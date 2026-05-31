@@ -1,0 +1,62 @@
+# FastMatch runtime dependencies.
+#
+# Install everything for the CPU quickstart with:
+#     pip install -r requirements.txt
+#
+# Tested on Python 3.13.
+
+PySide6==6.11.*
+numpy>=2.4
+Pillow>=12.1
+
+# ---------------------------------------------------------------------------
+# PyTorch — read this before relying on `pip install -r requirements.txt`.
+# ---------------------------------------------------------------------------
+# (a) A plain `pip install` (what the line below does) pulls the CPU-only
+#     wheel from PyPI. FastMatch runs correctly on it — every code path,
+#     including the engine, is device-agnostic and falls back to CPU — it is
+#     just slower for large searches. No GPU is required to use the app.
+#
+# (b) For the RTX 5060 / Blackwell (compute capability sm_120) GPU, the PyPI
+#     wheel ships NO sm_120 kernels: `torch.cuda.is_available()` may report
+#     True, yet the first real kernel raises
+#         CUDA error: no kernel image is available for execution
+#     (FastMatch detects this with a launch-time canary and auto-falls back to
+#     CPU). To get true GPU acceleration you must install a CUDA build from the
+#     PyTorch CUDA index *separately*, AFTER installing this file:
+#
+#         pip install torch --index-url https://download.pytorch.org/whl/cu128
+#
+#     If cu128 is unavailable for your platform, cu129 is an alternative:
+#
+#         pip install torch --index-url https://download.pytorch.org/whl/cu129
+#
+#     Verify the GPU build is active with:
+#
+#         python -c "import torch; print(torch.cuda.is_available())"
+#
+#     This prints `True` on a working CUDA build and `False` on the CPU build.
+#
+# The `pip install -r requirements.txt` default deliberately requests the CPU
+# wheel so a fresh checkout always works without a GPU.
+torch>=2.11
+
+# torchvision is OPTIONAL — not required, not installed by this file. The
+# engine uses `torchvision.ops.nms` for a faster non-maximum suppression when
+# importable, and otherwise ships a pure-torch NMS fallback that produces
+# identical results. Install it only if you want the faster path:
+#     pip install torchvision   (match the torch build / CUDA index used above)
+
+# ---------------------------------------------------------------------------
+# OpenCV — powers the "features" matching method ONLY.
+# ---------------------------------------------------------------------------
+# The convolution methods (ncc / ssd / ccorr) never import cv2; only the
+# `method="features"` path (ORB keypoints + RANSAC homography, for rotated /
+# scaled / warped instances) uses it. If cv2 is absent the feature method raises
+# a documented RuntimeError and the UI greys the option out — the rest of the
+# app is unaffected.
+#
+# Use the `-headless` build: it omits OpenCV's own Qt/GUI backend, which would
+# otherwise ship a second set of Qt plugins that clash with PySide6's at import
+# time (duplicate `xcb`/platform plugins, `QApplication`-already-running errors).
+opencv-python-headless>=4.13

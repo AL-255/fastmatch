@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+# Run from the repo root so `import fastmatch` resolves without an install.
+testpaths = ["tests"]
+markers = [
+    "cpu: fast engine tests that run on CPU in a couple of seconds",
+]
