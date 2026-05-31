@@ -81,6 +81,9 @@ class MainWindow(QMainWindow):
         self._params: MatchParams = MatchParams(device=device)
         # Remember the last selection so non-threshold param changes can re-run it.
         self._last_rect: QRect | None = None
+        # Last full result set from the engine, kept so a live threshold change can
+        # refresh the orientation breakdown without re-running the engine.
+        self._all_matches: list = []
         # Track whether we've shown the one-time "CPU is slow" notice.
         self._cpu_notice_shown = False
         # Controllers whose worker thread was still running at swap/close time
@@ -254,6 +257,7 @@ class MainWindow(QMainWindow):
 
         self._doc = doc
         self._last_rect = None
+        self._all_matches = []
         self._viewport.clear_matches()
         self._viewport.clear_template()
         self._viewport.set_image(doc)
@@ -284,6 +288,7 @@ class MainWindow(QMainWindow):
         self._viewport.clear_matches()
         self._viewport.clear_template()
         self._last_rect = None
+        self._all_matches = []
         self._count_label.setText("0 matches")
         self._params_panel.set_match_count(0)
 
@@ -311,8 +316,39 @@ class MainWindow(QMainWindow):
             shown = self._viewport.visible_match_count()
         except Exception:
             shown = len(match_list)
-        self._count_label.setText(f"{shown} matches")
+        # Remember the engine's full result so threshold-only changes can refresh
+        # the orientation breakdown without re-running the engine.
+        self._all_matches = match_list
+        self._count_label.setText(self._count_text(shown, match_list, self._params.threshold))
         self._params_panel.set_match_count(shown)
+
+    def _count_text(self, shown: int, matches: list, threshold: float) -> str:
+        """Build the status-bar count string, with an orientation breakdown.
+
+        When more than one orientation is searched (or any non-R0 hit is present)
+        we append a per-orientation tally of the *displayed* matches, e.g.
+        ``"12 matches — R0:5 R90:3 MX:4"``. With orientation search off this stays
+        the plain ``"N matches"`` it has always been.
+        """
+        base = f"{shown} matches"
+        if not matches:
+            return base
+        # Tally only the matches currently above the live threshold so the
+        # breakdown agrees with the shown count.
+        thr = threshold
+        counts: dict[str, int] = {}
+        for m in matches:
+            if getattr(m, "score", 0.0) < thr:
+                continue
+            o = getattr(m, "orientation", "R0")
+            counts[o] = counts.get(o, 0) + 1
+        # Only show a breakdown when something other than plain upright is in play.
+        if not counts or (len(counts) == 1 and "R0" in counts):
+            return base
+        from .types import ORIENTATIONS
+
+        parts = [f"{o}:{counts[o]}" for o in ORIENTATIONS if o in counts]
+        return f"{base} — {' '.join(parts)}"
 
     def _on_busy_changed(self, busy: bool) -> None:
         """Show/hide the determinate progress bar with engine busy state."""
@@ -347,14 +383,16 @@ class MainWindow(QMainWindow):
         # Keep the count readout in sync with the new live filter.
         try:
             shown = self._viewport.visible_match_count()
-            self._count_label.setText(f"{shown} matches")
+            self._count_label.setText(self._count_text(shown, self._all_matches, new.threshold))
             self._params_panel.set_match_count(shown)
         except Exception:
             pass
 
         # Did anything other than the threshold change? A *method* switch is
         # engine-relevant (different score map / backend), as are the feature-
-        # matching knobs, so re-issue the last selection on any of them.
+        # matching knobs and the orientation-search checkboxes (which change
+        # which transforms of the template are searched), so re-issue the last
+        # selection on any of them.
         engine_relevant_changed = (
             new.method != old.method
             or new.scales != old.scales
@@ -364,6 +402,8 @@ class MainWindow(QMainWindow):
             or new.nms_iou != old.nms_iou
             or new.exclude_iou != old.exclude_iou
             or new.threshold_floor != old.threshold_floor
+            or new.enable_rotation != old.enable_rotation
+            or new.enable_flipping != old.enable_flipping
             or new.feature_detector != old.feature_detector
             or new.feature_ratio != old.feature_ratio
             or new.feature_min_inliers != old.feature_min_inliers

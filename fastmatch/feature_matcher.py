@@ -58,7 +58,13 @@ from typing import Any, Callable
 
 import numpy as np
 
-from .types import Match
+from .types import (
+    Match,
+    _ORIENT_LINEAR,
+    active_orientations,
+    apply_orientation,
+    orientation_from_matrix,
+)
 
 # Image feature detection runs at FULL resolution. Downsampling the image forced
 # the template to be downsampled by the same factor to keep descriptors at a
@@ -467,8 +473,6 @@ class FeatureMatcher:
         Raises:
             RuntimeError: if OpenCV was unavailable (raised at construction).
         """
-        cv2 = self._cv2
-
         detector_name = getattr(params, "feature_detector", "orb")
         ratio = float(getattr(params, "feature_ratio", 0.75))
         # cv2.findHomography needs >= 4 correspondences; clamp once here so the
@@ -479,28 +483,58 @@ class FeatureMatcher:
         exclude_iou = float(getattr(params, "exclude_iou", 0.30))
         nms_iou = float(getattr(params, "nms_iou", 0.30))
 
+        # Orientation search (dihedral D4, §J / active_orientations). ORB/AKAZE/
+        # SIFT are rotation+scale invariant but NOT reflection invariant, so we do
+        # NOT run rotated template variants — instead the feature path runs the
+        # template under at most TWO variants: R0 always, and ONE flip ("MY") only
+        # when any reflection is in the active set (enable_flipping). Each found
+        # instance's recovered transform is then classified to its nearest D4
+        # orientation and kept only if that orientation is active; this is what
+        # makes the feature path respect the checkboxes (rotation OFF filters out
+        # instances ORB found rotated; flip OFF skips the flip variant entirely and
+        # rejects reflections). With both off this is the single R0 variant tagging
+        # every Match "R0" — otherwise unchanged.
+        active = set(
+            active_orientations(
+                getattr(params, "enable_rotation", False),
+                getattr(params, "enable_flipping", False),
+            )
+        )
+        variants: list[tuple[np.ndarray, np.ndarray]] = [
+            (template, np.eye(2, dtype=np.float64))  # R0: identity linear part
+        ]
+        if getattr(params, "enable_flipping", False):
+            # One mirror variant: ORB cannot match a reflected copy against the
+            # upright template (descriptors are not reflection invariant), so run
+            # the template pre-flipped by MY. Its linear part composes with the
+            # recovered homography to classify the net orientation.
+            variants.append(
+                (apply_orientation(template, "MY"), np.asarray(_ORIENT_LINEAR["MY"], np.float64))
+            )
+
         if progress is not None:
             progress(0)
         if cancel is not None and cancel():
             return []
 
-        # --- 0. select the coarsest-safe detection level from the template ---
+        # --- 0. select the coarsest-safe detection level from the (R0) template
         # The template (NOT the image) picks the level: L is the deepest pyramid
         # level at which the downsampled template's short side stays ≥
         # MIN_TPL_FEATURE px, so the template is never decimated into oblivion
         # (the regression that made features find nothing on large images, §K.2).
+        # The MY variant has the same short side, so the level is shared.
         tmpl_gray_full = self._to_gray(template)
         th_full, tw_full = tmpl_gray_full.shape[:2]
         if min(th_full, tw_full) < _MIN_TEMPLATE_SIDE:
             return []  # too small to anchor a homography
         level = 0 if self._force_full_level else self._select_level(th_full, tw_full)
         self._last_level = level
-        factor = 1 << level  # 2^level
 
         # --- 1-2. image features at level L (cached per (detector, level)) ---
-        # Image keypoints come back in FULL-RES coordinates (the detector scaled
-        # them ×2^level), so all geometry below is full-resolution regardless of
-        # the detection level.
+        # Detected ONCE regardless of how many template variants run (the cache is
+        # keyed on (detector, level); both variants share it). Image keypoints come
+        # back in FULL-RES coordinates (the detector scaled them ×2^level), so all
+        # geometry below is full-resolution regardless of the detection level.
         img_kps, img_desc = self._ensure_image_features(
             image_gray, detector_name, level, cancel
         )
@@ -510,6 +544,94 @@ class FeatureMatcher:
             return []
         if img_desc is None or len(img_kps) < min_inliers:
             return []  # nothing detectable in the image for this detector
+
+        # Run each template variant against the (shared) image features, pooling
+        # every variant's verified, orientation-classified instances.
+        results: list[Match] = []
+        for v_arr, v_linear in variants:
+            if cancel is not None and cancel():
+                break
+            results.extend(
+                self._match_variant(
+                    v_arr,
+                    v_linear,
+                    active,
+                    img_kps,
+                    img_desc,
+                    level,
+                    detector_name,
+                    ratio,
+                    min_inliers,
+                    max_instances,
+                    scale_back,
+                    cancel,
+                    progress,
+                )
+            )
+
+        if progress is not None:
+            progress(100)
+
+        # --- 6. source exclusion (IoU > exclude_iou or center inside) -------
+        if exclude_box is not None:
+            results = [
+                r
+                for r in results
+                if not self._excluded(r, exclude_box, exclude_iou)
+            ]
+
+        # Drop lattice phantoms (an oversized box engulfing several real copies)
+        # before NMS, so a phantom can't suppress the true instances it spans.
+        results = self._drop_lattice_phantoms(results)
+        # Sort by score descending to match the conv path's contract (§C.5).
+        results.sort(key=lambda r: r.score, reverse=True)
+        # Global IoU-NMS: voting can emit two overlapping boxes for one physical
+        # instance (and the two variants can each fit the same copy). The conv
+        # path's score map gets per-pixel NMS; the feature path bypasses it, so
+        # suppress overlaps here using the box IoU (not centre distance, which
+        # would wrongly merge two distinct touching instances). The highest-scoring
+        # box wins per location, carrying its orientation tag.
+        results = self._nms(results, nms_iou)
+        return results
+
+    def _match_variant(
+        self,
+        template: np.ndarray,
+        variant_linear: np.ndarray,
+        active: set,
+        img_kps: list,
+        img_desc: np.ndarray,
+        level: int,
+        detector_name: str,
+        ratio: float,
+        min_inliers: int,
+        max_instances: int,
+        scale_back: int,
+        cancel: Callable[[], bool] | None,
+        progress: Callable[[int], None] | None,
+    ) -> list[Match]:
+        """Detect + verify one template variant against the shared image features.
+
+        Runs the template-feature detection, multi-instance descriptor matching,
+        generalized-Hough voting, and per-cluster homography (§J.3 steps 3-5) for
+        a single oriented template variant (R0 or the MY flip). For every verified
+        instance the net recovered orientation is classified as
+        ``orientation_from_matrix(H[:2,:2] @ variant_linear)`` and the instance is
+        kept ONLY if that orientation is in ``active`` — tagging the surviving
+        Match with it. This is what makes the feature path honour the checkboxes:
+        rotation OFF rejects instances ORB found rotated; the flip variant only
+        runs when flipping is active, and a reflection it recovers is kept only if
+        its classified orientation is active. Source exclusion / phantom-drop / NMS
+        are applied once by the caller over the pooled variants.
+        """
+        cv2 = self._cv2
+        factor = 1 << int(level)  # 2^level
+        empty: list[Match] = []
+
+        tmpl_gray_full = self._to_gray(template)
+        th_full, tw_full = tmpl_gray_full.shape[:2]
+        if min(th_full, tw_full) < _MIN_TEMPLATE_SIDE:
+            return empty
 
         # --- 3. template features at level L ---------------------------------
         # Detect the template downsampled by 2^level (INTER_AREA) so its
@@ -680,6 +802,18 @@ class FeatureMatcher:
                 n_inliers = int(mask.ravel().sum())
                 if n_inliers < min_inliers:
                     continue
+                # --- orientation classification + checkbox filter (§J) -------
+                # Net recovered orientation = the homography's linear part composed
+                # with this variant's own linear part (identity for R0, the MY
+                # matrix for the flip variant), classified to its nearest D4 code.
+                # This is rotation+reflection aware: ORB found a rotated/mirrored
+                # copy iff H's linear part is a rotation/reflection. Keep the
+                # instance ONLY if that orientation is in the active set — so
+                # rotation OFF drops rotated fits and flip OFF rejects reflections.
+                net_linear = np.asarray(H, np.float64)[:2, :2] @ variant_linear
+                code = orientation_from_matrix(net_linear)
+                if code not in active:
+                    continue
                 box = self._project_to_box(cv2, H, tmpl_corners, full_w, full_h)
                 if box is None:
                     continue
@@ -696,35 +830,18 @@ class FeatureMatcher:
                     float(np.sqrt(area / tmpl_area_full)) if tmpl_area_full > 0 else 1.0
                 )
                 results.append(
-                    Match(x=rx, y=ry, w=rw, h=rh, score=float(score), scale=scale)
+                    Match(
+                        x=rx,
+                        y=ry,
+                        w=rw,
+                        h=rh,
+                        score=float(score),
+                        scale=scale,
+                        orientation=code,
+                    )
                 )
                 last_progress = it
-                if progress is not None:
-                    progress(
-                        min(100, 50 + int(round(50 * len(results) / max(1, max_instances))))
-                    )
 
-        if progress is not None:
-            progress(100)
-
-        # --- 6. source exclusion (IoU > exclude_iou or center inside) -------
-        if exclude_box is not None:
-            results = [
-                r
-                for r in results
-                if not self._excluded(r, exclude_box, exclude_iou)
-            ]
-
-        # Drop lattice phantoms (an oversized box engulfing several real copies)
-        # before NMS, so a phantom can't suppress the true instances it spans.
-        results = self._drop_lattice_phantoms(results)
-        # Sort by score descending to match the conv path's contract (§C.5).
-        results.sort(key=lambda r: r.score, reverse=True)
-        # Global IoU-NMS: voting can emit two overlapping boxes for one physical
-        # instance. The conv path's score map gets per-pixel NMS; the feature path
-        # bypasses it, so suppress overlaps here using the box IoU (not centre
-        # distance, which would wrongly merge two distinct touching instances).
-        results = self._nms(results, nms_iou)
         return results
 
     # -- helpers -------------------------------------------------------------

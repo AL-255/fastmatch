@@ -36,8 +36,17 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from dataclasses import replace
+
 from .device import resolve_device
-from .types import CONV_METHODS, METHODS, Match, MatchParams
+from .types import (
+    CONV_METHODS,
+    METHODS,
+    Match,
+    MatchParams,
+    active_orientations,
+    apply_orientation,
+)
 
 # torchvision is an *optional* dependency: we use its fused NMS kernel when it
 # is importable, but ship a pure-torch greedy NMS fallback so the engine has no
@@ -218,6 +227,24 @@ def _iou_against_box(
     areas = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
     union = areas + ref_area - inter
     return inter / union.clamp(min=1e-9)
+
+
+def _match_iou(a: Match, b: Match) -> float:
+    """IoU of two half-open :class:`Match` boxes (orientation-agnostic).
+
+    Used by the cross-orientation NMS that dedupes the pooled per-orientation
+    results: two different orientations that fit the same physical instance have
+    overlapping axis-aligned boxes, so this collapses them to the best-scoring one.
+    """
+    ix0 = max(a.x, b.x)
+    iy0 = max(a.y, b.y)
+    ix1 = min(a.x + a.w, b.x + b.w)
+    iy1 = min(a.y + a.h, b.y + b.h)
+    iw = max(0, ix1 - ix0)
+    ih = max(0, iy1 - iy0)
+    inter = iw * ih
+    union = a.w * a.h + b.w * b.h - inter
+    return inter / union if union > 0 else 0.0
 
 
 class Matcher:
@@ -454,11 +481,82 @@ class Matcher:
         if channel_mode == "rgb" and (self._rgb is None or template.ndim != 3):
             channel_mode = "luminance"
 
-        # Prepare the device-resident template channels once (validated here).
-        # The variance-floor rejection is gated on method (NCC only) inside.
-        tmpl = self._prepare_template(template, channel_mode, method)
-        th0, tw0 = tmpl["th"], tmpl["tw"]
+        # Orientation search (dihedral D4, §J / active_orientations). With both
+        # checkboxes off this is exactly ("R0",) and the code below takes the
+        # single-template path UNCHANGED — byte-for-byte the legacy behaviour the
+        # existing tests pin. Otherwise the boxed template is transformed by each
+        # active orientation, searched independently (reusing all the tiled multi-
+        # scale machinery), the per-orientation hits are tagged with their
+        # orientation, pooled, and deduped by ONE cross-orientation global NMS.
+        orients = active_orientations(params.enable_rotation, params.enable_flipping)
 
+        if orients == ("R0",):
+            # --- legacy single-orientation path (no behaviour change) ----------
+            # Prepare the device-resident template channels once (validated here).
+            # The variance-floor rejection is gated on method (NCC only) inside.
+            tmpl = self._prepare_template(template, channel_mode, method)
+            th0, tw0 = tmpl["th"], tmpl["tw"]
+            cands = self._search_template(tmpl, params, channel_mode, method, cancel, progress)
+            if cancel is not None and cancel():
+                return []
+            return self._finalize(cands, params, exclude_box, th0, tw0)
+
+        # --- multi-orientation path ------------------------------------------
+        # Per orientation: transform the boxed template, run the SAME per-template
+        # multi-scale (coarse-to-fine) search, finalize it (source-exclusion +
+        # per-orientation IoU-NMS + top-K), and tag every kept Match with the
+        # orientation it was found under. The transformed template's box size is
+        # used as-is, so R90/R270/diagonal boxes are correctly H/W-swapped.
+        pooled: list[Match] = []
+        n_orients = len(orients)
+        for oi, orient in enumerate(orients):
+            if cancel is not None and cancel():
+                return []
+            t_oriented = apply_orientation(template, orient)
+            tmpl = self._prepare_template(t_oriented, channel_mode, method)
+            th0, tw0 = tmpl["th"], tmpl["tw"]
+
+            # Scope the per-orientation progress into this orientation's slice of
+            # the [0,100] bar so the overall sweep stays monotonic and determinate.
+            def _scoped(pct: int, _oi: int = oi, _n: int = n_orients) -> None:
+                if progress is not None:
+                    progress(min(100, int(round((100.0 * _oi + pct) / _n))))
+
+            sub_progress = _scoped if progress is not None else None
+            cands = self._search_template(
+                tmpl, params, channel_mode, method, cancel, sub_progress
+            )
+            if cancel is not None and cancel():
+                return []
+            for m in self._finalize(cands, params, exclude_box, th0, tw0):
+                pooled.append(replace(m, orientation=orient))
+
+        if progress is not None:
+            progress(100)
+
+        # One cross-orientation greedy IoU-NMS over the combined list keeps the
+        # highest-scoring candidate per location (carrying its orientation tag),
+        # then top-K — the global dedupe across the per-orientation results.
+        return self._finalize_orientations(pooled, params)
+
+    def _search_template(
+        self,
+        tmpl: dict,
+        params: MatchParams,
+        channel_mode: str,
+        method: str,
+        cancel: Callable[[], bool] | None,
+        progress: Callable[[int], None] | None,
+    ) -> dict:
+        """Run the tiled multi-scale search for ONE (already-prepared) template.
+
+        Picks the coarse-to-fine pyramid path when beneficial (§K.1) else the
+        full-resolution search, wrapped in the CUDA OOM degradation ladder, and
+        returns the stacked raw candidate dict (no exclusion/NMS) for
+        :meth:`_finalize`. Factored out of :meth:`match` so the orientation search
+        can drive it once per active orientation; the legacy single-orientation
+        call site is byte-for-byte identical.
+        """
         scales = tuple(params.scales) if params.scales else (1.0,)
         device = self._device
 
@@ -497,10 +595,31 @@ class Matcher:
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-        if cancel is not None and cancel():
-            return []
+        return cands
 
-        return self._finalize(cands, params, exclude_box, th0, tw0)
+    @staticmethod
+    def _finalize_orientations(pooled: list[Match], params: MatchParams) -> list[Match]:
+        """Cross-orientation greedy IoU-NMS + top-K over pooled tagged Matches (§J).
+
+        Each input is an already-finalized (per-orientation) :class:`Match` tagged
+        with its orientation. This is the ONE global dedupe across orientations:
+        sort by score desc, greedily keep a box unless its IoU with an already-kept
+        higher-scoring box exceeds ``nms_iou`` (so the best-scoring orientation wins
+        per location, carrying its tag), then cap at ``max_results``. Box IoU is
+        orientation-agnostic, so an R0 and an R180 fit of the same instance overlap
+        and collapse to one. Pure python (runs on the small, post-finalize list).
+        """
+        if not pooled:
+            return []
+        ordered = sorted(pooled, key=lambda m: m.score, reverse=True)
+        kept: list[Match] = []
+        nms_iou = float(params.nms_iou)
+        for m in ordered:
+            if all(_match_iou(m, k) <= nms_iou for k in kept):
+                kept.append(m)
+            if len(kept) >= params.max_results:
+                break
+        return kept
 
     # -- template preparation / validation -----------------------------------
 

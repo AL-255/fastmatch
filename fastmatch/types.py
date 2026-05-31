@@ -16,6 +16,121 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
+
+# --- Dihedral orientations (D4) ---------------------------------------------
+# The 8 symmetries of a square: 4 rotations and 4 reflections. A boxed template
+# can appear in the image under any of these, and all matching methods can search
+# the active subset. Two independent bits select the subset:
+#   * rotation  -> the 90°-family rotations (R90, R180, R270)
+#   * flipping  -> the reflections (MX, MY); both bits also add the diagonal
+#                  reflections (MXR90, MYR90), which are a flip AND a 90° turn.
+ORIENTATIONS: tuple[str, ...] = ("R0", "R90", "R180", "R270", "MX", "MY", "MXR90", "MYR90")
+
+ORIENTATION_LABELS: dict[str, str] = {
+    "R0": "0°",
+    "R90": "rotated 90°",
+    "R180": "rotated 180°",
+    "R270": "rotated 270°",
+    "MX": "mirrored (vertical flip)",
+    "MY": "mirrored (horizontal flip)",
+    "MXR90": "mirrored + 90°",
+    "MYR90": "mirrored + 90° (other diagonal)",
+}
+
+
+def active_orientations(enable_rotation: bool, enable_flipping: bool) -> tuple[str, ...]:
+    """Select the active D4 orientations from the two UI checkboxes.
+
+    Each orientation has a rotation bit (a 90/180/270° turn) and a reflection bit
+    (a mirror); it is active iff the corresponding checkbox(es) are enabled:
+
+        (off, off) -> R0
+        (rot, off) -> R0, R90, R180, R270
+        (off, flip) -> R0, MX, MY
+        (rot, flip) -> all 8
+
+    Returned in the canonical :data:`ORIENTATIONS` order; always includes R0.
+    """
+    active = {"R0"}
+    if enable_rotation:
+        active |= {"R90", "R180", "R270"}
+    if enable_flipping:
+        active |= {"MX", "MY"}
+    if enable_rotation and enable_flipping:
+        active |= {"MXR90", "MYR90"}
+    return tuple(o for o in ORIENTATIONS if o in active)
+
+
+def apply_orientation(arr: np.ndarray, orient: str) -> np.ndarray:
+    """Return ``arr`` transformed by dihedral orientation ``orient``.
+
+    Works on ``(H, W)`` or ``(H, W, C)`` uint8/float arrays (numpy ``[row, col]``
+    == ``[y, x]``). R90/R270/MXR90/MYR90 swap the height and width. The result is
+    C-contiguous so it can be handed straight to torch/cv2.
+    """
+    if orient == "R0":
+        out = arr
+    elif orient == "R90":
+        out = np.rot90(arr, 1)            # 90° counter-clockwise
+    elif orient == "R180":
+        out = np.rot90(arr, 2)
+    elif orient == "R270":
+        out = np.rot90(arr, 3)
+    elif orient == "MX":
+        out = arr[::-1, :]                # mirror over the horizontal (x) axis
+    elif orient == "MY":
+        out = arr[:, ::-1]                # mirror over the vertical (y) axis
+    elif orient == "MXR90":
+        out = np.rot90(arr[::-1, :], 1)   # flip then rotate -> a diagonal reflection
+    elif orient == "MYR90":
+        out = np.rot90(arr[:, ::-1], 1)   # the other diagonal reflection
+    else:
+        raise ValueError(f"unknown orientation {orient!r}; expected one of {ORIENTATIONS}")
+    return np.ascontiguousarray(out)
+
+
+# Canonical 2x2 linear parts (image coords: +x right, +y down) of each D4
+# orientation — the exact forward linear map of :func:`apply_orientation` (the
+# numpy transform), so that ``orientation_from_matrix`` labels a recovered
+# transform with the SAME code ``apply_orientation`` would produce. (These are
+# derived from the numpy ops: e.g. np.rot90's array-CCW turn is a clockwise turn
+# in +y-down image coords, so R90 == [[0,1],[-1,0]] here, not its transpose.)
+_ORIENT_LINEAR: dict[str, tuple[tuple[float, float], tuple[float, float]]] = {
+    "R0": ((1, 0), (0, 1)),
+    "R90": ((0, 1), (-1, 0)),
+    "R180": ((-1, 0), (0, -1)),
+    "R270": ((0, -1), (1, 0)),
+    "MX": ((1, 0), (0, -1)),
+    "MY": ((-1, 0), (0, 1)),
+    "MXR90": ((0, -1), (-1, 0)),
+    "MYR90": ((0, 1), (1, 0)),
+}
+
+
+def orientation_from_matrix(linear: np.ndarray) -> str:
+    """Classify a 2x2 linear transform into its nearest dihedral orientation.
+
+    Used by the feature path: a homography's upper-left 2x2 (rotation + scale +
+    reflection, ignoring shear) is scale-normalized and matched to the closest of
+    the 8 canonical D4 matrices. The reflection is captured by the sign of the
+    determinant, the rotation by the entry pattern.
+    """
+    m = np.asarray(linear, dtype=np.float64)[:2, :2]
+    det = float(m[0, 0] * m[1, 1] - m[0, 1] * m[1, 0])
+    scale = float(np.sqrt(abs(det)))
+    if scale < 1e-9:
+        return "R0"
+    mn = m / scale
+    best, best_d = "R0", 1e18
+    for code, ref in _ORIENT_LINEAR.items():
+        ref_arr = np.asarray(ref, dtype=np.float64)
+        d = float(((mn - ref_arr) ** 2).sum())
+        if d < best_d:
+            best, best_d = code, d
+    return best
+
 
 # The selectable matching methods, in UI order, with one-line guidance on when each fits.
 # Single source of truth shared by the engine dispatch and the params-panel dropdown.
@@ -45,6 +160,9 @@ class Match:
             clamped at 0 — negative correlation is "not a match").
         scale: Scale at which the instance was found (``1.0`` == template
             native size; ``> 1`` == larger instance, ``< 1`` == smaller).
+        orientation: Dihedral orientation the instance was found under (one of
+            :data:`ORIENTATIONS`; ``"R0"`` == upright, unmirrored). Defaults to
+            ``"R0"`` so existing callers/constructors are unaffected.
     """
 
     x: int
@@ -53,6 +171,7 @@ class Match:
     h: int
     score: float
     scale: float
+    orientation: str = "R0"
 
 
 @dataclass(frozen=True)
@@ -82,6 +201,14 @@ class MatchParams:
     # "features" uses an ORB-keypoint + RANSAC-homography backend that tolerates
     # rotation/scale/perspective warp; the scale/NMS/channel knobs do not apply to it.
     method: str = "ncc"
+
+    # --- Orientation search (dihedral D4; see active_orientations) --------------
+    # Search the boxed template under additional orientations. All methods honor
+    # these. enable_rotation adds 90/180/270° turns; enable_flipping adds mirrors;
+    # both together also add the diagonal reflections. Each kept Match records the
+    # orientation it was found under (Match.orientation).
+    enable_rotation: bool = False
+    enable_flipping: bool = False
 
     # --- Feature-matching parameters (only used when method == "features") -------
     feature_detector: str = "orb"     # "orb" | "akaze" | "sift"

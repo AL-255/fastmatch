@@ -587,3 +587,76 @@ Optimization: detect at the **coarsest pyramid level that still keeps the templa
   optimization must be substantially faster (target ≥ 3× on NCC×5, ≥ 2× elsewhere) with no recall loss.
 - The existing 30 tests must still pass; add tests asserting pyramid-vs-full recall parity on a larger scene
   and that `core_tile`/small-image paths still work.
+
+---
+
+# L. ORIENTATION SEARCH (dihedral D4)
+
+User requirement: a boxed template can appear in the image rotated by a quarter-turn and/or mirrored, so the
+search should optionally cover the **8 symmetries of a square** (the dihedral group D4): 4 rotations and 4
+reflections. The shared contract is already implemented and **frozen** in `fastmatch/types.py`; all matching
+methods honour it. With both checkboxes off the behaviour is **byte-for-byte the current behaviour** (every
+`Match.orientation == "R0"`).
+
+### L.1 The two checkboxes → orientation subset
+
+Two independent UI bits select the active subset; `active_orientations(enable_rotation, enable_flipping)`
+returns the canonical-order tuple (always starting with `R0`):
+
+| `enable_rotation` | `enable_flipping` | Active orientations |
+|---|---|---|
+| off | off | `R0` (current behaviour) |
+| on  | off | `R0, R90, R180, R270` (the 90° rotation family) |
+| off | on  | `R0, MX, MY` (the axis mirrors) |
+| on  | on  | all 8: `R0, R90, R180, R270, MX, MY, MXR90, MYR90` |
+
+`enable_rotation` adds the 90/180/270° turns; `enable_flipping` adds the axis mirrors `MX`/`MY`; both
+together additionally add the **diagonal reflections** `MXR90`/`MYR90` (a mirror AND a quarter-turn). The
+canonical order is `ORIENTATIONS = ("R0","R90","R180","R270","MX","MY","MXR90","MYR90")`.
+
+### L.2 Contract helpers (frozen, in `types.py`)
+
+- `apply_orientation(arr, orient) -> np.ndarray` — the 8 numpy transforms on an `(H,W)` or `(H,W,C)` array.
+  `R90`/`R270`/`MXR90`/`MYR90` swap H and W; `MX` mirrors over the horizontal (x) axis (`arr[::-1, :]`), `MY`
+  over the vertical (y) axis (`arr[:, ::-1]`). The result is C-contiguous so it can be handed straight to
+  torch/cv2.
+- `orientation_from_matrix(linear_2x2) -> str` — classifies a recovered 2×2 linear transform (e.g. a feature
+  homography's upper-left block) to its nearest D4 orientation: the matrix is scale-normalized and matched to
+  the closest of the 8 canonical D4 matrices; the **reflection is captured by the sign of the determinant**
+  (det < 0 ⇒ a reflection code), the rotation by the entry pattern. A (near-)singular matrix degrades to `R0`.
+- `Match` carries `orientation: str = "R0"` — the orientation the instance was found under (defaults to `R0`
+  so existing callers are unaffected).
+
+### L.3 How the conv methods (ncc/ssd/ccorr) loop orientations
+
+The conv path transforms the **template** (not the image) once per active orientation: for each
+`orient in active_orientations(...)` it computes `apply_orientation(template, orient)` and runs the existing
+tiled, multi-scale score-map search on that variant (note `R90`/`R270`/diagonals give a transposed `tw×th`
+window, which is why those hits report swapped `w`/`h`). Candidates from **all orientations × all scales** are
+pooled, then a **single global NMS** picks the winning (orientation, scale) per location, exactly as
+multi-scale already pools across scales. Each kept `Match` records the orientation it was found under
+(`orientation=orient`). With the default `(off, off)` the loop has the single element `R0`, the template is
+untouched, and **NCC stays numerically identical** to the pre-feature path.
+
+### L.4 How the feature method classifies orientation
+
+The feature path is inherently rotation/scale tolerant, so it does not transform the template per orientation.
+Instead, after RANSAC fits a homography for a candidate instance, it composes that homography's linear part
+with the variant's own linear part and classifies the result via `orientation_from_matrix`; the instance is
+**kept only if its classified orientation is in the active set**. So with flipping OFF a mirrored fit
+(det < 0) is rejected, and with rotation OFF a rotated fit is rejected. The recovered `Match.orientation` is
+the classified D4 code (a reflection code `MX/MY/MXR90/MYR90` for a mirrored instance). Because ORB recovery
+is approximate, callers should treat the reflection-vs-rotation family as reliable rather than the exact code.
+
+### L.5 Tests
+`tests/test_orientations.py`:
+- **Pure-contract** (no engine): `active_orientations` for the four checkbox combos returns the exact tuples;
+  `apply_orientation` yields 8 distinct arrays from an asymmetric template (with the H/W swap for the rotation
+  and diagonal families); `orientation_from_matrix` round-trips the 8 canonical matrices under a scale factor
+  and routes det-sign to reflection vs rotation.
+- **Engine** (`@pytest.mark.cpu`, engine `importorskip`): a small CPU-fast scene with the motif stamped at
+  R0/R90/R180/MY; with both checkboxes on, every stamped copy is recovered (IoU-located) and `Match.orientation`
+  equals the stamp's true code; with both off, ONLY the upright copy is found and everything is tagged `R0`.
+  Plus an SSD spot-check (orientation is method-agnostic for the conv methods).
+- **Feature** (`cv2` `importorskip`): a feature-rich motif stamped upright + mirrored; `method="features"` with
+  flipping ON recovers the mirrored copy tagged as a reflection, and with flipping OFF does not report it.

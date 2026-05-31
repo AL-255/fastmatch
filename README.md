@@ -95,6 +95,7 @@ stamps and exits; load that file separately to search it.
 | **Left-drag** | Draw the selection box (the search template). |
 | Release a new selection | Re-runs the search; any in-flight search is **auto-cancelled** (latest-wins). |
 | **Method dropdown** | Pick the matching method (NCC / SSD / CCORR / Feature matching). Changing it **re-runs** the search on the current selection. See [Matching methods](#matching-methods). |
+| **Rotation / Flipping checkboxes** | Also search the template under quarter-turn rotations and/or mirror reflections. Changing either **re-runs** the search. See [Orientation search](#orientation-search). |
 | **Threshold slider** | **Live-filters** the displayed results — no re-run (works for every method). |
 
 The **source region you selected is excluded** from the matches (it would
@@ -157,6 +158,35 @@ Notes:
 - Feature matching requires **OpenCV** (`opencv-python-headless`, installed by
   the quickstart). If OpenCV is missing the dropdown greys that option out with a
   tooltip and the other three methods keep working.
+
+---
+
+## Orientation search
+
+By default the search looks for the template in its **upright, unmirrored**
+orientation only. Two checkboxes in the params panel widen the search to the
+**8 symmetries of a square** (the dihedral group D4):
+
+- **Rotation** — also match the template rotated by 90°, 180° and 270°.
+- **Flipping** — also match the template mirrored (horizontal and vertical
+  flips). With **both** boxes on, the two diagonal reflections (mirror **and** a
+  quarter-turn) are searched as well, for all 8 orientations.
+
+| Rotation | Flipping | Orientations searched |
+|---|---|---|
+| off | off | upright only (default — identical to before this feature) |
+| on  | off | upright + 90° / 180° / 270° |
+| off | on  | upright + horizontal / vertical mirror |
+| on  | on  | all 8 (rotations, mirrors, and diagonal reflections) |
+
+**All four methods honor these checkboxes.** The correlation methods
+(NCC / SSD / CCORR) re-run their score-map search once per active orientation
+and keep the best one per location; feature matching solves for the transform
+directly and classifies it. Each result records the orientation it was found
+under, so a hit can be a rotated or mirrored copy of your selection. With both
+boxes off, behaviour is exactly the upright-only search described above (no
+extra cost). Changing either checkbox re-runs the search on your current
+selection; the threshold slider stays a live, no-re-run filter.
 
 ---
 

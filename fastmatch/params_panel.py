@@ -43,7 +43,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .types import CONV_METHODS, METHOD_LABELS, METHODS, MatchParams
+from .types import (
+    CONV_METHODS,
+    METHOD_LABELS,
+    METHODS,
+    MatchParams,
+    active_orientations,
+)
 
 # Default multi-scale grids (DESIGN.md §H). CPU stays single-scale to avoid the
 # len(scales)x cost on a backend that is already minutes-slow.
@@ -238,6 +244,38 @@ class ParamsPanel(QWidget):
 
         root.addWidget(self._method_stack)
 
+        # --- Orientation (dihedral D4) search ------------------------------
+        # Applies to ALL methods, so it lives *outside* the method-specific
+        # stack as a common group (DESIGN.md / types.active_orientations). Two
+        # independent bits: rotation adds the 90/180/270° turns; flipping adds
+        # the mirrors; both together also add the diagonal reflections. Both
+        # default off, so with neither checked the search is the upright "R0"
+        # template only — byte-for-byte the prior behaviour.
+        orient_box = QGroupBox("Orientation", self)
+        orient_layout = QVBoxLayout(orient_box)
+        self._enable_rotation = QCheckBox("Enable Rotation", self)
+        self._enable_rotation.setChecked(MatchParams.enable_rotation)
+        self._enable_rotation.setToolTip(
+            "Also search the template rotated 90°, 180°, and 270°."
+        )
+        self._enable_rotation.toggled.connect(self._on_orientation_changed)
+        orient_layout.addWidget(self._enable_rotation)
+
+        self._enable_flipping = QCheckBox("Enable Flipping", self)
+        self._enable_flipping.setChecked(MatchParams.enable_flipping)
+        self._enable_flipping.setToolTip(
+            "Also search mirrored templates. Combined with rotation this adds the "
+            "diagonal reflections too (8 orientations total)."
+        )
+        self._enable_flipping.toggled.connect(self._on_orientation_changed)
+        orient_layout.addWidget(self._enable_flipping)
+
+        # Tiny readout of how many orientations the two checkboxes select.
+        self._orientation_label = QLabel(self)
+        self._orientation_label.setTextFormat(Qt.TextFormat.PlainText)
+        orient_layout.addWidget(self._orientation_label)
+        root.addWidget(orient_box)
+
         # --- Match-count readout -------------------------------------------
         self._count_label = QLabel(self)
         self._count_label.setTextFormat(Qt.TextFormat.PlainText)
@@ -247,6 +285,7 @@ class ParamsPanel(QWidget):
 
         # Initialize derived labels + the correct stack page without emitting.
         self._sync_threshold_label()
+        self._sync_orientation_label()
         self._sync_method_page()
         self.set_match_count(0)
 
@@ -306,6 +345,15 @@ class ParamsPanel(QWidget):
         """Refresh the numeric readout beside the threshold slider."""
         self._threshold_label.setText(f"{self._threshold.value() / _THRESH_TICKS:.3f}")
 
+    def _sync_orientation_label(self) -> None:
+        """Refresh the readout of how many orientations the checkboxes select."""
+        active = active_orientations(
+            self._enable_rotation.isChecked(), self._enable_flipping.isChecked()
+        )
+        n = len(active)
+        plural = "orientation" if n == 1 else "orientations"
+        self._orientation_label.setText(f"{n} {plural}: {', '.join(active)}")
+
     def _sync_method_page(self) -> None:
         """Show the control page (conv vs features) matching the current method."""
         self._method_stack.setCurrentIndex(0 if self._is_conv_method() else 1)
@@ -342,6 +390,17 @@ class ParamsPanel(QWidget):
         """A non-threshold control changed: emit a fresh params object."""
         self._emit()
 
+    def _on_orientation_changed(self, *args: object) -> None:
+        """An orientation checkbox toggled: refresh the readout, then emit.
+
+        Like the other non-threshold controls this is engine-relevant (it changes
+        which transforms of the template are searched), so the trailing _emit
+        carries the new enable_rotation/enable_flipping for the main window to
+        re-issue the search.
+        """
+        self._sync_orientation_label()
+        self._emit()
+
     def _emit(self) -> None:
         """Build and emit the current ``MatchParams`` unless suppressed."""
         if self._emitting:
@@ -375,6 +434,8 @@ class ParamsPanel(QWidget):
             compute_dtype=MatchParams.compute_dtype,
             channel_mode=self._channel_mode.currentText(),
             method=self._current_method(),
+            enable_rotation=self._enable_rotation.isChecked(),
+            enable_flipping=self._enable_flipping.isChecked(),
             feature_detector=str(self._feature_detector.currentData()),
             feature_ratio=MatchParams.feature_ratio,
             feature_min_inliers=self._feature_min_inliers.value(),
