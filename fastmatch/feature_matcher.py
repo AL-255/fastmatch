@@ -110,11 +110,23 @@ _MAX_FEATURE_LEVEL = 0     # 0 -> always full resolution (see note above)
 #: sub-pixel keypoint and homography noise without admitting outliers.
 _REPROJ_THRESH = 5.0
 
-#: RANSAC iterations for the per-instance homography fit. Raised above the cv2
-#: default because with MANY repeated copies a random 4-point sample is less
-#: likely to land entirely on one instance, so more iterations are needed to hit
-#: a geometrically consistent set.
-_RANSAC_ITERS = 5000
+#: RANSAC iterations for the per-instance homography fit. The vote clusters fed
+#: to findHomography are already mostly-consistent (one instance), so a moderate
+#: budget converges; kept a touch above the cv2 default for the residual noise.
+_RANSAC_ITERS = 3000
+
+#: Early-stop for the vote loop: after this many consecutive peaks fail to yield a
+#: verified instance, stop. Real instances are the strongest peaks (found first);
+#: on a highly-repetitive image the long tail of medium peaks is noise that the
+#: homography rejects anyway, so bounding the wasted findHomography calls keeps
+#: the per-query time down without dropping real instances.
+_MAX_CONSEC_FAIL = 25
+
+#: Max correspondences fed to a single per-cluster findHomography. A highly
+#: repetitive image (a chip die, a brick wall) makes a vote cluster huge; RANSAC
+#: needs only a few hundred points to lock the model, so we subsample larger
+#: clusters — bounding per-instance cost without affecting the fit.
+_MAX_CLUSTER_PTS = 600
 
 #: Multi-instance descriptor matching. The classic Lowe ratio test rejects a
 #: match whose 2nd-nearest neighbour is (nearly) as close — which is EXACTLY what
@@ -132,7 +144,10 @@ _GOOD_DIST = {
     "akaze": 90.0,  # Hamming on AKAZE's (longer) binary descriptor
     "sift": 300.0,  # L2 on 128-float SIFT (RANSAC filters the looser slack)
 }
-_MAX_MATCHES_PER_FEATURE = 256
+#: Nearest neighbours considered per template feature. Bounds the correspondence
+#: set (one per copy, plus a little noise) so a highly-repetitive image can't
+#: explode it — covers up to this many copies of the boxed region.
+_KNN_K = 96
 
 #: Reject a homography whose affine-part determinant is below this magnitude
 #: (near-singular / folded mapping) — a degenerate fit that does not correspond
@@ -535,17 +550,20 @@ class FeatureMatcher:
         # feature_ratio (UI, default 0.75) widens/narrows acceptance: at 0.75 it
         # keeps the nominal threshold; higher = more permissive.
         maxd *= max(0.25, ratio / 0.75)
-        matched = bf.radiusMatch(tmpl_desc, img_desc, maxDistance=float(maxd))
+        # Bounded multi-match: the k nearest image features per template feature
+        # (knnMatch is sorted), then keep those within the absolute "good" distance
+        # — one correspondence per copy. Bounding k (vs. radiusMatch's unbounded
+        # fan-out) keeps a highly-repetitive image (a chip die) from exploding the
+        # correspondence set into a multi-second match.
+        k = min(len(img_desc), _KNN_K)
+        knn = bf.knnMatch(tmpl_desc, img_desc, k=k)
         good = []
-        for ms in matched:
-            if not ms:
-                continue
-            # radiusMatch results are not guaranteed sorted; keep the nearest few
-            # per feature (cap the fan-out so a repetitive texture can't explode
-            # the correspondence set).
-            if len(ms) > _MAX_MATCHES_PER_FEATURE:
-                ms = sorted(ms, key=lambda m: m.distance)[:_MAX_MATCHES_PER_FEATURE]
-            good.extend(ms)
+        for ms in knn:
+            for m in ms:
+                if m.distance <= maxd:
+                    good.append(m)
+                else:
+                    break  # knnMatch results are sorted by distance
         if len(good) < min_inliers:
             return []
 
@@ -573,18 +591,24 @@ class FeatureMatcher:
         results: list[Match] = []
 
         n = len(good)
-        tpx = np.empty(n, np.float32); tpy = np.empty(n, np.float32)
-        ipx = np.empty(n, np.float32); ipy = np.empty(n, np.float32)
-        rel_s = np.empty(n, np.float32); rel_a = np.empty(n, np.float32)
-        for i, m in enumerate(good):
-            tk = tmpl_kps[m.queryIdx]; ik = img_kps[m.trainIdx]
-            tpx[i], tpy[i] = tk.pt
-            ipx[i], ipy[i] = ik.pt
-            ts = tk.size if tk.size > 1e-3 else 1.0
-            rel_s[i] = ik.size / ts
-            # ORB/SIFT keypoint angle is degrees in [0,360); -1 means unset.
-            da = (ik.angle - tk.angle) if (ik.angle >= 0 and tk.angle >= 0) else 0.0
-            rel_a[i] = np.deg2rad(da)
+        # Vectorized correspondence arrays (a Python loop over `good` would be a
+        # bottleneck on a repetitive image's large correspondence set). Build the
+        # per-keypoint arrays once, then gather by the match query/train indices.
+        qi = np.fromiter((m.queryIdx for m in good), np.int64, n)
+        ti = np.fromiter((m.trainIdx for m in good), np.int64, n)
+        tk_xy = np.array([k.pt for k in tmpl_kps], np.float32).reshape(-1, 2)
+        tk_sz = np.array([k.size for k in tmpl_kps], np.float32)
+        tk_ang = np.array([k.angle for k in tmpl_kps], np.float32)
+        ik_xy = np.array([k.pt for k in img_kps], np.float32).reshape(-1, 2)
+        ik_sz = np.array([k.size for k in img_kps], np.float32)
+        ik_ang = np.array([k.angle for k in img_kps], np.float32)
+        tpx = tk_xy[qi, 0]; tpy = tk_xy[qi, 1]
+        ipx = ik_xy[ti, 0]; ipy = ik_xy[ti, 1]
+        ts = np.where(tk_sz[qi] > 1e-3, tk_sz[qi], 1.0)
+        rel_s = ik_sz[ti] / ts
+        # ORB/SIFT keypoint angle is degrees in [0,360); -1 means unset.
+        ta = tk_ang[qi]; ia = ik_ang[ti]
+        rel_a = np.deg2rad(np.where((ia >= 0) & (ta >= 0), ia - ta, 0.0))
         # Predicted instance centre = img_kp + s*R(dθ)*(template_centre - tmpl_kp).
         vx = (0.5 * tw_full) - tpx
         vy = (0.5 * th_full) - tpy
@@ -606,12 +630,15 @@ class FeatureMatcher:
         if int(hist.max()) >= min_inliers:
             # Stop once peaks fall to the diffuse-noise floor; the homography
             # verification below rejects any noise cluster that slips through.
-            vote_floor = max(min_inliers, int(0.12 * int(hist.max())))
+            vote_floor = max(min_inliers, int(0.10 * int(hist.max())))
             used = np.zeros(n, bool)
             it = 0
             it_cap = 4 * max_instances + 8
+            last_progress = 0  # iteration index of the last recorded instance
             while len(results) < max_instances and it < it_cap:
                 it += 1
+                if it - last_progress > _MAX_CONSEC_FAIL:
+                    break  # only noise peaks left (see _MAX_CONSEC_FAIL)
                 if cancel is not None and cancel():
                     break
                 py, px = np.unravel_index(int(np.argmax(hist)), hist.shape)
@@ -633,6 +660,12 @@ class FeatureMatcher:
                     np.add.at(hist, (by[idx], bx[idx]), -1)
                 if idx.size < min_inliers:
                     continue
+                # Subsample a huge cluster (repetitive image) — RANSAC locks the
+                # model from a few hundred points; evenly-spaced keeps it cheap and
+                # deterministic.
+                if idx.size > _MAX_CLUSTER_PTS:
+                    sel = np.linspace(0, idx.size - 1, _MAX_CLUSTER_PTS).astype(np.int64)
+                    idx = idx[sel]
                 src_pts = np.stack([tpx[idx], tpy[idx]], 1).reshape(-1, 1, 2)
                 dst_pts = np.stack([ipx[idx], ipy[idx]], 1).reshape(-1, 1, 2)
                 try:
@@ -665,6 +698,7 @@ class FeatureMatcher:
                 results.append(
                     Match(x=rx, y=ry, w=rw, h=rh, score=float(score), scale=scale)
                 )
+                last_progress = it
                 if progress is not None:
                     progress(
                         min(100, 50 + int(round(50 * len(results) / max(1, max_instances))))
@@ -681,17 +715,52 @@ class FeatureMatcher:
                 if not self._excluded(r, exclude_box, exclude_iou)
             ]
 
+        # Drop lattice phantoms (an oversized box engulfing several real copies)
+        # before NMS, so a phantom can't suppress the true instances it spans.
+        results = self._drop_lattice_phantoms(results)
         # Sort by score descending to match the conv path's contract (§C.5).
         results.sort(key=lambda r: r.score, reverse=True)
-        # Global IoU-NMS: sequential RANSAC can fit two near-identical homographies
-        # to one physical instance and emit overlapping duplicate boxes. The conv
-        # path's score map gets per-pixel NMS; the feature path bypasses it, so
-        # suppress overlaps here using the box IoU (not centre distance, which
-        # would wrongly merge two distinct touching instances) — §C.5/§J.3.
+        # Global IoU-NMS: voting can emit two overlapping boxes for one physical
+        # instance. The conv path's score map gets per-pixel NMS; the feature path
+        # bypasses it, so suppress overlaps here using the box IoU (not centre
+        # distance, which would wrongly merge two distinct touching instances).
         results = self._nms(results, nms_iou)
         return results
 
     # -- helpers -------------------------------------------------------------
+
+    @staticmethod
+    def _drop_lattice_phantoms(results: list[Match]) -> list[Match]:
+        """Remove lattice phantoms: a box engulfing several real detections.
+
+        On a repetitive pattern, RANSAC can fit a self-consistent homography over
+        features drawn from DIFFERENT copies, yielding one oversized box that spans
+        several true instances (e.g. a 2.3× box covering a row of copies). Such a
+        phantom is identified geometrically — its box contains the CENTRES of ≥ 2
+        other (smaller) detections — which is scale-agnostic, so it never drops a
+        legitimate larger-scale copy (that one does not engulf two others).
+        """
+        n = len(results)
+        if n < 3:
+            return results
+        cx = [r.x + r.w / 2.0 for r in results]
+        cy = [r.y + r.h / 2.0 for r in results]
+        area = [r.w * r.h for r in results]
+        keep = [True] * n
+        for i, a in enumerate(results):
+            engulfed = 0
+            for j in range(n):
+                if i == j:
+                    continue
+                if (
+                    a.x <= cx[j] < a.x + a.w
+                    and a.y <= cy[j] < a.y + a.h
+                    and area[i] > 1.5 * area[j]
+                ):
+                    engulfed += 1
+            if engulfed >= 2:
+                keep[i] = False
+        return [r for r, k in zip(results, keep) if k]
 
     def _to_gray(self, arr: np.ndarray) -> np.ndarray:
         """Collapse a template to a C-contiguous uint8 grayscale image.
