@@ -18,12 +18,21 @@ origin top-left, +x right / +y down, half-open boxes ``(x, y, w, h)`` (§F.3).
 
 Pipeline (see §J.3):
 
-1. **Full-resolution tiled detection** — image features are detected at native
-   scale so a template selected at native scale keeps all its keypoints. To bound
-   memory/cost on gigapixel inputs, detection is TILED (overlapping tiles, each
-   with its own keypoint budget so features stay spatially dense), and the
-   template is detected at full resolution too (NOT downsampled) so descriptors
-   are scale-consistent. Boxes come out in full-res image px directly.
+1. **Coarsest-safe-level tiled detection** (§K.2) — the template (NOT the image)
+   picks a detection level ``L`` = the coarsest pyramid level at which the
+   downsampled template's short side stays ≥ ``MIN_TPL_FEATURE`` px. Both the
+   image (downsampled by ``2^L`` with ``INTER_AREA``) and the template (likewise)
+   are detected at level ``L``; keypoints are stored/used in FULL-RES coords
+   (×``2^L``), so all geometry stays full-resolution and boxes come out in
+   full-res image px directly. ``L == 0`` reproduces the original full-resolution
+   tiled detection exactly (small templates/images are unchanged). Detecting at
+   the coarse level is faster AND drops distractor descriptors, which *helps* the
+   Lowe ratio test recover warped instances on gigapixel images. The level is
+   bounded so the template is NEVER decimated below ``MIN_TPL_FEATURE`` — that
+   exact over-decimation is the bug that made feature matching find nothing on
+   large images, so the bound is load-bearing. To bound memory/cost, detection is
+   TILED (overlapping tiles, each with its own keypoint budget so features stay
+   spatially dense).
 2. **Detector** — ORB (default), AKAZE, or SIFT on the grayscale image. Image
    keypoints/descriptors are computed **once per (image, detector)** and cached
    on this matcher; :meth:`invalidate_image` clears the cache when the engine
@@ -67,6 +76,24 @@ _DETECT_OVERLAP = 96       # tiles overlap on every side so a keypoint's descrip
 _FEATURES_PER_TILE = 1500  # ORB/SIFT keypoint budget per detection tile
 _TEMPLATE_FEATURES = 5000  # denser budget for the (small) template crop
 _MIN_TEMPLATE_SIDE = 12    # below this a template cannot anchor a homography
+
+# Coarsest-safe-level detection pyramid (§K.2). Detecting features over a
+# gigapixel image at full resolution is the dominant cost of the feature path AND
+# floods the matcher with distractor descriptors (which hurt the Lowe ratio test
+# → missed warped instances). Instead we detect at the COARSEST pyramid level
+# where the downsampled template still keeps enough texture to fire ORB. The
+# level is chosen FROM THE TEMPLATE so the template never decimates below
+# ``MIN_TPL_FEATURE`` px on its shorter side — that exact over-decimation is the
+# bug that made feature matching return nothing on large images, so this bound is
+# load-bearing, NOT a tunable.
+#
+#   L = clamp(floor(log2(min(th, tw) / MIN_TPL_FEATURE)), 0, MAX_FEATURE_LEVEL)
+#
+# L == 0 reproduces today's full-resolution tiled detection exactly (small
+# templates / small images are unchanged), so the small-image behaviour and the
+# existing tests are preserved.
+_MIN_TPL_FEATURE = 96      # coarsest level keeps the template's short side ≥ ~96 px
+_MAX_FEATURE_LEVEL = 4     # cap the pyramid depth (2^4 = 16× downsample ceiling)
 
 #: RANSAC reprojection threshold (px, at detection scale). Inliers must lie
 #: within this distance of the projected model — a few px tolerates the
@@ -114,17 +141,29 @@ class FeatureMatcher:
             ) from exc
 
         self._cv2 = cv2
-        # Cache of {detector_name: (kps, desc)} for the staged image — full-res
-        # keypoints (absolute image coords) and their descriptors. Detection is
-        # full resolution, so no per-detector scale factor is needed. Cleared by
-        # invalidate_image().
-        self._image_cache: dict[str, tuple[list[Any], np.ndarray | None]] = {}
+        # Cache of {(detector_name, level): (kps, desc)} for the staged image —
+        # FULL-RES keypoint coordinates (absolute image coords, already ×2^level)
+        # and their descriptors, detected on the image downsampled by 2^level
+        # (§K.2). Keying on the level lets two queries with different templates
+        # (hence different safe levels) each reuse their own cached detection.
+        # Cleared by invalidate_image().
+        self._image_cache: dict[
+            tuple[str, int], tuple[list[Any], np.ndarray | None]
+        ] = {}
         self._image_shape: tuple[int, int] | None = None  # (H, W) at full res
         # Cheap fingerprint of the image the cache was built against. Defense in
         # depth: the engine calls invalidate_image() in set_image, but if a caller
         # reuses this matcher on a *different* array of the same detector without
         # invalidating, a stale fingerprint mismatch forces a re-detect (§U2).
         self._image_fingerprint: tuple[Any, ...] | None = None
+        # Test/diagnostic toggle: force the full-resolution path (L=0) regardless
+        # of the template-selected level. The full path stays the recall reference
+        # so a test can assert pyramid-vs-full parity (§K.2/§K.3). Off by default.
+        self._force_full_level: bool = False
+        # The level chosen for the most recent query (read by tests/benchmarks to
+        # report the selected L per template/image size). ``None`` before any
+        # query runs.
+        self._last_level: int | None = None
 
     # -- cache management ----------------------------------------------------
 
@@ -176,6 +215,31 @@ class FeatureMatcher:
         raise ValueError(f"unknown feature_detector {name!r}; expected orb/akaze/sift")
 
     @staticmethod
+    def _select_level(th: int, tw: int) -> int:
+        """Coarsest pyramid level that keeps the template usable (§K.2).
+
+        ``L = clamp(floor(log2(min(th, tw) / MIN_TPL_FEATURE)), 0,
+        MAX_FEATURE_LEVEL)`` — the deepest level at which the template's shorter
+        side, after downsampling by ``2^L``, is still ≥ ~``MIN_TPL_FEATURE`` px
+        (enough texture for ORB). ``L == 0`` for any template whose short side is
+        below ``2 * MIN_TPL_FEATURE``, reproducing today's full-resolution
+        behaviour exactly on small templates/images.
+
+        The cap is deliberately conservative: the template is NEVER decimated
+        below ``MIN_TPL_FEATURE`` (the regression that made feature matching find
+        nothing on large images, §J.3/§K.2), since ``2^L ≤ min(th,tw)/MIN_TPL``
+        implies ``min(th,tw)/2^L ≥ MIN_TPL_FEATURE``.
+        """
+        short = max(1, min(int(th), int(tw)))
+        if short < 2 * _MIN_TPL_FEATURE:
+            # log2(ratio) < 1 → floor is 0; short-circuit (avoids a log of <1).
+            return 0
+        # floor(log2(short / MIN_TPL_FEATURE)): the largest L with
+        # short / 2^L >= MIN_TPL_FEATURE, i.e. 2^L <= short / MIN_TPL_FEATURE.
+        level = int(np.floor(np.log2(short / _MIN_TPL_FEATURE)))
+        return max(0, min(level, _MAX_FEATURE_LEVEL))
+
+    @staticmethod
     def _fingerprint(image_gray: np.ndarray) -> tuple[Any, ...]:
         """Cheap identity fingerprint of a grayscale image for cache validation.
 
@@ -199,8 +263,16 @@ class FeatureMatcher:
         gray: np.ndarray,
         detector_name: str,
         cancel: Callable[[], bool] | None,
+        level: int = 0,
     ) -> tuple[list[Any] | None, np.ndarray | None]:
-        """Detect features over a full-res image in overlapping tiles.
+        """Detect features over a (possibly downsampled) image in overlapping tiles.
+
+        When ``level > 0`` the image is first downsampled by ``2^level`` with
+        ``cv2.INTER_AREA`` (the area-average resampler — anti-aliases, so coarse
+        keypoints stay repeatable) and detection runs on that smaller image; every
+        kept keypoint's coordinate is then multiplied by ``2^level`` so the cache
+        always stores **full-resolution** keypoint coordinates (§K.2). ``level==0``
+        is the original full-resolution tiled detection, bit-for-bit unchanged.
 
         Each tile is detected with its own keypoint budget so features stay
         spatially uniform across a gigapixel image (a single global cap would
@@ -214,7 +286,17 @@ class FeatureMatcher:
         mid-detection (so the caller does not cache a partial result).
         """
         cv2 = self._cv2
-        h, w = gray.shape[:2]
+        factor = 1 << int(level)  # 2^level
+        if factor > 1:
+            fh, fw = gray.shape[:2]
+            # INTER_AREA downsample by 2^level (§K.2). Detection then runs on the
+            # smaller image; keypoints are scaled back to full-res coords below.
+            dw = max(1, fw // factor)
+            dh = max(1, fh // factor)
+            det_img = cv2.resize(gray, (dw, dh), interpolation=cv2.INTER_AREA)
+        else:
+            det_img = gray
+        h, w = det_img.shape[:2]
         detector, _norm = self._make_detector(detector_name, nfeatures=_FEATURES_PER_TILE)
         step = _DETECT_TILE
         ov = _DETECT_OVERLAP
@@ -227,7 +309,7 @@ class FeatureMatcher:
                 # Detection window = core + overlap on every side (clamped).
                 ox0, oy0 = max(0, tx - ov), max(0, ty - ov)
                 ox1, oy1 = min(w, tx + step + ov), min(h, ty + step + ov)
-                sub = np.ascontiguousarray(gray[oy0:oy1, ox0:ox1])
+                sub = np.ascontiguousarray(det_img[oy0:oy1, ox0:ox1])
                 kp, desc = detector.detectAndCompute(sub, None)
                 if desc is None or kp is None or len(kp) == 0:
                     continue
@@ -237,7 +319,9 @@ class FeatureMatcher:
                 for i, k in enumerate(kp):
                     ax, ay = k.pt[0] + ox0, k.pt[1] + oy0
                     if tx <= ax < cx1 and ty <= ay < cy1:
-                        k.pt = (ax, ay)  # offset to absolute image coords
+                        # Scale the detection-level coordinate back to full-res so
+                        # the cache always speaks full-resolution image px (§K.2).
+                        k.pt = (ax * factor, ay * factor)
                         keep.append(i)
                 if not keep:
                     continue
@@ -253,21 +337,24 @@ class FeatureMatcher:
         self,
         image_gray: np.ndarray,
         detector_name: str,
+        level: int,
         cancel: Callable[[], bool] | None,
     ) -> tuple[list[Any], np.ndarray | None]:
-        """Detect+cache the full-res image's keypoints/descriptors per detector.
+        """Detect+cache the image's keypoints/descriptors per ``(detector, level)``.
 
-        Runs the tiled detector once per ``(image, detector)`` and caches the
-        result so subsequent queries with the same detector reuse it. Keypoints
-        are in absolute full-resolution image coordinates.
+        Runs the tiled detector once per ``(image, detector, level)`` on the image
+        downsampled by ``2^level`` (§K.2) and caches the result so subsequent
+        queries with the same detector AND level reuse it. Keypoints are stored in
+        absolute **full-resolution** image coordinates regardless of the detection
+        level, so all downstream geometry (RANSAC, bbox clamp) is full-res.
 
         Returns ``(image_kps, image_desc)``.
         """
-        key = (detector_name or "orb").lower()
+        key = ((detector_name or "orb").lower(), int(level))
         # Defense-in-depth (§U2): if the image array differs from the one the cache
         # was built against (caller reused the matcher without invalidate_image),
-        # drop every cached detector so we re-detect against the current image
-        # rather than returning stale keypoints/descriptors.
+        # drop every cached detector/level so we re-detect against the current
+        # image rather than returning stale keypoints/descriptors.
         fingerprint = self._fingerprint(image_gray)
         if self._image_fingerprint is not None and fingerprint != self._image_fingerprint:
             self._image_cache.clear()
@@ -281,7 +368,7 @@ class FeatureMatcher:
         h, w = image_gray.shape[:2]
         self._image_shape = (h, w)
 
-        kps, desc = self._detect_tiled(image_gray, key, cancel)
+        kps, desc = self._detect_tiled(image_gray, key[0], cancel, level=level)
         if kps is None:
             # Cancelled mid-detection — return empty without caching the partial.
             return [], None
@@ -348,9 +435,25 @@ class FeatureMatcher:
         if cancel is not None and cancel():
             return []
 
-        # --- 1-2. image features at FULL resolution (cached per detector) ----
+        # --- 0. select the coarsest-safe detection level from the template ---
+        # The template (NOT the image) picks the level: L is the deepest pyramid
+        # level at which the downsampled template's short side stays ≥
+        # MIN_TPL_FEATURE px, so the template is never decimated into oblivion
+        # (the regression that made features find nothing on large images, §K.2).
+        tmpl_gray_full = self._to_gray(template)
+        th_full, tw_full = tmpl_gray_full.shape[:2]
+        if min(th_full, tw_full) < _MIN_TEMPLATE_SIDE:
+            return []  # too small to anchor a homography
+        level = 0 if self._force_full_level else self._select_level(th_full, tw_full)
+        self._last_level = level
+        factor = 1 << level  # 2^level
+
+        # --- 1-2. image features at level L (cached per (detector, level)) ---
+        # Image keypoints come back in FULL-RES coordinates (the detector scaled
+        # them ×2^level), so all geometry below is full-resolution regardless of
+        # the detection level.
         img_kps, img_desc = self._ensure_image_features(
-            image_gray, detector_name, cancel
+            image_gray, detector_name, level, cancel
         )
         if progress is not None:
             progress(50)
@@ -359,21 +462,34 @@ class FeatureMatcher:
         if img_desc is None or len(img_kps) < min_inliers:
             return []  # nothing detectable in the image for this detector
 
-        # --- 3. template features at FULL resolution -------------------------
-        # Detect the template at native scale (NOT downsampled): the image is
-        # detected at full res too, so descriptors are scale-consistent, and a
-        # modest selection keeps all its keypoints (downsampling the template was
-        # the bug that made feature matching find nothing on large images).
-        tmpl_gray = self._to_gray(template)
-        th_full, tw_full = tmpl_gray.shape[:2]
-        if min(th_full, tw_full) < _MIN_TEMPLATE_SIDE:
-            return []  # too small to anchor a homography
+        # --- 3. template features at level L ---------------------------------
+        # Detect the template downsampled by 2^level (INTER_AREA) so its
+        # descriptors are scale-consistent with the level-L image detection, then
+        # scale the keypoints back to full-res template coords (×2^level). At
+        # level 0 this is identical to the original full-resolution detection, so
+        # small templates/images are unchanged (§K.2). The level bound guarantees
+        # the downsampled template's short side stays ≥ MIN_TPL_FEATURE px, so it
+        # still carries enough texture for ORB — never the decimation bug.
+        if factor > 1:
+            tdw = max(1, tw_full // factor)
+            tdh = max(1, th_full // factor)
+            tmpl_det = cv2.resize(
+                tmpl_gray_full, (tdw, tdh), interpolation=cv2.INTER_AREA
+            )
+        else:
+            tmpl_det = tmpl_gray_full
 
         detector, norm = self._make_detector(detector_name, nfeatures=_TEMPLATE_FEATURES)
-        tmpl_kps, tmpl_desc = detector.detectAndCompute(tmpl_gray, None)
+        tmpl_kps, tmpl_desc = detector.detectAndCompute(tmpl_det, None)
         tmpl_kps = list(tmpl_kps) if tmpl_kps is not None else []
         if tmpl_desc is None or len(tmpl_kps) < min_inliers:
             return []
+        if factor > 1:
+            # Map template keypoints back to full-res template coords so the
+            # homography is fit in a single full-resolution frame (template and
+            # image both full-res), and the projected box is already full-res.
+            for k in tmpl_kps:
+                k.pt = (k.pt[0] * factor, k.pt[1] * factor)
 
         # --- knnMatch + Lowe ratio test -------------------------------------
         bf = cv2.BFMatcher(norm)

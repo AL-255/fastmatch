@@ -506,3 +506,84 @@ cache on the Matcher, invalidated in `set_image`). `effective_device` unchanged.
   (and `-headless` avoids Qt-plugin clashes with PySide6).
 - `README.md`: document the 4 methods + when to use each (flat→SSD, textured→NCC, warped/rotated→features),
   that conv methods are GPU and feature matching is CPU via OpenCV, and the new method dropdown.
+
+---
+
+# K. PERFORMANCE — Image-Pyramid Optimization (per mode)
+
+Matching cost scales ~linearly with image pixels (baseline RTX 5060: NCC×1 855 ms, NCC×5 4276 ms, SSD/CCORR
+~1.7 s at 8000²; ×~50 on CPU). Each mode gets an image-pyramid optimization. **Hard rule: recall parity** —
+the optimized path must recover the SAME true instances the full-resolution path does (verified scene-by-
+scene against the full search); it trades a tiny, bounded precision/recall margin only where provably safe,
+and falls back to the full path when the pyramid can't help (so existing tests/behaviour never regress).
+
+### K.1 Conv modes (ncc/ssd/ccorr): coarse-to-fine search
+
+The full search computes the score map over every full-res position. Coarse-to-fine instead localizes
+candidates cheaply at a downsampled level, then refines only those candidates at finer levels.
+
+**Compute image pyramid** (in `engine.set_image`, on the compute device, cached, reused across queries):
+levels ℓ=0..K, level ℓ = the staged luminance (and rgb planes, if staged) downsampled by 2^ℓ via
+`F.avg_pool2d(2)`. Memory overhead ≈ 1/3 of the base. Build lazily/bounded so it never blows the VRAM
+budget (it participates in the OOM ladder; on OOM, skip pyramid and use the full path).
+
+**Per (template, scale) algorithm:**
+1. **Level count** `K = clamp(floor(log2(min(sth,stw) / MIN_COARSE_SIDE)), 0, MAX_PYR_LEVELS)`
+   (`MIN_COARSE_SIDE≈16`, `MAX_PYR_LEVELS≈4`). If `K==0` (template/image too small) → use the existing
+   full-res `_search_all_scales` path (no behaviour change; this is what the small-image tests exercise).
+2. **Coarse search** at level K: downsample the template to level K (scale·2^-K), compute the FULL score map
+   on the (tiny) level-K image via the existing per-tile machinery, local-max + threshold at a **relaxed**
+   `coarse_thr = max(0, min(threshold, threshold_floor) - COARSE_MARGIN)` (`COARSE_MARGIN≈0.20` so a true
+   peak that looks weaker when blurred is NOT pruned). Collect candidate top-left positions.
+3. **Refine** ℓ=K-1…0: map each candidate ×2; around the mapped position open a search window of
+   `±REFINE_RADIUS` (≈3 px, absorbs the ×2 + downsample-rounding uncertainty); **batch-extract** the
+   level-ℓ ROIs (each `window + (sth_ℓ-1)` so the conv is valid), stack as `(N,1,Hroi,Wroi)`, and compute
+   the score map for all ROIs in ONE batched `F.conv2d` (+ batched box filters). Keep local-max peaks ≥ the
+   level threshold; dedupe candidates landing in the same cell. These become the next level's candidates.
+4. **Level 0** peaks are the final candidates (exact positions + scores) → feed the existing
+   `_finalize` (source-exclusion, IoU-NMS, top-K), identical to the full path.
+5. **Multi-scale**: run coarse-to-fine per requested scale; pool all candidates; ONE global NMS (as today).
+
+**Refactor enabling the ROI batch:** split the per-window score into (a) term computation (cross_z via
+conv, S1/S2 via box filters — done for a tile OR a batch of ROIs) and (b) a pure-elementwise
+`_score_from_terms(method, cross_z, S1, S2, n, meanT, normTz, sumT2, …)` that is shape-agnostic, so both
+the tiled full path and the batched ROI path reuse the exact same NCC/SSD/CCORR formula (§J.2). NCC stays
+numerically identical on the full path.
+
+**Performance kernel:** the ROI refinement MUST be batched (one conv over N ROIs), not a Python per-
+candidate loop, so refinement cost is ~O(#candidates · template²) on the GPU regardless of image size. The
+coarse full search is ~O(pixels/4^K). Target: NCC×5 @8000² from ~4.3 s to < ~0.8 s; NCC×1 @8000² < ~0.2 s;
+similar or better on CPU; **recall identical** to full search on the test scenes.
+
+**Safeguards:** keep `_search_all_scales` (full) intact as the fallback and the recall reference; an internal
+toggle/flag forces the full path so a test can assert pyramid-vs-full recall parity. A forced `core_tile`
+(used by the seam test) takes the full path. The coarse margin is conservative; if a benchmark scene shows
+the pyramid missing a true instance the full path finds, widen `COARSE_MARGIN` / raise `MIN_COARSE_SIDE`.
+
+### K.2 Feature mode: coarsest-safe-level detection pyramid
+
+The feature path's cost is dominated by global image detection. Detecting at FULL res over a gigapixel image
+is slow AND produces many distractor descriptors (which hurt the Lowe ratio test → missed warped instances).
+Optimization: detect at the **coarsest pyramid level that still keeps the template usable**.
+
+- **Level selection from the template:** `L = clamp(floor(log2(min(th,tw) / MIN_TPL_FEATURE)), 0,
+  MAX_FEATURE_LEVEL)` with `MIN_TPL_FEATURE≈96` — the coarsest level where the downsampled template still has
+  ≥ ~96 px (enough ORB keypoints). `L=0` reproduces today's full-res tiled detection (so small templates /
+  small images are unchanged).
+- **Per-level cached tiled detection:** detect the image downsampled by `2^L` (INTER_AREA), tiled with the
+  per-tile budget as today, cached per `(detector, L)`; keypoints stored in full-res coords (×2^L).
+- **Per query:** pick L from the template, downsample the template by `2^L`, detect/match/RANSAC at that
+  level, map boxes back ×2^L. Fewer features at level L ⇒ faster knnMatch + RANSAC AND fewer distractors
+  ⇒ **equal-or-better recall** (this should also help the gigapixel rotated-instance case).
+- **Safety:** the level is bounded so the template never decimates below `MIN_TPL_FEATURE` (this is the exact
+  failure that made feature matching return nothing before — do NOT reintroduce it). Verify recall parity
+  vs L=0 on the rotated-instance scene at several image sizes.
+
+### K.3 Verification (both modes)
+- **Recall parity:** on a battery of scenes (stamped motifs at known locations; rotated/scaled copies; tile
+  seams; flat regions), assert the optimized path recovers every true instance the full path recovers
+  (IoU ≥ 0.7), with precision no worse beyond a small tolerance.
+- **Benchmarks:** report before/after match() time per mode at 4000²/8000² (GPU) and a CPU spot-check; the
+  optimization must be substantially faster (target ≥ 3× on NCC×5, ≥ 2× elsewhere) with no recall loss.
+- The existing 30 tests must still pass; add tests asserting pyramid-vs-full recall parity on a larger scene
+  and that `core_tile`/small-image paths still work.

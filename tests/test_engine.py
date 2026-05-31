@@ -554,3 +554,164 @@ def test_flat_template_ncc_raises_but_ssd_recovers() -> None:
         assert _iou((r.x, r.y, r.w, r.h), exclude_box) <= params.exclude_iou, (
             "[ssd] source region was not excluded"
         )
+
+
+# --------------------------------------------------------------------------- #
+# (f) Coarse-to-fine image-pyramid search: recall parity vs the full path.
+#
+# DESIGN §K.1 / §K.3: the pyramid path must recover the SAME true instances the
+# full-resolution path recovers (IoU >= 0.7), with the full path kept as the
+# recall reference. We build a scene large enough (and a template big enough)
+# that Matcher(use_pyramid=True) actually engages the coarse-to-fine path, then
+# assert it recovers every instance the full search does, for ncc/ssd/ccorr.
+# Kept CPU-fast: the pyramid run is sub-second and the full reference run is a
+# fraction of a second at this size.
+# --------------------------------------------------------------------------- #
+def _make_large_motif(rng: np.random.Generator, mh: int = 96, mw: int = 88) -> np.ndarray:
+    """A bigger version of the asymmetric motif so the pyramid path engages."""
+    m = np.zeros((mh, mw, 3), dtype=np.uint8)
+    m[:, :, 0] = 30
+    m[: mh // 2, : mw // 2, 0] = 240
+    m[: mh // 2, mw // 2 :, 1] = 220
+    m[mh // 2 :, : mw // 3, 2] = 200
+    m[mh // 2 :, mw // 3 :, :] = 255
+    m[6:18, mw - 18 : mw - 6, :] = 0
+    m = np.clip(m.astype(np.int16) + rng.integers(-4, 5, m.shape), 0, 255).astype(np.uint8)
+    return m
+
+
+@cpu
+@pytest.mark.parametrize("method", ["ncc", "ssd", "ccorr"])
+def test_pyramid_recall_parity_vs_full(method: str) -> None:
+    """Pyramid path recovers exactly the instances the full path does (§K.1/§K.3).
+
+    Recall parity is non-negotiable: for the same scene and params,
+    ``use_pyramid=True`` must recover every true instance ``use_pyramid=False``
+    recovers at IoU >= 0.7, with the source excluded.
+    """
+    rng = np.random.default_rng(11)
+    h, w = 1100, 1100
+    img = _make_background(h, w, rng)
+    motif = _make_large_motif(rng)
+    mh, mw = motif.shape[:2]
+    # Spread well apart so the 96x88 stamps never overlap.
+    positions = [(50, 50), (650, 180), (250, 700), (820, 760), (470, 430)]
+    _stamp(img, motif, positions)
+    truth_boxes = [(x, y, mw, mh) for (x, y) in positions]
+
+    src_idx = 0
+    sx, sy = positions[src_idx]
+    template = np.ascontiguousarray(img[sy : sy + mh, sx : sx + mw])
+    exclude_box = (sx, sy, mw, mh)
+    params = _default_params(method=method, threshold=0.80)
+
+    # The pyramid must actually engage here, else this test proves nothing.
+    pm = Matcher(device="cpu", use_pyramid=True)
+    pm.set_image(img)
+    assert pm._pyramid_beneficial(  # noqa: SLF001 - intentional white-box check
+        pm._prepare_template(template, "luminance", method), params.scales
+    ), "pyramid did not engage — test would be vacuous"
+
+    def _recovered(matcher: "Matcher") -> set[int]:
+        results = matcher.match(template, params, exclude_box=exclude_box)
+        assert all(0.0 <= r.score <= 1.0 for r in results)
+        kept = [r for r in results if r.score >= params.threshold]
+        # Source must be excluded on both paths.
+        for r in kept:
+            assert _iou((r.x, r.y, r.w, r.h), exclude_box) <= params.exclude_iou
+        rec: set[int] = set()
+        for i, tb in enumerate(truth_boxes):
+            if i == src_idx:
+                continue
+            if any(_iou((r.x, r.y, r.w, r.h), tb) >= 0.7 for r in kept):
+                rec.add(i)
+        return rec
+
+    full = Matcher(device="cpu", use_pyramid=False)
+    full.set_image(img)
+    full_rec = _recovered(full)
+    pyr_rec = _recovered(pm)
+
+    # The full path is the recall reference; the pyramid must recover at least
+    # everything it does (here: every non-source instance).
+    assert full_rec, f"[{method}] full path recovered nothing — bad scene"
+    assert full_rec.issubset(pyr_rec), (
+        f"[{method}] pyramid missed instances the full path found: "
+        f"full={sorted(full_rec)} pyramid={sorted(pyr_rec)}"
+    )
+
+
+@cpu
+@pytest.mark.parametrize("method", ["ncc", "ssd", "ccorr"])
+def test_pyramid_parity_high_frequency_template(method: str) -> None:
+    """Pyramid parity for a HIGH-FREQUENCY (noise) template (§K.1 regression).
+
+    Regression guard: the coarse template must be down-sampled the SAME way as the
+    image pyramid (average pooling, not bilinear). For a high-frequency template,
+    a bilinear-vs-average mismatch drops an exact copy's coarse NCC well below the
+    threshold, so the pyramid prunes it and finds NOTHING — while the full search
+    finds it. (A low-frequency/structured motif hides the bug, which is why this
+    case is exercised explicitly.) NCC is the sensitive method; SSD/CCORR are
+    included for completeness.
+    """
+    rng = np.random.default_rng(7)
+    h, w = 1100, 1100
+    img = _make_background(h, w, rng)
+    # Pure high-frequency motif (energy only at fine scales — destroyed by a
+    # bilinear shrink that disagrees with the image's average-pool pyramid).
+    mh, mw = 96, 88
+    motif = rng.integers(0, 256, (mh, mw, 3), dtype=np.uint8)
+    positions = [(60, 60), (640, 200), (260, 720), (800, 740)]
+    _stamp(img, motif, positions)
+    truth_boxes = [(x, y, mw, mh) for (x, y) in positions]
+
+    sx, sy = positions[0]
+    template = np.ascontiguousarray(img[sy : sy + mh, sx : sx + mw])
+    exclude_box = (sx, sy, mw, mh)
+    params = _default_params(method=method, threshold=0.80)
+
+    pm = Matcher(device="cpu", use_pyramid=True)
+    pm.set_image(img)
+    assert pm._pyramid_beneficial(  # noqa: SLF001 - the pyramid must engage
+        pm._prepare_template(template, "luminance", method), params.scales
+    ), "pyramid did not engage — test would be vacuous"
+
+    def _recovered(matcher: "Matcher") -> set[int]:
+        kept = [
+            r
+            for r in matcher.match(template, params, exclude_box=exclude_box)
+            if r.score >= params.threshold
+        ]
+        rec: set[int] = set()
+        for i, tb in enumerate(truth_boxes):
+            if i == 0:
+                continue
+            if any(_iou((r.x, r.y, r.w, r.h), tb) >= 0.7 for r in kept):
+                rec.add(i)
+        return rec
+
+    full = Matcher(device="cpu", use_pyramid=False)
+    full.set_image(img)
+    full_rec = _recovered(full)
+    pyr_rec = _recovered(pm)
+    assert full_rec, f"[{method}] full path recovered nothing — bad scene"
+    assert full_rec.issubset(pyr_rec), (
+        f"[{method}] pyramid missed high-frequency instances the full path found: "
+        f"full={sorted(full_rec)} pyramid={sorted(pyr_rec)}"
+    )
+
+
+@cpu
+def test_forced_core_tile_disables_pyramid() -> None:
+    """A forced ``core_tile`` always takes the full path (§K.1 safeguard).
+
+    The seam test forces a small ``core_tile``; that must keep the search on the
+    full-resolution tiled path (pyramid off) so its tile-seam bookkeeping is
+    exercised unchanged, regardless of the default ``use_pyramid=True``.
+    """
+    m = Matcher(device="cpu", core_tile=64)
+    assert m._use_pyramid is False  # noqa: SLF001 - white-box safeguard check
+
+    # And the default constructor leaves the pyramid available.
+    m2 = Matcher(device="cpu")
+    assert m2._use_pyramid is True  # noqa: SLF001

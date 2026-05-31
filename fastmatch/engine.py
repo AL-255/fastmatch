@@ -86,6 +86,40 @@ _LOCALMAX_MAX_KERNEL = 48
 _SMOOTH_RADICES = (2, 3, 5, 7)
 
 
+# --- coarse-to-fine image-pyramid search constants (§K.1) -------------------
+
+#: Smallest template side (px) we keep at the coarsest pyramid level. The level
+#: count is chosen so the down-sampled template never drops below this — below
+#: it a blurred template loses the structure that makes a peak detectable.
+_MIN_COARSE_SIDE = 16
+
+#: Hard cap on pyramid levels above level 0 (§K.1). Bounds memory and the number
+#: of refinement passes regardless of how big the image/template are.
+_MAX_PYR_LEVELS = 4
+
+#: Relaxation subtracted from the (clamped) threshold at the coarse level so a
+#: true peak that looks weaker once blurred is NOT pruned before refinement
+#: (§K.1). Conservative on purpose — recall parity beats a tighter coarse cut.
+_COARSE_MARGIN = 0.20
+
+#: Half-width (px, at each refined level's own resolution) of the search window
+#: opened around each ×2-mapped coarse candidate. Absorbs the ×2 mapping plus
+#: the avg-pool down-sampling rounding uncertainty (§K.1).
+_REFINE_RADIUS = 3
+
+#: Below this template×scale pixel count the coarse-to-fine machinery's fixed
+#: overhead (pyramid pooling of the template, ROI gather/scatter) outweighs the
+#: tiny full-res conv it would replace, so the full path is used instead. Keeps
+#: the small-image/test scenes on the unchanged full path and auto-enables the
+#: pyramid only when it actually pays (§K.1 "auto-enable only when beneficial").
+_PYRAMID_MIN_TEMPLATE_PX = 64 * 64
+
+#: Below this image pixel count the full-res search is already cheap enough that
+#: the pyramid's overhead is not worth it (and keeps every existing small-image
+#: test on the byte-identical full path).
+_PYRAMID_MIN_IMAGE_PX = 1024 * 1024
+
+
 def _next_smooth(n: int) -> int:
     """Smallest integer ``>= n`` whose only prime factors are 2, 3, 5, 7.
 
@@ -204,6 +238,7 @@ class Matcher:
         conv_backend: Literal["auto", "spatial", "fft"] = "auto",
         vram_fraction: float = 0.6,
         core_tile: int | None = None,
+        use_pyramid: bool = True,
     ) -> None:
         """Construct a matcher.
 
@@ -224,7 +259,15 @@ class Matcher:
                 size (square), overriding the VRAM-derived auto size. ``None``
                 (default) auto-sizes from VRAM on CUDA / uses a large single tile
                 on CPU. T6 tests set this to force tile seams; it does not change
-                results, only how the output grid is partitioned.
+                results, only how the output grid is partitioned. A forced
+                ``core_tile`` ALSO disables the coarse-to-fine pyramid so the seam
+                test always exercises the full-resolution path (§K.1 safeguard).
+            use_pyramid: Enable the coarse-to-fine image-pyramid search for the
+                convolution methods (§K.1). ``True`` (default) auto-enables the
+                pyramid only when it is beneficial (large enough image *and*
+                template); it falls back to the full-resolution
+                :meth:`_search_all_scales` otherwise and on any error.
+                ``False`` forces the full path — the recall-parity reference.
         """
         self._device = resolve_device(device if device is not None else "auto")
         self._compute_dtype = compute_dtype
@@ -232,6 +275,9 @@ class Matcher:
         self._conv_backend = conv_backend
         self._vram_fraction = float(vram_fraction)
         self._forced_core_tile = core_tile
+        # A forced core tile means a test is exercising the tile-seam partitioning
+        # on the full-resolution path; never override that with the pyramid.
+        self._use_pyramid = bool(use_pyramid) and core_tile is None
 
         # fp16 inputs lose precision near the denominator zero-crossing, so the
         # spec raises eps an order of magnitude in that mode.
@@ -248,6 +294,16 @@ class Matcher:
         self._rgb: list[torch.Tensor] | None = None
         self._h: int = 0
         self._w: int = 0
+
+        # Compute-device image pyramid for the coarse-to-fine search (§K.1):
+        # _pyr_lum[ell] is the staged luminance down-sampled by 2**ell via
+        # avg_pool2d(2) (level 0 == self._lum), and _pyr_rgb[ell] the matching
+        # 3-plane fp32 RGB stack when rgb is staged. Built lazily on first use
+        # by _ensure_pyramid(), bounded by _MAX_PYR_LEVELS, cached and reused
+        # across queries, and invalidated by set_image(). On a build OOM it is
+        # left empty so match() transparently uses the full path.
+        self._pyr_lum: list[torch.Tensor] | None = None
+        self._pyr_rgb: list[list[torch.Tensor]] | None = None
         # Host-side uint8 luminance for the OpenCV feature path (§J.3); the conv
         # methods never read it. Populated by set_image().
         self._lum_u8: np.ndarray | None = None
@@ -327,6 +383,11 @@ class Matcher:
             np.clip(np.rint(np.asarray(lum) * 255.0), 0, 255).astype(np.uint8)
         )
 
+        # A new image invalidates the cached coarse-to-fine pyramid (§K.1); it is
+        # rebuilt lazily on the next match() against the new staged luminance/rgb.
+        self._pyr_lum = None
+        self._pyr_rgb = None
+
         # A new image invalidates any cached image features (§J.3/§J.4). The
         # matcher object itself is reused so its detector cache key still applies.
         if self._feature_matcher is not None:
@@ -401,15 +462,32 @@ class Matcher:
         scales = tuple(params.scales) if params.scales else (1.0,)
         device = self._device
 
+        # Choose the coarse-to-fine pyramid path when it is beneficial (§K.1),
+        # else the full-resolution search. The pyramid path internally falls back
+        # to the full path per (template, scale) when the level count K==0, and on
+        # any error/OOM the whole job degrades to the full path below — so recall
+        # parity holds and existing tests (which hit the not-beneficial branch or
+        # a forced core_tile) exercise the byte-identical full path.
+        use_pyramid = self._pyramid_beneficial(tmpl, scales)
+
         # The whole search is wrapped in the CUDA OOM degradation ladder. On CPU
         # the ladder collapses to a single straight run (no OOM expected).
         try:
-            cands = self._search_all_scales(
-                tmpl, scales, params, channel_mode, method, cancel, progress
-            )
+            if use_pyramid:
+                cands = self._search_all_scales_pyramid(
+                    tmpl, scales, params, channel_mode, method, cancel, progress
+                )
+            else:
+                cands = self._search_all_scales(
+                    tmpl, scales, params, channel_mode, method, cancel, progress
+                )
         except torch.cuda.OutOfMemoryError:
             if device.type != "cuda":
                 raise  # CPU OOM is a real failure, not something we degrade.
+            # The pyramid participates in the OOM ladder (§K.1): drop it and let
+            # the degradation ladder run the plain full-resolution search.
+            self._pyr_lum = None
+            self._pyr_rgb = None
             cands = self._degrade_after_oom(
                 tmpl, scales, params, channel_mode, method, cancel, progress
             )
@@ -545,6 +623,68 @@ class Matcher:
             )
         return per_channel, sth, stw
 
+    def _scaled_template_at_level(
+        self, tmpl: dict, scale: float, level: int
+    ) -> tuple[list[dict], int, int]:
+        """Template per-channel terms at physical ``scale`` AND pyramid ``level``.
+
+        The coarse/refine template MUST be down-sampled the SAME way the image
+        pyramid is (``F.avg_pool2d(2)`` per level) — not by bilinear interpolation.
+        Otherwise, for high-frequency content, an exact copy's coarse NCC is well
+        below 1.0 (bilinear vs. average disagree pixel-for-pixel), the relaxed
+        coarse threshold prunes it, and the pyramid misses real matches that the
+        full search finds. Here we first resample to the requested physical scale
+        (bilinear, matching the full path at ``level == 0``) and then ``avg_pool2d``
+        ``level`` times, mirroring :meth:`_ensure_pyramid`. ``level == 0`` is
+        identical to :meth:`_scaled_template`.
+        """
+        if level <= 0:
+            return self._scaled_template(tmpl, scale)
+        # Level-0 channels at the requested physical scale (bilinear, as the full path).
+        if abs(scale - 1.0) < 1e-9:
+            chans = list(tmpl["channels"])
+        else:
+            th, tw = tmpl["th"], tmpl["tw"]
+            sth0 = max(_MIN_SIDE, int(round(th * scale)))
+            stw0 = max(_MIN_SIDE, int(round(tw * scale)))
+            chans = [
+                F.interpolate(
+                    c.unsqueeze(0).unsqueeze(0),
+                    size=(sth0, stw0),
+                    mode="bilinear",
+                    align_corners=False,
+                )[0, 0]
+                for c in tmpl["channels"]
+            ]
+        # Average-pool `level` times to match the image pyramid construction.
+        pooled: list[torch.Tensor] = []
+        for c in chans:
+            x = c.unsqueeze(0).unsqueeze(0)
+            for _ in range(level):
+                if min(x.shape[-2], x.shape[-1]) < 2:
+                    break
+                x = F.avg_pool2d(x, kernel_size=2)
+            pooled.append(x[0, 0])
+
+        sth, stw = pooled[0].shape[0], pooled[0].shape[1]
+        n = float(sth * stw)
+        per_channel: list[dict] = []
+        for c in pooled:
+            mean = c.mean()
+            tz = c - mean
+            norm_tz = torch.sqrt((tz * tz).sum()).clamp(min=self._eps)
+            sum_t2 = (c * c).sum()
+            per_channel.append(
+                {
+                    "tz": tz.unsqueeze(0).unsqueeze(0).contiguous(),
+                    "norm_tz": norm_tz,
+                    "mean_t": mean,
+                    "sum_t2": sum_t2,
+                    "n": n,
+                }
+            )
+        return per_channel, sth, stw
+
     # -- multi-scale orchestration -------------------------------------------
 
     def _search_all_scales(
@@ -636,6 +776,464 @@ class Matcher:
             "score": torch.cat(all_score),
             "scale": torch.cat(all_scale),
         }
+
+    # -- coarse-to-fine image-pyramid search (§K.1) --------------------------
+
+    def _pyramid_beneficial(self, tmpl: dict, scales: tuple[float, ...]) -> bool:
+        """Decide whether coarse-to-fine is worth it for this query (§K.1).
+
+        Auto-enable only when the pyramid actually pays: the full-resolution
+        search must be expensive enough (large image AND a large-enough template
+        so the coarse level is meaningfully smaller) and at least one requested
+        scale must yield ``K >= 1``. Otherwise return ``False`` so the unchanged
+        full path runs — this keeps every small-image/seam test on the
+        byte-identical full path and avoids paying the pyramid's fixed overhead
+        where it would lose.
+        """
+        if not self._use_pyramid:
+            return False
+        # Below these sizes the full-res search is already cheap; the pyramid's
+        # template-pooling + ROI gather overhead would not be recovered.
+        if (self._h * self._w) < _PYRAMID_MIN_IMAGE_PX:
+            return False
+        th, tw = tmpl["th"], tmpl["tw"]
+        # At least one scale must produce a real (>=1) level count AND keep the
+        # scaled template above the px floor where coarse localization is stable.
+        for s in scales:
+            sth = max(_MIN_SIDE, int(round(th * s)))
+            stw = max(_MIN_SIDE, int(round(tw * s)))
+            if (sth * stw) < _PYRAMID_MIN_TEMPLATE_PX:
+                continue
+            if self._level_count(sth, stw) >= 1:
+                return True
+        return False
+
+    def _level_count(self, sth: int, stw: int) -> int:
+        """Pyramid level count ``K`` for a template of size ``sth x stw`` (§K.1).
+
+        ``K = clamp(floor(log2(min(sth,stw) / MIN_COARSE_SIDE)), 0, MAX_PYR_LEVELS)``
+        — the coarsest level whose down-sampled template still keeps ``>=
+        MIN_COARSE_SIDE`` px on its shorter side, capped at ``MAX_PYR_LEVELS``.
+        """
+        m = min(sth, stw)
+        if m < _MIN_COARSE_SIDE:
+            return 0
+        k = int(np.floor(np.log2(m / _MIN_COARSE_SIDE)))
+        return int(max(0, min(_MAX_PYR_LEVELS, k)))
+
+    def _ncc_safe_level(self, tmpl: dict, scale: float, k: int, method: str) -> int:
+        """Largest level ``<= k`` whose down-sampled NCC template keeps variance.
+
+        For NCC, the coarse template must retain structure (variance on the
+        ``[0,1]`` template ``>= _VAR_FLOOR``); otherwise its blurred-flat NCC peak
+        is zeroed by the flat-region guard and the coarse pass misses the match.
+        Returns the deepest level where the template at physical scale
+        ``scale / 2**level`` still clears the floor (``0`` falls back to the full
+        path). Non-NCC methods are unaffected and ``k`` is returned unchanged.
+        """
+        if method != "ncc" or k <= 0:
+            return k
+        lvl = k
+        while lvl > 0:
+            per_channel, sth_l, stw_l = self._scaled_template_at_level(tmpl, scale, lvl)
+            n = max(1, sth_l * stw_l)
+            # Variance on [0,1] = sum(Tz^2)/n = norm_tz^2 / n; keep the deepest
+            # level where any channel still has structure (permissive: rgb needs
+            # only one informative channel).
+            vmax = max(float((c["norm_tz"] ** 2).item()) / n for c in per_channel)
+            if vmax >= _VAR_FLOOR:
+                break
+            lvl -= 1
+        return lvl
+
+    def _ensure_pyramid(self) -> bool:
+        """Build (lazily, once) the compute-device image pyramid (§K.1).
+
+        Levels ``0..MAX_PYR_LEVELS``: level 0 is the staged luminance (and rgb
+        planes when staged), level ``ell`` is the previous level down-sampled by
+        ``F.avg_pool2d(2)`` (memory overhead about 1/3 of the base). Cached on the
+        matcher and reused across queries. On a CUDA OOM during the build the
+        partial pyramid is discarded and ``False`` is returned so the caller uses
+        the full path (the pyramid participates in the OOM ladder, §K.1).
+        """
+        if self._pyr_lum is not None:
+            return True
+        if self._lum is None:
+            return False
+        try:
+            lum_levels: list[torch.Tensor] = [self._lum]
+            for _ in range(_MAX_PYR_LEVELS):
+                prev = lum_levels[-1]
+                if min(prev.shape[-2], prev.shape[-1]) < 2:
+                    break  # cannot halve further
+                lum_levels.append(F.avg_pool2d(prev, kernel_size=2))
+
+            rgb_levels: list[list[torch.Tensor]] | None = None
+            if self._rgb is not None:
+                # Pool each RGB plane in fp32 [0,1] so the level-ell ROI conv runs
+                # against the same normalized signal as the template channels
+                # (matching how _match_tile converts the uint8 plane per tile).
+                base = [p.to(torch.float32) / 255.0 for p in self._rgb]
+                rgb_levels = [base]
+                for _ in range(len(lum_levels) - 1):
+                    prev_planes = rgb_levels[-1]
+                    rgb_levels.append(
+                        [F.avg_pool2d(p, kernel_size=2) for p in prev_planes]
+                    )
+            self._pyr_lum = lum_levels
+            self._pyr_rgb = rgb_levels
+            return True
+        except torch.cuda.OutOfMemoryError:
+            self._pyr_lum = None
+            self._pyr_rgb = None
+            if self._device.type == "cuda":
+                torch.cuda.empty_cache()
+            return False
+
+    def _level_planes(
+        self, level: int, channel_mode: str, channels: int
+    ) -> list[torch.Tensor]:
+        """Image plane(s) at pyramid ``level`` matching the template channels.
+
+        Returns fp32 ``(1,1,Hl,Wl)`` slabs — three RGB planes when rgb mode is
+        active and the rgb pyramid is staged, else a single luminance plane —
+        paired positionally with ``per_channel`` exactly as :meth:`_match_tile`.
+        """
+        if channel_mode == "rgb" and self._pyr_rgb is not None and channels == 3:
+            return list(self._pyr_rgb[level])
+        assert self._pyr_lum is not None
+        return [self._pyr_lum[level]]
+
+    def _search_all_scales_pyramid(
+        self,
+        tmpl: dict,
+        scales: tuple[float, ...],
+        params: MatchParams,
+        channel_mode: str,
+        method: str,
+        cancel: Callable[[], bool] | None,
+        progress: Callable[[int], None] | None,
+    ) -> dict:
+        """Coarse-to-fine multi-scale search, pooling raw candidates (§K.1).
+
+        Per scale: pick ``K``; ``K == 0`` falls back to the full-resolution
+        per-scale search (unchanged behaviour); otherwise localize candidates at
+        level ``K`` and refine them down to level 0 with batched ROI convs. All
+        scales' level-0 candidates are pooled and handed to the single global NMS
+        in :meth:`_finalize`, exactly like the full path. Falls back to the full
+        path entirely if the pyramid cannot be built.
+        """
+        if not self._ensure_pyramid():
+            return self._search_all_scales(
+                tmpl, scales, params, channel_mode, method, cancel, progress
+            )
+
+        all_x: list[torch.Tensor] = []
+        all_y: list[torch.Tensor] = []
+        all_w: list[torch.Tensor] = []
+        all_h: list[torch.Tensor] = []
+        all_score: list[torch.Tensor] = []
+        all_scale: list[torch.Tensor] = []
+
+        n_scales = max(len(scales), 1)
+        for si, s in enumerate(scales):
+            if cancel is not None and cancel():
+                break
+            sth = max(_MIN_SIDE, int(round(tmpl["th"] * s)))
+            stw = max(_MIN_SIDE, int(round(tmpl["tw"] * s)))
+            assert self._pyr_lum is not None
+            # K cannot exceed the number of pyramid levels actually built.
+            k = min(self._level_count(sth, stw), len(self._pyr_lum) - 1)
+            # NCC needs the down-sampled template to keep its variance. A high-
+            # frequency / low-structure template averaged down to a deep coarse
+            # level can become near-flat; the flat-region guard then zeros its NCC
+            # peak, so the coarse pass finds ZERO candidates and the pyramid misses
+            # real matches that the full search finds (SSD/CCORR don't subtract the
+            # mean, so they are unaffected). Reduce K to the deepest level where the
+            # coarse template still clears the variance floor; K==0 -> full path.
+            k = self._ncc_safe_level(tmpl, s, k, method)
+
+            if k <= 0:
+                # Small template at this scale: the unchanged full-res per-scale
+                # path (keeps recall parity for the easy cases automatically).
+                per_channel, sth0, stw0 = self._scaled_template(tmpl, s)
+                xs, ys, ws, hs, scs = self._full_scale_candidates(
+                    per_channel, sth0, stw0, s, params, channel_mode, method, cancel
+                )
+            else:
+                xs, ys, ws, hs, scs = self._coarse_to_fine_scale(
+                    tmpl, s, k, params, channel_mode, method, cancel
+                )
+
+            if xs.numel() > 0:
+                all_x.append(xs)
+                all_y.append(ys)
+                all_w.append(ws)
+                all_h.append(hs)
+                all_score.append(scs)
+                all_scale.append(torch.full_like(scs, float(s)))
+
+            if progress is not None:
+                progress(min(100, int(round(100.0 * (si + 1) / n_scales))))
+
+        return self._stack_candidates(all_x, all_y, all_w, all_h, all_score, all_scale)
+
+    def _full_scale_candidates(
+        self,
+        per_channel: list[dict],
+        sth: int,
+        stw: int,
+        scale: float,
+        params: MatchParams,
+        channel_mode: str,
+        method: str,
+        cancel: Callable[[], bool] | None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Run the unchanged tiled full-res search for ONE scale (K==0 branch).
+
+        Reuses :meth:`_plan_tiles` / :meth:`_match_tile` so this scale is computed
+        byte-identically to the full path — the recall reference for the easy
+        (small-template) cases the pyramid skips.
+        """
+        tiles = self._plan_tiles(sth, stw)
+        xs_l: list[torch.Tensor] = []
+        ys_l: list[torch.Tensor] = []
+        ws_l: list[torch.Tensor] = []
+        hs_l: list[torch.Tensor] = []
+        sc_l: list[torch.Tensor] = []
+        for tile in tiles:
+            if cancel is not None and cancel():
+                break
+            gx, gy, ws, hs, scs = self._match_tile(
+                per_channel, sth, stw, scale, tile, params, channel_mode, method
+            )
+            if gx.numel() > 0:
+                xs_l.append(gx)
+                ys_l.append(gy)
+                ws_l.append(ws)
+                hs_l.append(hs)
+                sc_l.append(scs)
+        if not xs_l:
+            empty = torch.empty(0, device=self._device)
+            return empty, empty, empty, empty, empty
+        return (
+            torch.cat(xs_l),
+            torch.cat(ys_l),
+            torch.cat(ws_l),
+            torch.cat(hs_l),
+            torch.cat(sc_l),
+        )
+
+    def _coarse_to_fine_scale(
+        self,
+        tmpl: dict,
+        scale: float,
+        k: int,
+        params: MatchParams,
+        channel_mode: str,
+        method: str,
+        cancel: Callable[[], bool] | None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Coarse-to-fine localization for ONE scale (§K.1 steps 2-4).
+
+        Returns flat ``(x, y, w, h, score)`` level-0 candidate tensors (full-res
+        top-left px + the scaled box size + the exact level-0 score) ready for the
+        shared :meth:`_finalize`. No Python per-candidate loop touches the GPU:
+        the refinement is one batched conv over all ROIs per level.
+        """
+        device = self._device
+        floor = float(params.threshold_floor)
+        thr = float(params.threshold)
+        # Relaxed coarse threshold so a true peak that is weaker once blurred is
+        # not pruned before it can be refined (§K.1 step 2).
+        coarse_thr = max(0.0, min(thr, floor) - _COARSE_MARGIN)
+        empty = torch.empty(0, device=device)
+
+        # --- step 2: coarse full score map at level K -----------------------
+        # Template at level K: physical scale s, then avg-pooled k times so it is
+        # down-sampled IDENTICALLY to the image pyramid (consistency is essential
+        # for high-frequency templates — see _scaled_template_at_level).
+        per_channel_k, sth_k, stw_k = self._scaled_template_at_level(tmpl, scale, k)
+        coarse_map = self._level_score_map(
+            k, per_channel_k, sth_k, stw_k, method, channel_mode
+        )
+        if coarse_map is None:
+            return empty, empty, empty, empty, empty
+        cy, cx = self._local_max_positions(coarse_map, sth_k, stw_k, coarse_thr)
+        if cy.numel() == 0:
+            return empty, empty, empty, empty, empty
+
+        # --- step 3: refine ell = K-1 .. 0 ----------------------------------
+        # Candidates carried as level-(ell+1) top-left positions; mapped ×2 into
+        # the current level at the top of each iteration.
+        last_scores = empty
+        sth0, stw0 = sth_k, stw_k
+        for ell in range(k - 1, -1, -1):
+            if cancel is not None and cancel():
+                return empty, empty, empty, empty, empty
+            per_channel_l, sth_l, stw_l = self._scaled_template_at_level(tmpl, scale, ell)
+            # Per-level threshold: relaxed for the intermediate (still-blurred)
+            # levels, exact `floor` only at level 0 where positions are final.
+            level_thr = floor if ell == 0 else coarse_thr
+            cy, cx, sc = self._refine_level(
+                ell, cy, cx, per_channel_l, sth_l, stw_l, method, channel_mode, level_thr
+            )
+            if cy.numel() == 0:
+                return empty, empty, empty, empty, empty
+            if ell == 0:
+                last_scores = sc
+                sth0, stw0 = sth_l, stw_l
+
+        # --- step 4: level-0 candidates -> finalize-ready tensors -----------
+        gx = cx.to(torch.float32)
+        gy = cy.to(torch.float32)
+        ws = torch.full_like(gx, float(int(round(stw0))))
+        hs = torch.full_like(gx, float(int(round(sth0))))
+        scores = last_scores.clamp(min=0.0)
+        return gx, gy, ws, hs, scores
+
+    def _level_score_map(
+        self,
+        level: int,
+        per_channel: list[dict],
+        sth: int,
+        stw: int,
+        method: str,
+        channel_mode: str,
+    ) -> torch.Tensor | None:
+        """Full (single-slab) score map for one pyramid ``level`` (§K.1 step 2).
+
+        The coarse level is tiny (image area / ``4**level``) so a single conv over
+        the whole level is cheap — no tiling needed. Returns the sanitized 2-D map
+        (the final ``max(0, ·)`` NOT yet applied), or ``None`` when the template is
+        larger than the level.
+        """
+        channels = len(per_channel)
+        planes = self._level_planes(level, channel_mode, channels)
+        hl, wl = planes[0].shape[-2], planes[0].shape[-1]
+        if hl - sth + 1 <= 0 or wl - stw + 1 <= 0:
+            return None
+        m = self._score_map(planes, per_channel, sth, stw, method)[0]
+        return torch.nan_to_num(m, nan=-1.0, posinf=-1.0, neginf=-1.0)
+
+    def _local_max_positions(
+        self, score_map: torch.Tensor, sth: int, stw: int, thr: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Threshold + local-max prefilter on a 2-D score map (§D.5 reused).
+
+        Identical neighborhood policy to :meth:`_match_tile` (template size capped
+        at :data:`_LOCALMAX_MAX_KERNEL`) so coarse peaks are picked the same way
+        the full path picks them. Returns ``(rows, cols)`` top-left positions.
+        """
+        kh = min(sth, _LOCALMAX_MAX_KERNEL)
+        kw = min(stw, _LOCALMAX_MAX_KERNEL)
+        pooled = F.max_pool2d(
+            score_map.unsqueeze(0).unsqueeze(0),
+            kernel_size=(kh, kw),
+            stride=1,
+            padding=(kh // 2, kw // 2),
+        )[0, 0, : score_map.shape[0], : score_map.shape[1]]
+        peaks = (score_map >= pooled) & (score_map >= thr)
+        ys, xs = torch.nonzero(peaks, as_tuple=True)
+        return ys, xs
+
+    def _refine_level(
+        self,
+        level: int,
+        cand_y_up: torch.Tensor,
+        cand_x_up: torch.Tensor,
+        per_channel: list[dict],
+        sth: int,
+        stw: int,
+        method: str,
+        channel_mode: str,
+        thr: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Refine candidates at one finer ``level`` with ONE batched conv (§K.1).
+
+        ``cand_*_up`` are top-left positions in the *coarser* (level+1) grid. Each
+        is mapped ×2 into this level, a ``±_REFINE_RADIUS`` window opened around
+        it, and the matching valid ROI (``window + (s*-1)`` so the conv is valid)
+        batch-extracted into a single ``(N,1,Hroi,Wroi)`` tensor per channel. All
+        N score maps are produced by ONE batched :meth:`_score_map` call (no
+        per-candidate Python loop on the GPU), the per-ROI peak kept and deduped
+        to one candidate per grid cell. Returns ``(rows, cols, scores)`` in THIS
+        level's grid.
+        """
+        device = self._device
+        empty_l = torch.empty(0, dtype=torch.long, device=device)
+        empty_f = torch.empty(0, device=device)
+        planes = self._level_planes(level, channel_mode, len(per_channel))
+        hl, wl = planes[0].shape[-2], planes[0].shape[-1]
+
+        # ROI spans the search window plus the template support so the conv is
+        # valid; the valid output grid is then exactly the ±radius window.
+        win_w = (2 * _REFINE_RADIUS + 1) + (stw - 1)
+        win_h = (2 * _REFINE_RADIUS + 1) + (sth - 1)
+        max_y0 = hl - win_h
+        max_x0 = wl - win_w
+        if max_y0 < 0 or max_x0 < 0:
+            # Level smaller than one ROI: fall back to a single full score map.
+            full = self._level_score_map(level, per_channel, sth, stw, method, channel_mode)
+            if full is None:
+                return empty_l, empty_l, empty_f
+            ys, xs = self._local_max_positions(full, sth, stw, thr)
+            return ys, xs, full[ys, xs].clamp(min=0.0)
+
+        cy2 = cand_y_up.to(torch.long) * 2
+        cx2 = cand_x_up.to(torch.long) * 2
+        # ROI top-left = mapped position - REFINE_RADIUS, clamped in-bounds.
+        roi_y0 = (cy2 - _REFINE_RADIUS).clamp(min=0, max=max_y0)
+        roi_x0 = (cx2 - _REFINE_RADIUS).clamp(min=0, max=max_x0)
+
+        # Build the (N,1,win_h,win_w) batch per channel via vectorized gather: an
+        # index grid added to each ROI's top-left, no Python per-candidate loop.
+        n = roi_y0.numel()
+        ar_h = torch.arange(win_h, device=device)
+        ar_w = torch.arange(win_w, device=device)
+        rows = (roi_y0.view(n, 1, 1) + ar_h.view(1, win_h, 1)).expand(n, win_h, win_w)
+        cols = (roi_x0.view(n, 1, 1) + ar_w.view(1, 1, win_w)).expand(n, win_h, win_w)
+
+        roi_planes: list[torch.Tensor] = []
+        for p in planes:
+            plane = p[0, 0]  # (Hl,Wl)
+            roi = plane[rows, cols]  # (N,win_h,win_w) advanced-indexing gather
+            roi_planes.append(roi.unsqueeze(1))  # (N,1,win_h,win_w)
+
+        # ONE batched score map over all N ROIs (§K.1 performance kernel).
+        maps = self._score_map(roi_planes, per_channel, sth, stw, method)  # (N,oh,ow)
+        maps = torch.nan_to_num(maps, nan=-1.0, posinf=-1.0, neginf=-1.0)
+        oh, ow = maps.shape[-2], maps.shape[-1]
+
+        # Per-ROI argmax peak: the ROI's valid output grid is exactly the ±radius
+        # window, so its best cell is a local maximum within that window and gives
+        # one peak per candidate.
+        flat = maps.reshape(n, oh * ow)
+        best_val, best_idx = flat.max(dim=1)
+        keep = best_val >= thr
+        if not bool(keep.any()):
+            return empty_l, empty_l, empty_f
+
+        best_idx = best_idx[keep]
+        best_val = best_val[keep]
+        roi_y0k = roi_y0[keep]
+        roi_x0k = roi_x0[keep]
+        peak_r = best_idx // ow
+        peak_c = best_idx % ow
+        # Absolute top-left in this level's grid.
+        gy = roi_y0k + peak_r
+        gx = roi_x0k + peak_c
+
+        # Dedupe candidates that landed on the same level cell (overlapping ROIs
+        # from neighbouring coarse candidates can converge on one true peak),
+        # keeping the max score per cell — vectorized, no Python loop.
+        key = gy.to(torch.long) * wl + gx.to(torch.long)
+        uniq, inv = torch.unique(key, return_inverse=True)
+        u_score = torch.full((uniq.numel(),), -1.0, device=device)
+        u_score = u_score.scatter_reduce(0, inv, best_val, reduce="amax", include_self=True)
+        u_gy = (uniq // wl).to(torch.long)
+        u_gx = (uniq % wl).to(torch.long)
+        return u_gy, u_gx, u_score.clamp(min=0.0)
 
     # -- tiling --------------------------------------------------------------
 
@@ -768,7 +1366,9 @@ class Matcher:
         # still pass), already non-negative in [0,1] for SSD/CCORR. The common
         # nan_to_num(-1) sentinel + clamp(min=0) below then handles all three
         # uniformly (negative correlation -> 0 for NCC; no-op for SSD/CCORR).
-        ncc = self._score_map(img_planes, per_channel, sth, stw, method)
+        # The score helpers keep a leading batch dim (B==1 for a single tile);
+        # squeeze it back to the 2-D map this peak-extraction path expects.
+        ncc = self._score_map(img_planes, per_channel, sth, stw, method)[0]
 
         # Sanitize before any thresholding so a stray inf/nan can't masquerade as
         # a peak (§D.1). -1 is below every valid score, so a sanitized cell can
@@ -853,13 +1453,16 @@ class Matcher:
         """Compute the per-window score map for one of the convolution methods.
 
         Shared machinery for ``ncc``/``ssd``/``ccorr`` (§J.2): the *only*
-        difference between the three is the final score formula. All three reuse
-        the same per-channel quantities the engine already computes —
-        ``cross_z = conv(I, Tz)`` (zero-mean template), the box-filtered windowed
-        sum ``S1`` and sum-of-squares ``S2``, and the template scalars ``meanT``,
-        ``normTz``, ``sumT2``. The *raw* cross term is derived without a second
-        convolution: ``cross_raw = cross_z + meanT * S1`` (since ``T = Tz +
-        meanT``).
+        difference between the three is the final score formula. This thin wrapper
+        computes the per-channel score *terms* (cross/box-filter quantities) with
+        :meth:`_compute_score_terms` and then applies the pure-elementwise
+        :meth:`_score_from_terms` (§K.1 refactor) — exactly the split the batched
+        coarse-to-fine ROI path also reuses, so both paths share one formula and
+        NCC stays bit-for-bit identical on the full path.
+
+        Each plane in ``img_planes`` is a 4-D ``(B,1,H,W)`` slab (the full path
+        passes ``B == 1`` tiles; the batched-ROI path passes ``B == N`` stacked
+        ROIs). The returned map preserves the leading batch dim: ``(B, oh, ow)``.
 
         Luminance mode passes a single plane paired with the single template
         channel. ``rgb`` mode passes three image planes paired with the three
@@ -874,8 +1477,30 @@ class Matcher:
         is bit-for-bit identical to the legacy NCC map — the regression baseline),
         and already in ``[0, 1]`` for SSD/CCORR.
         """
+        terms = self._compute_score_terms(img_planes, per_channel, sth, stw)
+        return self._score_from_terms(method, terms)
+
+    def _compute_score_terms(
+        self,
+        img_planes: list[torch.Tensor],
+        per_channel: list[dict],
+        sth: int,
+        stw: int,
+    ) -> dict:
+        """Compute the per-window score *terms*, summed across channels (§K.1).
+
+        Returns the method-agnostic quantities every convolution score is built
+        from — ``cross_z``, ``cross_raw``, ``S2``, the (scalar) template ``sumT2``,
+        the NCC denominator ``sqrt(n·varI)·normTz``, the per-channel-summed SSD,
+        the featureless-window guard ``flat``, the per-channel pixel count ``n``
+        and the channel count — so the pure-elementwise :meth:`_score_from_terms`
+        can produce ncc/ssd/ccorr without re-touching the (expensive) conv/box
+        machinery. Shape-agnostic: ``img_planes`` are 4-D ``(B,1,H,W)`` slabs and
+        every term keeps the leading batch dim (``B == 1`` for a full-path tile,
+        ``B == N`` for the batched-ROI refinement). The accumulation order is the
+        legacy one so the resulting NCC map is bit-for-bit unchanged.
+        """
         n = per_channel[0]["n"]
-        eps = self._eps
         backend = self._cross_backend(sth, stw)
         channels = len(per_channel)
 
@@ -943,24 +1568,49 @@ class Matcher:
             and flat is not None
         )
 
+        return {
+            "cross_z": cross_z_sum,
+            "cross_raw": cross_raw_sum,
+            "s2": s2_sum,
+            "sum_t2": sum_t2_sum,
+            "ncc_denom": ncc_denom_sum,
+            "ssd": ssd_sum,
+            "flat": flat,
+            "n": n,
+            "channels": channels,
+        }
+
+    def _score_from_terms(self, method: str, terms: dict) -> torch.Tensor:
+        """Pure-elementwise score formula from precomputed terms (§K.1 / §J.2).
+
+        Shape-agnostic: operates on whatever shape the term tensors carry (a
+        ``(oh, ow)`` tile map on the full path, a ``(N, oh, ow)`` batch on the
+        ROI-refinement path) — there are no convolutions or box filters here, only
+        the final per-method arithmetic, so the tiled full path and the batched
+        coarse-to-fine path produce identical scores. NCC's expression and op
+        order are unchanged from the original ``_score_map`` so the NCC regression
+        tests still pass bit-for-bit.
+        """
+        eps = self._eps
+
         if method == "ncc":
             # coeff = cross_z / (sqrt(n·varI)·normTz + eps); flat windows -> 0.
-            # This expression and its op-order are unchanged from the original
-            # _ncc_map so the NCC regression tests still pass bit-for-bit.
-            ncc = cross_z_sum / (ncc_denom_sum + eps)
-            ncc = torch.where(flat, torch.zeros_like(ncc), ncc)
+            ncc = terms["cross_z"] / (terms["ncc_denom"] + eps)
+            ncc = torch.where(terms["flat"], torch.zeros_like(ncc), ncc)
             return ncc
 
         if method == "ccorr":
             # Cosine cross-correlation: cc = cross_raw / (sqrt(S2)·sqrt(sumT2)+eps).
             # Summed per-channel numerators/denominator terms before dividing.
-            cc = cross_raw_sum / (torch.sqrt(s2_sum) * torch.sqrt(sum_t2_sum) + eps)
+            cc = terms["cross_raw"] / (
+                torch.sqrt(terms["s2"]) * torch.sqrt(terms["sum_t2"]) + eps
+            )
             return cc.clamp(min=0.0, max=1.0)
 
         if method == "ssd":
             # Normalized squared difference -> flat-friendly similarity score.
             # rmse = sqrt(SSD / (n · channels)); score = clamp(1 - rmse, 0, 1).
-            rmse = torch.sqrt(ssd_sum / (n * channels))
+            rmse = torch.sqrt(terms["ssd"] / (terms["n"] * terms["channels"]))
             return (1.0 - rmse).clamp(min=0.0, max=1.0)
 
         raise ValueError(f"unsupported convolution method {method!r}")
@@ -969,7 +1619,10 @@ class Matcher:
         """Separable windowed-sum box filter (O(kh+kw)), fp32 accumulators.
 
         Sums over each ``kh x kw`` window via two 1-D ``ones`` convolutions
-        (vertical then horizontal). Output shape ``(H-kh+1, W-kw+1)``.
+        (vertical then horizontal). Input ``(B,1,H,W)``; output ``(B,H-kh+1,
+        W-kw+1)`` — the single channel dim is squeezed but the batch dim is kept
+        so the same kernel serves both the ``B==1`` full path and the ``B==N``
+        batched-ROI refinement (§K.1) without any per-candidate Python loop.
         """
         # Vertical sum: a (kh,1) ones kernel reduces H -> H-kh+1.
         ones_v = torch.ones((1, 1, kh, 1), device=x.device, dtype=torch.float32)
@@ -977,13 +1630,18 @@ class Matcher:
         # Horizontal sum: a (1,kw) ones kernel reduces W -> W-kw+1.
         ones_h = torch.ones((1, 1, 1, kw), device=x.device, dtype=torch.float32)
         s = F.conv2d(v, ones_h)
-        return s[0, 0]
+        return s[:, 0]
 
     def _cross_spatial(self, img: torch.Tensor, tz: torch.Tensor) -> torch.Tensor:
-        """Dense cross-correlation ``sum_w(I * Tz)`` via ``F.conv2d`` (no flip)."""
+        """Dense cross-correlation ``sum_w(I * Tz)`` via ``F.conv2d`` (no flip).
+
+        Input ``(B,1,H,W)`` against the shared single-channel template weight
+        ``(1,1,sth,stw)`` -> ``(B, oh, ow)`` (channel squeezed, batch kept) so one
+        ``F.conv2d`` covers all ``B`` ROIs at once on the refinement path.
+        """
         weight = tz.to(img.dtype)
         out = F.conv2d(img, weight)
-        return out[0, 0]
+        return out[:, 0]
 
     def _cross_fft(
         self, img: torch.Tensor, tz: torch.Tensor, sth: int, stw: int
@@ -993,16 +1651,18 @@ class Matcher:
         Circular convolution of the image with a *flipped* template equals linear
         cross-correlation once we pad both to a common length >= H+sth-1 (so the
         wrap-around tail does not contaminate the valid region) and crop the
-        valid ``(H-sth+1, W-stw+1)`` block.
+        valid ``(H-sth+1, W-stw+1)`` block. Input ``(B,1,H,W)``; the rfft2 batches
+        over the leading dims so the output keeps the batch: ``(B, oh, ow)``.
         """
         ih, iw = img.shape[-2], img.shape[-1]
         # Linear-conv length, padded to a 2-3-5-7 smooth size for FFT speed.
         fh = _next_smooth(ih + sth - 1)
         fw = _next_smooth(iw + stw - 1)
 
-        img2 = img[0, 0]
+        img2 = img[:, 0]  # (B,H,W)
         tzf = torch.flip(tz[0, 0], dims=(0, 1))  # flip so circular conv == correlation
 
+        # rfft2 transforms the trailing two dims, broadcasting the leading batch.
         img_fft = torch.fft.rfft2(img2, s=(fh, fw))
         tz_fft = torch.fft.rfft2(tzf, s=(fh, fw))
         conv = torch.fft.irfft2(img_fft * tz_fft, s=(fh, fw))
@@ -1011,7 +1671,7 @@ class Matcher:
         # spans (ih-sth+1, iw-stw+1).
         out_h = ih - sth + 1
         out_w = iw - stw + 1
-        return conv[sth - 1 : sth - 1 + out_h, stw - 1 : stw - 1 + out_w]
+        return conv[:, sth - 1 : sth - 1 + out_h, stw - 1 : stw - 1 + out_w]
 
     # -- OOM degradation ladder (CUDA only) ----------------------------------
 
