@@ -454,10 +454,14 @@ Backend: **OpenCV (cv2)**. REQUIRED only for this method; if cv2 is not importab
 the option. Convolution methods never import cv2.
 
 Pipeline (multi-instance, warp-tolerant):
-1. **Detection scale**: gigapixel feature detection is heavy, so downsample image (and template) by an
-   integer factor `f` so the image's max dimension ≤ `FEATURE_MAX_DIM = 3000`. Detect/match at that scale;
-   map result boxes back to full-res by `×f`. Cache the downsampled grayscale image + its keypoints/
-   descriptors on the Matcher, keyed by detector; invalidate in `set_image`.
+1. **Detection scale**: detect at **full resolution** so a template selected at native scale keeps all its
+   keypoints. (An earlier design downsampled image *and template* by a shared factor to bound cost; that
+   decimated any modest selection below ORB's keypoint threshold and made feature matching find nothing on
+   large images — the bug.) Bound cost/memory instead by **tiling** detection (`_DETECT_TILE` with
+   `_DETECT_OVERLAP`, each tile given `_FEATURES_PER_TILE` so keypoints stay spatially dense; each keypoint
+   assigned to one tile core so seams produce no duplicate descriptors). Boxes come out in full-res px
+   directly. Cache the full-res keypoints/descriptors on the Matcher, keyed by detector; invalidate in
+   `set_image`. The template is detected at full resolution too (denser `_TEMPLATE_FEATURES` budget).
 2. **Detector** per `feature_detector`: ORB (`cv2.ORB_create`, default), AKAZE, or SIFT. Grayscale (reuse
    staged luminance). Compute IMAGE kpts/desc once per (image, detector) and cache.
 3. **Per query**: detect TEMPLATE kpts/desc; `knnMatch(k=2)` template→image with the right norm

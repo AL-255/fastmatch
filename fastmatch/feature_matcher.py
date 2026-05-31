@@ -18,11 +18,12 @@ origin top-left, +x right / +y down, half-open boxes ``(x, y, w, h)`` (§F.3).
 
 Pipeline (see §J.3):
 
-1. **Detection scale** — gigapixel feature detection is heavy, so the image (and
-   template) are downsampled by an integer factor ``f`` chosen so the image's
-   longest side is ``<= FEATURE_MAX_DIM``. Detection/matching happen at that
-   scale and result boxes are mapped back to full-res by ``* f`` (and then by the
-   caller's ``scale_back`` if the passed image was itself a downscale).
+1. **Full-resolution tiled detection** — image features are detected at native
+   scale so a template selected at native scale keeps all its keypoints. To bound
+   memory/cost on gigapixel inputs, detection is TILED (overlapping tiles, each
+   with its own keypoint budget so features stay spatially dense), and the
+   template is detected at full resolution too (NOT downsampled) so descriptors
+   are scale-consistent. Boxes come out in full-res image px directly.
 2. **Detector** — ORB (default), AKAZE, or SIFT on the grayscale image. Image
    keypoints/descriptors are computed **once per (image, detector)** and cached
    on this matcher; :meth:`invalidate_image` clears the cache when the engine
@@ -48,11 +49,24 @@ import numpy as np
 
 from .types import Match
 
-# Cap the longest image side fed to the detector. Feature detection on a
-# gigapixel image is both slow and memory-hungry; downsampling to <= 3000 px on
-# the long edge keeps detection fast while preserving enough keypoints, and the
-# integer downsample factor maps boxes back cleanly (§J.3 step 1).
-FEATURE_MAX_DIM = 3000
+# Image feature detection runs at FULL resolution. Downsampling the image forced
+# the template to be downsampled by the same factor to keep descriptors at a
+# comparable scale, which decimated any modest selection (a 200 px box on a
+# 12000 px image shrank to 50 px) below ORB's keypoint threshold — so feature
+# matching found nothing on exactly the large images this app targets. Instead we
+# detect at native scale and bound cost/memory by TILING the detection, giving
+# each tile its own keypoint budget so features stay spatially dense everywhere
+# (a single global cap would leave any one small instance with too few keypoints
+# to match). Boxes are already in full-res coordinates — no scale-back needed.
+_DETECT_TILE = 2048        # full-res detection tile edge (px)
+_DETECT_OVERLAP = 96       # tiles overlap on every side so a keypoint's descriptor
+                           # patch and near-seam features have full context; a
+                           # keypoint is assigned to exactly one tile's core, so
+                           # there are no duplicate descriptors at seams (which
+                           # would defeat the Lowe ratio test there).
+_FEATURES_PER_TILE = 1500  # ORB/SIFT keypoint budget per detection tile
+_TEMPLATE_FEATURES = 5000  # denser budget for the (small) template crop
+_MIN_TEMPLATE_SIDE = 12    # below this a template cannot anchor a homography
 
 #: RANSAC reprojection threshold (px, at detection scale). Inliers must lie
 #: within this distance of the projected model — a few px tolerates the
@@ -100,13 +114,11 @@ class FeatureMatcher:
             ) from exc
 
         self._cv2 = cv2
-        # Cache of {detector_name: (down_f, kps, desc)} for the staged image. The
-        # downsample factor is stored alongside so a detector switch reuses the
-        # same factor and box-mapping math. Cleared by invalidate_image().
-        self._image_cache: dict[str, tuple[int, list[Any], np.ndarray | None]] = {}
-        # The grayscale image the cache was built against (downsampled). Stored so
-        # corner projection / clamping can use the detection-scale image extent.
-        self._image_gray: np.ndarray | None = None
+        # Cache of {detector_name: (kps, desc)} for the staged image — full-res
+        # keypoints (absolute image coords) and their descriptors. Detection is
+        # full resolution, so no per-detector scale factor is needed. Cleared by
+        # invalidate_image().
+        self._image_cache: dict[str, tuple[list[Any], np.ndarray | None]] = {}
         self._image_shape: tuple[int, int] | None = None  # (H, W) at full res
         # Cheap fingerprint of the image the cache was built against. Defense in
         # depth: the engine calls invalidate_image() in set_image, but if a caller
@@ -123,40 +135,44 @@ class FeatureMatcher:
         on the next feature query rather than reusing stale features.
         """
         self._image_cache.clear()
-        self._image_gray = None
         self._image_shape = None
         self._image_fingerprint = None
 
     # -- detector factory ----------------------------------------------------
 
-    def _make_detector(self, name: str):
+    def _make_detector(self, name: str, nfeatures: int | None = None):
         """Build the requested OpenCV detector and its descriptor norm.
 
         Returns ``(detector, norm)`` where ``norm`` is the BFMatcher distance for
         that descriptor type: HAMMING for the binary ORB/AKAZE descriptors, L2
         for SIFT's float descriptors (§J.3 step 3).
 
+        ``nfeatures`` caps the keypoint budget: per-tile for image detection
+        (spatially dense) and higher for the small template crop. ``None`` uses
+        the per-tile default.
+
         Raises:
             ValueError: on an unknown detector name.
         """
         cv2 = self._cv2
         n = (name or "orb").lower()
+        nf = _FEATURES_PER_TILE if nfeatures is None else int(nfeatures)
         if n == "orb":
-            # A generous feature budget so large templates match densely, plus a
-            # reduced ``edgeThreshold``: ORB's default (31 px) discards every
+            # Reduced ``edgeThreshold``: ORB's default (31 px) discards every
             # keypoint within 31 px of any border, which on a modest template
             # (e.g. a 56 px crop) leaves *zero* keypoints. Shrinking it keeps
             # keypoints near small-template edges while staying identical between
-            # the image and the template detection so descriptors are comparable.
+            # image and template detection so descriptors are comparable.
             # ``fastThreshold`` is lowered so faint synthetic texture still fires.
             return (
-                cv2.ORB_create(nfeatures=5000, edgeThreshold=15, fastThreshold=10),
+                cv2.ORB_create(nfeatures=nf, edgeThreshold=15, fastThreshold=10),
                 cv2.NORM_HAMMING,
             )
         if n == "akaze":
+            # AKAZE has no feature-count cap; per-tile detection bounds it instead.
             return cv2.AKAZE_create(), cv2.NORM_HAMMING
         if n == "sift":
-            return cv2.SIFT_create(), cv2.NORM_L2
+            return cv2.SIFT_create(nfeatures=nf), cv2.NORM_L2
         raise ValueError(f"unknown feature_detector {name!r}; expected orb/akaze/sift")
 
     @staticmethod
@@ -178,26 +194,58 @@ class FeatureMatcher:
             sample = tuple(int(v) for v in flat[idx])
         return (image_gray.shape, str(image_gray.dtype), sample)
 
-    @staticmethod
-    def _downsample_factor(h: int, w: int) -> int:
-        """Smallest integer ``f >= 1`` so ``max(h, w) / f <= FEATURE_MAX_DIM``."""
-        longest = max(h, w)
-        if longest <= FEATURE_MAX_DIM:
-            return 1
-        # ceil division gives the smallest factor that brings the long edge under
-        # the cap; integer factor keeps the box-mapping math exact (§J.3 step 1).
-        return int((longest + FEATURE_MAX_DIM - 1) // FEATURE_MAX_DIM)
+    def _detect_tiled(
+        self,
+        gray: np.ndarray,
+        detector_name: str,
+        cancel: Callable[[], bool] | None,
+    ) -> tuple[list[Any] | None, np.ndarray | None]:
+        """Detect features over a full-res image in overlapping tiles.
 
-    def _downscale(self, gray: np.ndarray, f: int) -> np.ndarray:
-        """Integer-factor area-average downscale of a grayscale image."""
-        if f <= 1:
-            return np.ascontiguousarray(gray)
+        Each tile is detected with its own keypoint budget so features stay
+        spatially uniform across a gigapixel image (a single global cap would
+        starve small instances). Tiles overlap by ``_DETECT_OVERLAP`` on every
+        side so a keypoint near a seam is detected with its full descriptor
+        patch; each keypoint is then assigned to exactly one tile's *core*, so no
+        duplicate descriptors land at seams (duplicates would defeat the Lowe
+        ratio test there). Keypoint coordinates are offset to absolute image px.
+
+        Returns ``(kps, desc)``, or ``(None, None)`` if ``cancel()`` fired
+        mid-detection (so the caller does not cache a partial result).
+        """
         cv2 = self._cv2
         h, w = gray.shape[:2]
-        # INTER_AREA is the right resampler for shrinking (anti-aliased).
-        return cv2.resize(
-            gray, (max(1, w // f), max(1, h // f)), interpolation=cv2.INTER_AREA
-        )
+        detector, _norm = self._make_detector(detector_name, nfeatures=_FEATURES_PER_TILE)
+        step = _DETECT_TILE
+        ov = _DETECT_OVERLAP
+        all_kp: list[Any] = []
+        all_desc: list[np.ndarray] = []
+        for ty in range(0, h, step):
+            for tx in range(0, w, step):
+                if cancel is not None and cancel():
+                    return None, None
+                # Detection window = core + overlap on every side (clamped).
+                ox0, oy0 = max(0, tx - ov), max(0, ty - ov)
+                ox1, oy1 = min(w, tx + step + ov), min(h, ty + step + ov)
+                sub = np.ascontiguousarray(gray[oy0:oy1, ox0:ox1])
+                kp, desc = detector.detectAndCompute(sub, None)
+                if desc is None or kp is None or len(kp) == 0:
+                    continue
+                # Core bounds (half-open) this tile owns.
+                cx1, cy1 = min(w, tx + step), min(h, ty + step)
+                keep: list[int] = []
+                for i, k in enumerate(kp):
+                    ax, ay = k.pt[0] + ox0, k.pt[1] + oy0
+                    if tx <= ax < cx1 and ty <= ay < cy1:
+                        k.pt = (ax, ay)  # offset to absolute image coords
+                        keep.append(i)
+                if not keep:
+                    continue
+                all_kp.extend(kp[i] for i in keep)
+                all_desc.append(desc[keep])
+        if not all_desc:
+            return [], None
+        return all_kp, np.vstack(all_desc)
 
     # -- image-feature cache -------------------------------------------------
 
@@ -206,14 +254,14 @@ class FeatureMatcher:
         image_gray: np.ndarray,
         detector_name: str,
         cancel: Callable[[], bool] | None,
-    ) -> tuple[int, list[Any], np.ndarray | None]:
-        """Detect+cache the downsampled image's keypoints/descriptors per detector.
+    ) -> tuple[list[Any], np.ndarray | None]:
+        """Detect+cache the full-res image's keypoints/descriptors per detector.
 
-        Computes the integer downsample factor once, downsamples the image, and
-        runs ``detectAndCompute`` a single time per ``(image, detector)`` — the
-        result is cached so subsequent queries with the same detector reuse it.
+        Runs the tiled detector once per ``(image, detector)`` and caches the
+        result so subsequent queries with the same detector reuse it. Keypoints
+        are in absolute full-resolution image coordinates.
 
-        Returns ``(down_f, image_kps, image_desc)`` at detection scale.
+        Returns ``(image_kps, image_desc)``.
         """
         key = (detector_name or "orb").lower()
         # Defense-in-depth (§U2): if the image array differs from the one the cache
@@ -223,7 +271,6 @@ class FeatureMatcher:
         fingerprint = self._fingerprint(image_gray)
         if self._image_fingerprint is not None and fingerprint != self._image_fingerprint:
             self._image_cache.clear()
-            self._image_gray = None
             self._image_shape = None
         self._image_fingerprint = fingerprint
 
@@ -233,19 +280,12 @@ class FeatureMatcher:
 
         h, w = image_gray.shape[:2]
         self._image_shape = (h, w)
-        f = self._downsample_factor(h, w)
-        small = self._downscale(image_gray, f)
-        self._image_gray = small
 
-        if cancel is not None and cancel():
-            # Don't cache a cancelled (potentially partial) detection.
-            return f, [], None
-
-        detector, _norm = self._make_detector(detector_name)
-        kps, desc = detector.detectAndCompute(small, None)
-        kps = list(kps) if kps is not None else []
-        result = (f, kps, desc)
-        # Only cache a real detection (post-cancel guard above already returned).
+        kps, desc = self._detect_tiled(image_gray, key, cancel)
+        if kps is None:
+            # Cancelled mid-detection — return empty without caching the partial.
+            return [], None
+        result = (kps, desc)
         self._image_cache[key] = result
         return result
 
@@ -308,8 +348,8 @@ class FeatureMatcher:
         if cancel is not None and cancel():
             return []
 
-        # --- 1-2. image features (cached per detector) ----------------------
-        down_f, img_kps, img_desc = self._ensure_image_features(
+        # --- 1-2. image features at FULL resolution (cached per detector) ----
+        img_kps, img_desc = self._ensure_image_features(
             image_gray, detector_name, cancel
         )
         if progress is not None:
@@ -319,17 +359,18 @@ class FeatureMatcher:
         if img_desc is None or len(img_kps) < min_inliers:
             return []  # nothing detectable in the image for this detector
 
-        # --- 3. template features at the same detection scale ---------------
+        # --- 3. template features at FULL resolution -------------------------
+        # Detect the template at native scale (NOT downsampled): the image is
+        # detected at full res too, so descriptors are scale-consistent, and a
+        # modest selection keeps all its keypoints (downsampling the template was
+        # the bug that made feature matching find nothing on large images).
         tmpl_gray = self._to_gray(template)
-        tmpl_small = self._downscale(tmpl_gray, down_f)
-        th_small, tw_small = tmpl_small.shape[:2]
-        # Degenerate templates (smaller than a few px after downscale) cannot
-        # define a homography-supporting corner quad.
-        if th_small < 2 or tw_small < 2:
-            return []
+        th_full, tw_full = tmpl_gray.shape[:2]
+        if min(th_full, tw_full) < _MIN_TEMPLATE_SIDE:
+            return []  # too small to anchor a homography
 
-        detector, norm = self._make_detector(detector_name)
-        tmpl_kps, tmpl_desc = detector.detectAndCompute(tmpl_small, None)
+        detector, norm = self._make_detector(detector_name, nfeatures=_TEMPLATE_FEATURES)
+        tmpl_kps, tmpl_desc = detector.detectAndCompute(tmpl_gray, None)
         tmpl_kps = list(tmpl_kps) if tmpl_kps is not None else []
         if tmpl_desc is None or len(tmpl_kps) < min_inliers:
             return []
@@ -348,22 +389,20 @@ class FeatureMatcher:
         if len(good) < min_inliers:
             return []
 
-        # Template corners (at detection scale) for projection -> bbox.
+        # Template corners (full-res) for projection -> bbox.
         tmpl_corners = np.array(
-            [[0, 0], [tw_small, 0], [tw_small, th_small], [0, th_small]],
+            [[0, 0], [tw_full, 0], [tw_full, th_full], [0, th_full]],
             dtype=np.float32,
         ).reshape(-1, 1, 2)
-        # Full-res template area for the scale estimate.
-        th_full, tw_full = tmpl_gray.shape[:2]
         tmpl_area_full = float(th_full * tw_full)
 
-        # Detection-scale image extent for clamping projected corners.
-        ih_small, iw_small = self._image_gray.shape[:2]  # type: ignore[union-attr]
+        # Image extent (full res) for clamping projected corners.
         full_h, full_w = self._image_shape  # type: ignore[misc]
 
         # --- 4. sequential RANSAC multi-instance loop -----------------------
-        # Total full-res-frame scale factor: detection downsample * caller's.
-        total_f = down_f * max(1, int(scale_back))
+        # Detection is full-res, so boxes are already in image px; only the
+        # caller's scale_back (1 from the engine) remains.
+        total_f = max(1, int(scale_back))
 
         results: list[Match] = []
         remaining = list(good)
@@ -395,7 +434,7 @@ class FeatureMatcher:
                 break
 
             box = self._project_to_box(
-                cv2, H, tmpl_corners, iw_small, ih_small
+                cv2, H, tmpl_corners, full_w, full_h
             )
             if box is not None:
                 bx_s, by_s, bw_s, bh_s = box
