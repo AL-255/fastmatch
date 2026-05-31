@@ -18,36 +18,38 @@ origin top-left, +x right / +y down, half-open boxes ``(x, y, w, h)`` (§F.3).
 
 Pipeline (see §J.3):
 
-1. **Coarsest-safe-level tiled detection** (§K.2) — the template (NOT the image)
-   picks a detection level ``L`` = the coarsest pyramid level at which the
-   downsampled template's short side stays ≥ ``MIN_TPL_FEATURE`` px. Both the
-   image (downsampled by ``2^L`` with ``INTER_AREA``) and the template (likewise)
-   are detected at level ``L``; keypoints are stored/used in FULL-RES coords
-   (×``2^L``), so all geometry stays full-resolution and boxes come out in
-   full-res image px directly. ``L == 0`` reproduces the original full-resolution
-   tiled detection exactly (small templates/images are unchanged). Detecting at
-   the coarse level is faster AND drops distractor descriptors, which *helps* the
-   Lowe ratio test recover warped instances on gigapixel images. The level is
-   bounded so the template is NEVER decimated below ``MIN_TPL_FEATURE`` — that
-   exact over-decimation is the bug that made feature matching find nothing on
-   large images, so the bound is load-bearing. To bound memory/cost, detection is
-   TILED (overlapping tiles, each with its own keypoint budget so features stay
-   spatially dense).
+1. **Full-resolution tiled detection** — image (and template) keypoints are
+   detected at native scale, because down-sampling drops keypoints and realistic
+   templates (the demo's flat colour-block motif; any feature-poor pattern) have
+   few to spare. Cost/memory is bounded by TILING (overlapping tiles, each with
+   its own keypoint budget so features stay spatially dense); the result is cached
+   per detector so the cost is one-time. (A coarsest-safe-level down-sampling
+   pyramid is plumbed via ``_MAX_FEATURE_LEVEL`` but defaults OFF — it traded too
+   much recall on feature-poor templates; see that constant's note.)
 2. **Detector** — ORB (default), AKAZE, or SIFT on the grayscale image. Image
    keypoints/descriptors are computed **once per (image, detector)** and cached
    on this matcher; :meth:`invalidate_image` clears the cache when the engine
    stages a new image.
-3. **Per query** — detect template keypoints/descriptors, ``knnMatch(k=2)``
-   template->image with the right norm (HAMMING for ORB/AKAZE, L2 for SIFT), and
-   keep matches passing the Lowe ratio test.
-4. **Sequential RANSAC homography** — repeatedly fit a homography on the surviving
-   matches; if it has enough inliers and passes degeneracy guards, record the
-   instance (template-corner quad -> axis-aligned bbox), remove its inliers, and
-   loop until too few matches remain or ``feature_max_instances`` is hit.
-5. **Score** — ``min(1.0, inliers / (2 * feature_min_inliers))`` (exact copies
-   saturate near 1.0; ambiguous ones score lower).
+3. **Multi-instance descriptor matching** — for each template feature keep ALL
+   image matches within an absolute "good descriptor" distance (``radiusMatch``),
+   NOT just the best. The classic Lowe ratio test rejects a match whose 2nd
+   neighbour is equally close — i.e. EVERY repeated/identical instance (each
+   template feature recurs once per copy) — so it finds nothing on the demo's many
+   copies. Keeping all good matches (one per copy) is what makes multi-instance
+   detection work; the geometry step below rejects the spurious ones.
+4. **Generalized-Hough vote + per-cluster homography** — each correspondence votes
+   for an instance centre using the matched keypoints' scale and orientation (a
+   similarity transform, à la Lowe 2004), so the correct correspondences for each
+   copy form a sharp peak well above the diffuse noise. Each peak's
+   correspondences are verified/refined with one homography (degeneracy-guarded),
+   yielding the instance's axis-aligned bbox; the votes are consumed and the next
+   peak is taken, up to ``feature_max_instances``. (Voting replaced a plain
+   sequential RANSAC, which drowned in the large ambiguous correspondence set and
+   recovered ~0-2 of many identical copies.)
+5. **Score** — ``min(1.0, inliers / (2 * feature_min_inliers))`` (richly supported
+   instances saturate near 1.0; ambiguous ones score lower).
 6. **Exclude source** — same rule as the conv path (IoU > ``exclude_iou`` or
-   center inside ``exclude_box``).
+   center inside ``exclude_box``); overlapping detections merged by IoU-NMS.
 """
 
 from __future__ import annotations
@@ -93,12 +95,44 @@ _MIN_TEMPLATE_SIDE = 12    # below this a template cannot anchor a homography
 # templates / small images are unchanged), so the small-image behaviour and the
 # existing tests are preserved.
 _MIN_TPL_FEATURE = 96      # coarsest level keeps the template's short side ≥ ~96 px
-_MAX_FEATURE_LEVEL = 4     # cap the pyramid depth (2^4 = 16× downsample ceiling)
+# Downsampling the image/template for feature detection is a SPEED optimization,
+# but it silently drops keypoints — and realistic templates (the demo's flat
+# colour-block motif; any feature-poor pattern) have few to begin with, so even a
+# 2× shrink halves recall on repeated instances. Full-resolution detection is
+# already tiled (memory-bounded) and cached (the cost is one-time, amortized
+# across queries), so it is fast enough in practice. We therefore default the
+# feature path to L=0 (full res) for reliability; set this > 0 only to trade
+# recall for first-query detection speed on very large, feature-rich templates.
+_MAX_FEATURE_LEVEL = 0     # 0 -> always full resolution (see note above)
 
 #: RANSAC reprojection threshold (px, at detection scale). Inliers must lie
 #: within this distance of the projected model — a few px tolerates the
 #: sub-pixel keypoint and homography noise without admitting outliers.
 _REPROJ_THRESH = 5.0
+
+#: RANSAC iterations for the per-instance homography fit. Raised above the cv2
+#: default because with MANY repeated copies a random 4-point sample is less
+#: likely to land entirely on one instance, so more iterations are needed to hit
+#: a geometrically consistent set.
+_RANSAC_ITERS = 5000
+
+#: Multi-instance descriptor matching. The classic Lowe ratio test rejects a
+#: match whose 2nd-nearest neighbour is (nearly) as close — which is EXACTLY what
+#: happens for repeated/identical instances: each template feature recurs once
+#: per copy, so its nearest neighbours (the copies) are all equally close and the
+#: ratio test discards them, finding nothing. The demo image (and the common
+#: "find every copy" use case) is precisely this. So instead of the ratio test we
+#: keep ALL image matches within an absolute "good descriptor" distance of each
+#: template feature (one correspondence per copy) and let the geometric RANSAC
+#: verification below reject the spurious ones. ``_GOOD_DIST`` is the per-detector
+#: max descriptor distance for a "good" match (random ORB Hamming ≈ 128; an exact
+#: copy ≈ 0); ``_MAX_MATCHES_PER_FEATURE`` caps the fan-out on repetitive texture.
+_GOOD_DIST = {
+    "orb": 64.0,    # Hamming on the 256-bit ORB descriptor
+    "akaze": 90.0,  # Hamming on AKAZE's (longer) binary descriptor
+    "sift": 300.0,  # L2 on 128-float SIFT (RANSAC filters the looser slack)
+}
+_MAX_MATCHES_PER_FEATURE = 256
 
 #: Reject a homography whose affine-part determinant is below this magnitude
 #: (near-singular / folded mapping) — a degenerate fit that does not correspond
@@ -491,17 +525,27 @@ class FeatureMatcher:
             for k in tmpl_kps:
                 k.pt = (k.pt[0] * factor, k.pt[1] * factor)
 
-        # --- knnMatch + Lowe ratio test -------------------------------------
+        # --- multi-instance descriptor matching (NOT the Lowe ratio test) ----
+        # Keep EVERY image match within an absolute "good" descriptor distance of
+        # each template feature — one correspondence per copy — so repeated /
+        # identical instances survive (the ratio test would reject them; see the
+        # _GOOD_DIST note). RANSAC below provides the geometric verification.
         bf = cv2.BFMatcher(norm)
-        # k=2 so the ratio test can compare best vs second-best (§J.3 step 3).
-        knn = bf.knnMatch(tmpl_desc, img_desc, k=2)
+        maxd = _GOOD_DIST.get((detector_name or "orb").lower(), 64.0)
+        # feature_ratio (UI, default 0.75) widens/narrows acceptance: at 0.75 it
+        # keeps the nominal threshold; higher = more permissive.
+        maxd *= max(0.25, ratio / 0.75)
+        matched = bf.radiusMatch(tmpl_desc, img_desc, maxDistance=float(maxd))
         good = []
-        for pair in knn:
-            if len(pair) < 2:
+        for ms in matched:
+            if not ms:
                 continue
-            m, second = pair[0], pair[1]
-            if m.distance < ratio * second.distance:
-                good.append(m)
+            # radiusMatch results are not guaranteed sorted; keep the nearest few
+            # per feature (cap the fan-out so a repetitive texture can't explode
+            # the correspondence set).
+            if len(ms) > _MAX_MATCHES_PER_FEATURE:
+                ms = sorted(ms, key=lambda m: m.distance)[:_MAX_MATCHES_PER_FEATURE]
+            good.extend(ms)
         if len(good) < min_inliers:
             return []
 
@@ -515,72 +559,116 @@ class FeatureMatcher:
         # Image extent (full res) for clamping projected corners.
         full_h, full_w = self._image_shape  # type: ignore[misc]
 
-        # --- 4. sequential RANSAC multi-instance loop -----------------------
-        # Detection is full-res, so boxes are already in image px; only the
-        # caller's scale_back (1 from the engine) remains.
+        # --- 4. generalized-Hough instance voting + per-cluster homography ---
+        # Without the ratio test the correspondence set is large and ambiguous
+        # (each template feature matches one keypoint per copy, plus noise), so a
+        # plain sequential RANSAC over the whole set drowns and finds almost
+        # nothing on repeated instances. Instead, each correspondence VOTES for an
+        # instance centre using the matched keypoints' scale and orientation (a
+        # similarity transform, à la Lowe 2004): the correct correspondences for a
+        # given copy all vote for the same centre, producing a sharp peak per
+        # instance that stands well above the diffuse noise. We then verify/refine
+        # each peak's correspondences with a single homography.
         total_f = max(1, int(scale_back))
-
         results: list[Match] = []
-        remaining = list(good)
-        while len(remaining) >= min_inliers and len(results) < max_instances:
-            if cancel is not None and cancel():
-                break
 
-            src_pts = np.float32(
-                [tmpl_kps[m.queryIdx].pt for m in remaining]
-            ).reshape(-1, 1, 2)
-            dst_pts = np.float32(
-                [img_kps[m.trainIdx].pt for m in remaining]
-            ).reshape(-1, 1, 2)
+        n = len(good)
+        tpx = np.empty(n, np.float32); tpy = np.empty(n, np.float32)
+        ipx = np.empty(n, np.float32); ipy = np.empty(n, np.float32)
+        rel_s = np.empty(n, np.float32); rel_a = np.empty(n, np.float32)
+        for i, m in enumerate(good):
+            tk = tmpl_kps[m.queryIdx]; ik = img_kps[m.trainIdx]
+            tpx[i], tpy[i] = tk.pt
+            ipx[i], ipy[i] = ik.pt
+            ts = tk.size if tk.size > 1e-3 else 1.0
+            rel_s[i] = ik.size / ts
+            # ORB/SIFT keypoint angle is degrees in [0,360); -1 means unset.
+            da = (ik.angle - tk.angle) if (ik.angle >= 0 and tk.angle >= 0) else 0.0
+            rel_a[i] = np.deg2rad(da)
+        # Predicted instance centre = img_kp + s*R(dθ)*(template_centre - tmpl_kp).
+        vx = (0.5 * tw_full) - tpx
+        vy = (0.5 * th_full) - tpy
+        cos = np.cos(rel_a); sin = np.sin(rel_a)
+        pcx = ipx + rel_s * (cos * vx - sin * vy)
+        pcy = ipy + rel_s * (sin * vx + cos * vy)
 
-            try:
-                H, mask = cv2.findHomography(
-                    src_pts, dst_pts, cv2.RANSAC, _REPROJ_THRESH
+        # Vote into a coarse 2-D histogram (bin ≈ a quarter of the template's
+        # short side, so one instance's votes land in one bin / its neighbours).
+        binsz = max(8, int(min(tw_full, th_full) // 4))
+        nbx = int(full_w // binsz) + 2
+        nby = int(full_h // binsz) + 2
+        valid = (pcx >= 0) & (pcx < full_w) & (pcy >= 0) & (pcy < full_h)
+        bx = np.clip((pcx / binsz).astype(np.int64), 0, nbx - 1)
+        by = np.clip((pcy / binsz).astype(np.int64), 0, nby - 1)
+        hist = np.zeros((nby, nbx), np.int32)
+        np.add.at(hist, (by[valid], bx[valid]), 1)
+
+        if int(hist.max()) >= min_inliers:
+            # Stop once peaks fall to the diffuse-noise floor; the homography
+            # verification below rejects any noise cluster that slips through.
+            vote_floor = max(min_inliers, int(0.12 * int(hist.max())))
+            used = np.zeros(n, bool)
+            it = 0
+            it_cap = 4 * max_instances + 8
+            while len(results) < max_instances and it < it_cap:
+                it += 1
+                if cancel is not None and cancel():
+                    break
+                py, px = np.unravel_index(int(np.argmax(hist)), hist.shape)
+                peak = int(hist[py, px])
+                if peak < vote_floor:
+                    break
+                # Gather this peak's correspondences (its bin + 8 neighbours) and
+                # consume them whether or not they yield an instance (so the loop
+                # always makes progress and cannot spin on the same peak).
+                cl = (
+                    (~used)
+                    & valid
+                    & (np.abs(bx - px) <= 1)
+                    & (np.abs(by - py) <= 1)
                 )
-            except cv2.error:
-                # Belt-and-suspenders: a degenerate point set (e.g. < 4 usable
-                # correspondences) raises rather than returning None — stop the
-                # sequential loop cleanly instead of propagating the cv2.error.
-                break
-            if H is None or mask is None:
-                break
-            inlier_mask = mask.ravel().astype(bool)
-            n_inliers = int(inlier_mask.sum())
-            if n_inliers < min_inliers:
-                break
-
-            box = self._project_to_box(
-                cv2, H, tmpl_corners, full_w, full_h
-            )
-            if box is not None:
+                idx = np.nonzero(cl)[0]
+                used[cl] = True
+                if idx.size:
+                    np.add.at(hist, (by[idx], bx[idx]), -1)
+                if idx.size < min_inliers:
+                    continue
+                src_pts = np.stack([tpx[idx], tpy[idx]], 1).reshape(-1, 1, 2)
+                dst_pts = np.stack([ipx[idx], ipy[idx]], 1).reshape(-1, 1, 2)
+                try:
+                    H, mask = cv2.findHomography(
+                        src_pts, dst_pts, cv2.RANSAC, _REPROJ_THRESH,
+                        maxIters=_RANSAC_ITERS, confidence=0.999,
+                    )
+                except cv2.error:
+                    continue
+                if H is None or mask is None:
+                    continue
+                n_inliers = int(mask.ravel().sum())
+                if n_inliers < min_inliers:
+                    continue
+                box = self._project_to_box(cv2, H, tmpl_corners, full_w, full_h)
+                if box is None:
+                    continue
                 bx_s, by_s, bw_s, bh_s = box
-                # Map detection-scale bbox to full-resolution and clamp to image.
-                bx = int(round(bx_s * total_f))
-                by = int(round(by_s * total_f))
-                bw = int(round(bw_s * total_f))
-                bh = int(round(bh_s * total_f))
-                bx = max(0, min(bx, full_w))
-                by = max(0, min(by, full_h))
-                bw = max(1, min(bw, full_w - bx))
-                bh = max(1, min(bh, full_h - by))
-
+                rx = max(0, min(int(round(bx_s * total_f)), full_w))
+                ry = max(0, min(int(round(by_s * total_f)), full_h))
+                rw = max(1, min(int(round(bw_s * total_f)), full_w - rx))
+                rh = max(1, min(int(round(bh_s * total_f)), full_h - ry))
                 # 5. score saturates toward 1.0 for richly-supported instances.
                 score = min(1.0, n_inliers / (2.0 * max(1, min_inliers)))
                 # 7. scale ~= sqrt(bbox_area / template_area).
-                area = float(bw * bh)
-                scale = float(np.sqrt(area / tmpl_area_full)) if tmpl_area_full > 0 else 1.0
-                results.append(
-                    Match(x=bx, y=by, w=bw, h=bh, score=float(score), scale=scale)
+                area = float(rw * rh)
+                scale = (
+                    float(np.sqrt(area / tmpl_area_full)) if tmpl_area_full > 0 else 1.0
                 )
-
-            # Remove the inliers consumed by this instance, then look for the next
-            # one in what's left (sequential RANSAC, §J.3 step 4).
-            remaining = [m for m, keep in zip(remaining, inlier_mask) if not keep]
-
-            if progress is not None:
-                # Coarse 50->100 sweep across the instance budget.
-                frac = len(results) / max(1, max_instances)
-                progress(min(100, 50 + int(round(50 * frac))))
+                results.append(
+                    Match(x=rx, y=ry, w=rw, h=rh, score=float(score), scale=scale)
+                )
+                if progress is not None:
+                    progress(
+                        min(100, 50 + int(round(50 * len(results) / max(1, max_instances))))
+                    )
 
         if progress is not None:
             progress(100)

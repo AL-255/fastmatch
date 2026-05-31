@@ -248,3 +248,61 @@ def test_ncc_misses_rotated_copy_that_features_finds() -> None:
         "NCC unexpectedly matched the rotated copy; the features-vs-NCC contrast "
         f"is invalid (hits={[(r.x, r.y, r.w, r.h, r.score) for r in rot_hits]})"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Feature matching recovers MANY identical repeated instances (the demo image).
+# --------------------------------------------------------------------------- #
+@cpu
+def test_features_recover_repeated_instances_on_demo() -> None:
+    """Feature matching finds the demo's many identical motif copies (regression).
+
+    The synthetic demo (``loader.generate_sample``) stamps one identical motif at
+    N locations. The Lowe ratio test rejects exactly such repeated matches (every
+    template feature has N equally-close neighbours), and ``knnMatch(k=2)`` only
+    ever sees two copies — so the old matcher recovered ~0-2 of them ("cannot
+    match anything"). The generalized-Hough vote + per-cluster homography must
+    recover the great majority of the copies with no false positives.
+    """
+    loader = pytest.importorskip("fastmatch.loader", reason="loader not available")
+    import tempfile
+    import os
+
+    path = tempfile.mktemp(suffix=".png")
+    try:
+        gt = loader.generate_sample(path, w=2400, h=1800, tile=160, n_targets=12, seed=0)
+        doc = loader.load_image(path)
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+    src = gt[0]
+    template = np.ascontiguousarray(
+        doc.full[src.y : src.y + src.h, src.x : src.x + src.w]
+    )
+    exclude_box = (src.x, src.y, src.w, src.h)
+    others = [g for g in gt if (g.x, g.y) != (src.x, src.y)]
+
+    m = Matcher(device="cpu")
+    m.set_image(doc.full)
+    params = MatchParams(
+        method="features", threshold=0.3, threshold_floor=0.0, feature_min_inliers=8
+    )
+    results = m.match(template, params, exclude_box=exclude_box)
+
+    truth_boxes = [(g.x, g.y, g.w, g.h) for g in gt]
+    recovered = sum(
+        any(_iou((r.x, r.y, r.w, r.h), (g.x, g.y, g.w, g.h)) >= 0.5 for r in results)
+        for g in others
+    )
+    false_pos = sum(
+        1
+        for r in results
+        if not any(_iou((r.x, r.y, r.w, r.h), tb) >= 0.5 for tb in truth_boxes)
+    )
+    # Must recover the large majority of the identical copies (the old matcher got
+    # ~0-2), with no spurious boxes.
+    assert recovered >= int(0.8 * len(others)), (
+        f"feature matching recovered only {recovered}/{len(others)} repeated copies"
+    )
+    assert false_pos == 0, f"feature matching produced {false_pos} false positive(s)"

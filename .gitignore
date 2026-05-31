@@ -28,3 +28,7 @@ env/
 # FastMatch scratch (generated samples, memmap backing files)
 *.fmraw
 /sample*.png
+
+# User-provided sample images (test data, not part of the project)
+samples/*
+!samples/.gitkeep
