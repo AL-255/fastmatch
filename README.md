@@ -14,6 +14,45 @@ CUDA build is installed, falling back transparently to CPU otherwise.
 
 ---
 
+## Web (browser) edition — `docs/`
+
+A zero-install version runs **entirely in the browser** via
+[Pyodide](https://pyodide.org) and is hostable on **GitHub Pages** as static
+files. Because PyTorch and Qt have no WebAssembly builds, the web edition is a
+self-contained **NumPy reimplementation** of the convolution matchers
+(`ncc`/`ssd`/`ccorr`) — same algorithm as the desktop's full-resolution path
+(FFT cross-correlation + integral-image windowed statistics, dihedral-orientation
+and multi-scale search, greedy IoU-NMS, source exclusion). Feature matching is
+desktop-only (it needs OpenCV, unavailable under Pyodide).
+
+The browser engine (`docs/fastmatch_web.py`) is pure NumPy, so it runs in
+CPython too and is unit-tested (`tests/test_web_engine.py`), including a recall
+**parity check against the desktop torch engine**.
+
+**Try it locally:**
+
+```bash
+python -m http.server -d docs 8000   # then open http://localhost:8000
+```
+
+Open an image (or **Load sample**), drag a box around a pattern, and it finds
+every similar region. Everything is client-side; large images (more than a few
+thousand px per side) are slow in the browser — the WASM engine is single-threaded.
+
+**Deploy on GitHub Pages:** the repo ships a workflow
+(`.github/workflows/pages.yml`) that publishes `docs/` via the official Pages
+Actions. One-time setup: **Settings → Pages → Source = GitHub Actions**. After
+that, every push that touches `docs/` builds and deploys automatically (or run
+the workflow manually from the Actions tab); the app is served at
+`https://<user>.github.io/<repo>/`. There is no build step — `docs/` already
+contains everything (`index.html`, `app.js`, `style.css`, `fastmatch_web.py`,
+`sample.png`) and `index.html` becomes the site root, so the app's relative
+fetches resolve exactly as they do locally. Pyodide + NumPy load from a CDN on
+first visit (~10 MB, cached). *(Alternatively, set Source to "Deploy from a
+branch" → `main` → `/docs`, which needs no workflow.)*
+
+---
+
 ## Install
 
 FastMatch needs PySide6, NumPy, Pillow, and PyTorch. **torchvision is optional**

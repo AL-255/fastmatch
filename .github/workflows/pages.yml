@@ -1,0 +1,49 @@
+name: Deploy web app to GitHub Pages
+
+# Publishes the static browser edition in docs/ (index.html + app.js + style.css
+# + fastmatch_web.py + sample.png) to GitHub Pages. The repo's Pages "Source"
+# must be set to "GitHub Actions" (Settings -> Pages) for this to deploy.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch: {}
+
+# Permissions the deploy-pages action needs to publish via OIDC.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one in-flight Pages deployment at a time; newer pushes supersede older.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload docs/ as the Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # Only the static site folder is published; index.html becomes the
+          # site root, so the app's relative fetches (fastmatch_web.py,
+          # sample.png, ...) resolve exactly as they do when served locally.
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
