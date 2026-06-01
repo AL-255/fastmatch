@@ -425,6 +425,11 @@ class ImageViewport(QGraphicsView):
         if self._overlay is not None:
             self._overlay.set_xor(self._box_xor)
 
+    def set_background_color(self, color: QColor) -> None:
+        """Set the canvas colour behind tiles (follows the application theme)."""
+        self.setBackgroundBrush(QColor(color))
+        self.viewport().update()
+
     # ------------------------------------------------------ selection/template
     def template_rect(self) -> QRect | None:
         """The current template selection rect (image px), or ``None``."""

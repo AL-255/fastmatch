@@ -58,6 +58,24 @@ _COLUMNS: tuple[str, ...] = (
 # QFileDialog name filter for the memory JSON files (matches save_store output).
 _JSON_FILTER = "FastMatch memory (*.json)"
 
+# Canonical extension for a saved store.
+_JSON_EXT = ".json"
+
+
+def _ensure_json_suffix(path: str) -> str:
+    """Return ``path`` with a ``.json`` extension guaranteed.
+
+    The Save dialog only offers the ``*.json`` filter, but native dialogs do not
+    reliably append the extension when the user types a bare name (GTK/GNOME and
+    the offscreen platform notably do not). We normalize on our side so a file
+    typed as ``patterns`` is written as ``patterns.json``. An existing ``.json``
+    suffix is kept as-is (case-insensitively); any other extension is preserved
+    and ``.json`` is appended, since the dialog only ever meant a JSON file.
+    """
+    if path and os.path.splitext(path)[1].lower() == _JSON_EXT:
+        return path
+    return path + _JSON_EXT
+
 
 class MemoryPanel(QWidget):
     """A list of saved searches with stats, plus add/remove and save/load.
@@ -325,6 +343,7 @@ class MemoryPanel(QWidget):
         path, _ = QFileDialog.getSaveFileName(self, "Save memory as", start, _JSON_FILTER)
         if not path:
             return False  # user cancelled
+        path = _ensure_json_suffix(path)  # write "name" as "name.json"
         if self._write(path):
             self._current_path = path
             return True

@@ -2,23 +2,21 @@
 
 Parses CLI arguments, configures the ``QApplication`` (OpenGL desktop attribute
 must be set *before* the ``QApplication`` is created, per ``DESIGN.md`` §E.8),
-loads or synthesizes an image, builds the main window, and runs the event loop.
+optionally loads an image, builds the main window, and runs the event loop.
 
-Two non-GUI fast paths exist:
+A non-GUI fast path exists:
 
 * ``--generate-sample PATH`` writes a labelled synthetic image and exits without
   ever creating a ``QApplication`` (useful in CI / headless setups).
 
-If no positional image is given and we are not generating, we auto-synthesize a
-small demo sample so the app always has something to show.
+If no positional image is given, the app starts with an empty canvas; an image
+is opened from *File ▸ Open Image…*.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
-import tempfile
-from pathlib import Path
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -31,7 +29,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "image",
         nargs="?",
         default=None,
-        help="Image file to open. If omitted, a small demo sample is generated.",
+        help="Image file to open. If omitted, the app starts with an empty canvas.",
     )
     p.add_argument(
         "--device",
@@ -114,16 +112,19 @@ def main(argv: list[str] | None = None) -> int:
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseDesktopOpenGL, True)
     app = QApplication(sys.argv if argv is None else [sys.argv[0], *argv])
 
-    # Resolve the image: either the user's file, or an auto-generated demo.
-    if args.image is not None:
-        doc = load_image(args.image, max_ram_bytes=args.max_ram_bytes)
-    else:
-        # Auto-generate a modest demo sample (full 12000^2 would be slow to make
-        # and to search on CPU, so the no-arg demo is deliberately small).
-        tmp_dir = Path(tempfile.mkdtemp(prefix="fastmatch_demo_"))
-        demo_path = tmp_dir / "demo_sample.png"
-        generate_sample(demo_path, w=2400, h=1800, tile=160, n_targets=12, seed=args.seed)
-        doc = load_image(demo_path, max_ram_bytes=args.max_ram_bytes)
+    # Apply the persisted application theme before any window is built so the
+    # first paint is already themed (no light->dark flash on startup).
+    from .theme import apply_theme, load_theme
+
+    apply_theme(app, load_theme(), persist=False)
+
+    # Resolve the image: the user's file, or None to start on an empty canvas
+    # (no auto-generated demo). An image is opened later via File > Open Image…
+    doc = (
+        load_image(args.image, max_ram_bytes=args.max_ram_bytes)
+        if args.image is not None
+        else None
+    )
 
     # Build + show the window. Imported here so the headless path above never
     # imports the GUI stack.

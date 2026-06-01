@@ -68,6 +68,10 @@ mismatched CUDA wheel cleanly degrades to CPU rather than crashing.
 # Open an image in the viewer
 python -m fastmatch path/to/image.png
 
+# Launch with no image — starts on an empty canvas; open one from
+# File > Open Image…
+python -m fastmatch
+
 # Generate a synthetic ground-truth test image (textured noise + known motifs),
 # then open it
 python -m fastmatch --generate-sample sample.png --w 12000 --h 12000
@@ -79,10 +83,12 @@ python -m fastmatch path/to/image.png --device cuda
 python -m fastmatch path/to/image.png --device auto
 ```
 
-`--device` accepts `auto`, `cuda`, or `cpu`. `cuda` still falls back to CPU if
-the canary kernel fails. `--generate-sample <path>` writes a synthetic image
-(default `12000x12000`, override with `--w` / `--h`) with a set of known motif
-stamps and exits; load that file separately to search it.
+If no image path is given, FastMatch opens with an **empty canvas** (no
+auto-generated demo) — load an image from *File ▸ Open Image…*. `--device`
+accepts `auto`, `cuda`, or `cpu`. `cuda` still falls back to CPU if the canary
+kernel fails. `--generate-sample <path>` writes a synthetic image (default
+`12000x12000`, override with `--w` / `--h`) with a set of known motif stamps and
+exits; load that file separately to search it.
 
 ---
 
@@ -102,6 +108,7 @@ stamps and exits; load that file separately to search it.
 | **Threshold slider** | **Live-filters** the displayed results — no re-run (works for every method). |
 | **View ▸ Match boxes** menu | Configure the overlay box outlines: **Line width** (1–6 px, zoom-independent) and **XOR with background** (invert the outline against whatever is underneath so it stays visible on any background). |
 | **Engine** menu | Switch the compute backend on the fly: **Auto (prefer GPU)**, **CUDA (GPU)**, or **CPU**. CUDA is greyed out when no working GPU is detected. Switching rebuilds the engine on the new device, updates the status banner, re-gates the GPU-only multi-scale search, and re-runs the current selection. |
+| **Theme** menu | Switch the application look: **System** (follow the desktop), **Light**, or **Dark**. The whole UI and the image canvas re-theme instantly, and the choice is remembered for next launch. |
 | **Add to Memory** | Save the current selection + all current matches as an entry in the Memory list. See [Saved-match Memory](#saved-match-memory). |
 | **Double-click a Memory entry** | Revisit that saved search — restores the blue reference box to its remembered selection and re-shows its matches. |
 
@@ -220,7 +227,9 @@ compare interesting matches across a session.
 - **File menu** — all file operations live under **File**: *Open Image…*,
   *Close Image*, *Open Memory…*, *Save Memory* (writes to the current file, or
   prompts if none yet; `Ctrl+S`), *Save Memory As…* (`Ctrl+Shift+S`), and
-  *Close Memory* (clear the list). A Memory `.json` records the **source image**
+  *Close Memory* (clear the list). Saving always writes a `.json` file — a name
+  typed without an extension (e.g. `patterns`) is saved as `patterns.json`
+  automatically. A Memory `.json` records the **source image**
   (its path and pixel size) and **every entry** (selection, settings, and each
   match with its score, scale and orientation). Match coordinates are in the
   **source image's pixel space**, so a Memory opened against the same image lines
@@ -235,6 +244,14 @@ compare interesting matches across a session.
   the GPU-only multi-scale search, and re-runs the current selection — matching
   the `--device` flag you could have launched with. The view, selection, and
   Memory list are preserved across the switch.
+- **Theme menu** — switch the application appearance at runtime: *System*
+  (follow the desktop's own theme), *Light*, or *Dark*. The whole window and the
+  image canvas re-theme instantly. Light/Dark use hand-built palettes on Qt's
+  palette-faithful **Fusion** style so they look identical on every platform;
+  *System* restores the desktop theme captured at startup. The choice is
+  persisted (via `QSettings`) and re-applied on the next launch, before the first
+  paint, so there is no startup flash. Match/selection box colours are kept
+  constant across themes (a match always reads as the same green).
 
 ---
 

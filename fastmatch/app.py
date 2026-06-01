@@ -32,6 +32,7 @@ from pathlib import Path
 from PySide6.QtCore import QRect, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (
+    QApplication,
     QDockWidget,
     QFileDialog,
     QLabel,
@@ -49,16 +50,19 @@ from .memory import MemoryEntry
 from .memory_panel import MemoryPanel
 from .params_panel import ParamsPanel
 from .types import CONV_METHODS, MatchParams
+from . import theme
 
 
 class MainWindow(QMainWindow):
     """Top-level window wiring viewport, controller, and params panel."""
 
-    def __init__(self, doc: ImageDocument, *, device: str = "auto") -> None:
-        """Construct the window around a loaded document.
+    def __init__(self, doc: ImageDocument | None = None, *, device: str = "auto") -> None:
+        """Construct the window, optionally around a loaded document.
 
         Args:
-            doc: The image to display and search.
+            doc: The image to display and search, or ``None`` to start with an
+                empty canvas (no image) — e.g. launching with no file argument.
+                An image is then loaded via *File ▸ Open Image…*.
             device: Device preference passed to the engine ("auto"/"cuda"/"cpu").
         """
         super().__init__()
@@ -97,11 +101,15 @@ class MainWindow(QMainWindow):
 
         # --- Central viewport ---------------------------------------------
         self._viewport = ImageViewport(self)
-        self._viewport.set_image(doc)
+        if doc is not None:
+            self._viewport.set_image(doc)  # else: start on the empty canvas
         self.setCentralWidget(self._viewport)
 
         # --- Controller (owns worker thread) -------------------------------
-        self._controller = MatchController(doc, self._params)
+        # With no image there is nothing to search, so we defer building the
+        # engine/worker thread until an image is opened (_swap_document). A None
+        # controller is the same idle state reached via File > Close Image.
+        self._controller = MatchController(doc, self._params) if doc is not None else None
 
         # --- Params panel + device banner dock -----------------------------
         self._params_panel = ParamsPanel(self._resolved_device.type, self)
@@ -115,6 +123,11 @@ class MainWindow(QMainWindow):
         # Render the image as the matcher sees it: grayscale in luminance mode,
         # colour in rgb mode (the channel-mode combo drives the display).
         self._viewport.set_display_grayscale(self._params.channel_mode == "luminance")
+        # Colour the image canvas for the active application theme. The app-level
+        # palette/style is applied at bootstrap (__main__); the canvas is themed
+        # separately because it is not a Qt palette role.
+        self._theme = theme.load_theme()
+        self._viewport.set_background_color(theme.viewport_background(self._theme))
 
         dock_body = QWidget(self)
         dock_layout = QVBoxLayout(dock_body)
@@ -138,7 +151,8 @@ class MainWindow(QMainWindow):
         # here and re-seeded on every document swap so saved coords stay tied to
         # the right image.
         self._memory = MemoryPanel(self)
-        self._memory.set_source(self._doc.path, self._viewport.image_size())
+        if self._doc is not None:
+            self._memory.set_source(self._doc.path, self._viewport.image_size())
         self._memory_dock = QDockWidget("Memory", self)
         self._memory_dock.setWidget(self._memory)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._memory_dock)
@@ -170,7 +184,14 @@ class MainWindow(QMainWindow):
         if self._resolved_device.type == "cpu":
             QTimer.singleShot(0, self._maybe_show_cpu_notice)
 
-        # Fit the freshly loaded image into the view.
+        # Empty-canvas startup (no document): mirror the File > Close Image idle
+        # state — nothing to close/run and a "No image" readout until one is opened.
+        if self._doc is None:
+            self._act_close_image.setEnabled(False)
+            self._params_panel.set_run_enabled(False)
+            self._count_label.setText("No image")
+
+        # Fit the freshly loaded image into the view (no-op when empty).
         self._viewport.fit_in_view()
 
     # ------------------------------------------------------------------ build
@@ -280,7 +301,39 @@ class MainWindow(QMainWindow):
         self._act_box_xor.toggled.connect(self._viewport.set_box_xor)
         boxes_menu.addAction(self._act_box_xor)
 
+        self._build_theme_menu()
         self._build_engine_menu()
+
+    def _build_theme_menu(self) -> None:
+        """&Theme menu — switch the application look (System / Light / Dark).
+
+        An exclusive radio group; the entry matching the persisted theme starts
+        checked. Selecting one re-themes the whole app live and remembers the
+        choice for next launch.
+        """
+        theme_menu = self._theme_menu = self.menuBar().addMenu("&Theme")
+        self._theme_group = QActionGroup(self)
+        self._theme_group.setExclusive(True)
+        self._theme_actions: dict[str, QAction] = {}
+        for key in theme.THEME_KEYS:
+            act = QAction(theme.THEME_LABELS[key], self, checkable=True)
+            act.setChecked(key == self._theme)
+            act.triggered.connect(lambda _checked, k=key: self._on_select_theme(k))
+            self._theme_group.addAction(act)
+            theme_menu.addAction(act)
+            self._theme_actions[key] = act
+
+    def _on_select_theme(self, key: str) -> None:
+        """Re-theme the whole application at runtime (menu callback)."""
+        key = theme.normalize_theme(key)
+        if key == self._theme:
+            return
+        app = QApplication.instance()
+        if app is None:  # pragma: no cover - GUI always has an app
+            return
+        self._theme = theme.apply_theme(app, key)  # palette + style + persist
+        self._theme_actions[self._theme].setChecked(True)  # keep the radio honest
+        self._viewport.set_background_color(theme.viewport_background(self._theme))
 
     def _build_engine_menu(self) -> None:
         """&Engine menu — pick the compute backend (CPU / CUDA / Auto) at runtime.
@@ -364,11 +417,13 @@ class MainWindow(QMainWindow):
         # Live cursor readout.
         self._viewport.cursorImagePos.connect(self._on_cursor_pos)
 
-        # Controller results / state.
-        self._controller.matches_ready.connect(self._on_matches_ready)
-        self._controller.busy_changed.connect(self._on_busy_changed)
-        self._controller.progress.connect(self._on_progress)
-        self._controller.failed.connect(self._on_failed)
+        # Controller results / state. With no image at startup there is no
+        # controller yet; _install_new_controller wires these when one is opened.
+        if self._controller is not None:
+            self._controller.matches_ready.connect(self._on_matches_ready)
+            self._controller.busy_changed.connect(self._on_busy_changed)
+            self._controller.progress.connect(self._on_progress)
+            self._controller.failed.connect(self._on_failed)
 
         # Params panel: threshold is a live filter, everything else re-runs.
         self._params_panel.params_changed.connect(self._on_params_changed)
@@ -433,6 +488,8 @@ class MainWindow(QMainWindow):
         build a new engine (§C.3 / §C.6).
         """
         old = self._controller
+        if old is None:
+            return True  # empty-canvas state: no controller to tear down
         if not old.shutdown():
             self._orphaned_controllers.append(old)
             return False
@@ -443,10 +500,14 @@ class MainWindow(QMainWindow):
         """Build a fresh controller for the current doc + params and wire signals.
 
         The previous controller must already have been relinquished via
-        :meth:`_teardown_controller`.
+        :meth:`_teardown_controller`. With no document (empty canvas) there is
+        nothing to search, so the controller stays ``None``.
         """
         from .controller import MatchController
 
+        if self._doc is None:
+            self._controller = None
+            return
         self._controller = MatchController(self._doc, self._params)
         self._controller.matches_ready.connect(self._on_matches_ready)
         self._controller.busy_changed.connect(self._on_busy_changed)
@@ -872,17 +933,20 @@ class MainWindow(QMainWindow):
         """
         try:
             old = self._controller
-            if not old.shutdown():
+            if old is not None and not old.shutdown():
                 self._orphaned_controllers.append(old)
         finally:
             super().closeEvent(event)
 
 
-def build_main_window(doc: ImageDocument, *, device: str = "auto") -> MainWindow:
+def build_main_window(
+    doc: ImageDocument | None = None, *, device: str = "auto"
+) -> MainWindow:
     """Construct a :class:`MainWindow` for ``doc`` (helper for __main__ and tests).
 
     Args:
-        doc: The image document to display and search.
+        doc: The image document to display and search, or ``None`` to start with
+            an empty canvas (no image loaded).
         device: Device preference ("auto"/"cuda"/"cpu").
 
     Returns:

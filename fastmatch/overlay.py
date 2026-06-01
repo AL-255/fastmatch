@@ -27,6 +27,10 @@ _OVERLAY_Z = 10.0
 # thing you selected" versus "the things we found".
 _MATCH_COLOR = QColor(40, 220, 70)
 _SOURCE_COLOR = QColor(0, 200, 255)
+# A semi-transparent dark casing drawn just under the coloured outline (normal
+# mode only) so the bright box edges stay legible on light backgrounds too — the
+# match/selection colours are theme-independent, the casing keeps them readable.
+_CASING_COLOR = QColor(0, 0, 0, 170)
 
 
 class MatchOverlayItem(QGraphicsItem):
@@ -194,14 +198,27 @@ class MatchOverlayItem(QGraphicsItem):
                 QPainter.CompositionMode.CompositionMode_Difference
             )
 
-        def _pen(color: QColor) -> QPen:
+        def _pen(color: QColor, width: int) -> QPen:
             p = QPen(color)
             p.setCosmetic(True)  # width in device px, immune to view scale
-            p.setWidth(self._line_width)
+            p.setWidth(width)
             return p
 
-        painter.setPen(_pen(_MATCH_COLOR))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
+        def _draw_boxes(rects: list[QRectF], color: QColor) -> None:
+            """Draw ``rects`` outlined in ``color``, with a dark contrast casing.
+
+            In normal mode a slightly wider semi-transparent dark stroke is laid
+            down first, so the bright outline stays legible on *any* background —
+            a light canvas/image (where the match green or selection cyan would
+            otherwise wash out) as much as a dark one. XOR mode already inverts
+            against the background, so it skips the casing.
+            """
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            if not self._xor:
+                painter.setPen(_pen(_CASING_COLOR, self._line_width + 2))
+                painter.drawRects(rects)
+            painter.setPen(_pen(color, self._line_width))
+            painter.drawRects(rects)
 
         if self._boxes.shape[0] and self._mask.any():
             visible = self._boxes[self._mask]
@@ -224,7 +241,7 @@ class MatchOverlayItem(QGraphicsItem):
                     QRectF(float(x), float(y), float(w), float(h))
                     for x, y, w, h in culled
                 ]
-                painter.drawRects(rects)
+                _draw_boxes(rects, _MATCH_COLOR)
 
         # Source box on top, in its own color, if present and exposed.
         sb = self._source_box
@@ -235,7 +252,6 @@ class MatchOverlayItem(QGraphicsItem):
                 and sb.y() < ey1
                 and (sb.y() + sb.height()) > ey0
             ):
-                painter.setPen(_pen(_SOURCE_COLOR))
-                painter.drawRect(QRectF(sb))
+                _draw_boxes([QRectF(sb)], _SOURCE_COLOR)
 
         painter.restore()
