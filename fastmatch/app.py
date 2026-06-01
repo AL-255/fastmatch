@@ -220,8 +220,41 @@ class MainWindow(QMainWindow):
         tb.addAction(self._act_selftest)
 
     def _build_menus(self) -> None:
-        """Menu bar — overlay box appearance lives under 'View > Match boxes'."""
-        view_menu = self.menuBar().addMenu("&View")
+        """Menu bar — File (image + memory ops) and View (box appearance)."""
+        # Keep references on self: a menu held only by a local can have its C++
+        # object GC-deleted by shiboken (-> "QMenu already deleted" on access).
+        file_menu = self._file_menu = self.menuBar().addMenu("&File")
+        # Image operations.
+        self._act_open.setText("Open Image…")  # reuse the toolbar action
+        file_menu.addAction(self._act_open)
+        self._act_close_image = QAction("Close Image", self)
+        self._act_close_image.setToolTip("Close the current image and clear the view.")
+        self._act_close_image.triggered.connect(self._on_close_image)
+        file_menu.addAction(self._act_close_image)
+        file_menu.addSeparator()
+        # Memory operations (backed by the Memory panel's file methods).
+        act_open_mem = QAction("Open Memory…", self)
+        act_open_mem.triggered.connect(self._memory.open_memory)
+        file_menu.addAction(act_open_mem)
+        act_save_mem = QAction("Save Memory", self)
+        act_save_mem.setShortcut(QKeySequence.StandardKey.Save)  # Ctrl+S
+        act_save_mem.triggered.connect(self._memory.save_memory)
+        file_menu.addAction(act_save_mem)
+        act_save_mem_as = QAction("Save Memory As…", self)
+        act_save_mem_as.setShortcut(QKeySequence.StandardKey.SaveAs)
+        act_save_mem_as.triggered.connect(self._memory.save_memory_as)
+        file_menu.addAction(act_save_mem_as)
+        act_close_mem = QAction("Close Memory", self)
+        act_close_mem.setToolTip("Clear all memory entries.")
+        act_close_mem.triggered.connect(self._memory.close_memory)
+        file_menu.addAction(act_close_mem)
+        file_menu.addSeparator()
+        act_quit = QAction("Quit", self)
+        act_quit.setShortcut(QKeySequence.StandardKey.Quit)
+        act_quit.triggered.connect(self.close)
+        file_menu.addAction(act_quit)
+
+        view_menu = self._view_menu = self.menuBar().addMenu("&View")
         view_menu.addAction(self._act_fit)  # Fit (F), also on the toolbar
         view_menu.addSeparator()
 
@@ -293,6 +326,26 @@ class MainWindow(QMainWindow):
             return
         self._swap_document(doc)
 
+    def _on_close_image(self) -> None:
+        """Close the current image: clear the view, matches, and selection.
+
+        The matching controller is left idle (no image -> no selections can be
+        drawn); opening another image rebuilds it via _swap_document.
+        """
+        self._viewport.clear_matches()
+        self._viewport.clear_template()
+        self._viewport.clear_image()
+        self._last_rect = None
+        self._all_matches = []
+        self._params_panel.set_run_enabled(False)
+        self._params_panel.set_match_count(0)
+        self._memory.set_source("", (0, 0))
+        self._progress.setValue(0)
+        self._progress.setVisible(False)
+        self._count_label.setText("No image")
+        self._act_close_image.setEnabled(False)  # nothing to close now
+        self.statusBar().showMessage("Image closed.", 4000)
+
     def _swap_document(self, doc: ImageDocument) -> None:
         """Replace the current document, controller, and viewport image.
 
@@ -346,6 +399,7 @@ class MainWindow(QMainWindow):
         # Re-seed the Memory panel's source header so entries added after the
         # swap record the new image (existing entries are left untouched).
         self._memory.set_source(self._doc.path, self._viewport.image_size())
+        self._act_close_image.setEnabled(True)  # an image is open again
 
     def _on_mode_toggled(self, checked: bool) -> None:
         """Switch the viewport between Pan (checked) and Select (unchecked)."""

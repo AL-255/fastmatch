@@ -216,13 +216,16 @@ compare interesting matches across a session.
 - **Remove** — deletes the selected line(s) from the list.
 - **Double-click** an entry to **revisit** it — FastMatch restores the blue
   reference box to the entry's remembered selection and re-shows its matches.
-- **Save / Load (JSON)** — *Save* writes the whole Memory to a `.json` file that
-  records the **source image** (its path and pixel size) and **every entry**
-  (selection, settings, and each match with its score, scale and orientation);
-  *Load* reads one back. Match coordinates are stored in the **source image's
-  pixel space**, so a Memory loaded against the same image lines its boxes up
-  exactly. A file written by a newer FastMatch (a higher schema version), or any
-  malformed/non-JSON file, is refused with a clear error rather than crashing.
+- **File menu** — all file operations live under **File**: *Open Image…*,
+  *Close Image*, *Open Memory…*, *Save Memory* (writes to the current file, or
+  prompts if none yet; `Ctrl+S`), *Save Memory As…* (`Ctrl+Shift+S`), and
+  *Close Memory* (clear the list). A Memory `.json` records the **source image**
+  (its path and pixel size) and **every entry** (selection, settings, and each
+  match with its score, scale and orientation). Match coordinates are in the
+  **source image's pixel space**, so a Memory opened against the same image lines
+  its boxes up exactly; opening one recorded for a different image offers to open
+  that image. A file written by a newer FastMatch (a higher schema version), or
+  any malformed/non-JSON file, is refused with a clear error rather than crashing.
 
 ---
 

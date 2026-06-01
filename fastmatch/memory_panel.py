@@ -87,6 +87,9 @@ class MemoryPanel(QWidget):
         # Source header for store(); populated via set_source / load_store.
         self._source_image: str = ""
         self._image_size: tuple[int, int] = (0, 0)
+        # Path of the memory file currently associated with this list (set on a
+        # successful Open/Save As); drives "Save Memory" vs "Save Memory As…".
+        self._current_path: str | None = None
 
         root = QVBoxLayout(self)
 
@@ -131,15 +134,9 @@ class MemoryPanel(QWidget):
         self._remove_button.clicked.connect(self._on_remove_clicked)
         buttons.addWidget(self._remove_button)
 
-        self._save_button = QPushButton("Save…", self)
-        self._save_button.setToolTip("Save all memory entries to a JSON file.")
-        self._save_button.clicked.connect(self._on_save_clicked)
-        buttons.addWidget(self._save_button)
-
-        self._load_button = QPushButton("Load…", self)
-        self._load_button.setToolTip("Load memory entries from a JSON file (replaces the current list).")
-        self._load_button.clicked.connect(self._on_load_clicked)
-        buttons.addWidget(self._load_button)
+        # File operations (Open/Save/Save As/Close Memory) live in the window's
+        # File menu; see ImageViewport's MainWindow. The public methods below
+        # back those menu items.
 
         root.addLayout(buttons)
 
@@ -289,38 +286,63 @@ class MemoryPanel(QWidget):
                 del self._entries[row]
         self._sync_header()
 
-    def _on_save_clicked(self) -> None:
-        """Prompt for a path and write the current store as JSON.
+    # --------------------------------------------------------- file operations
+    def current_memory_path(self) -> str | None:
+        """The JSON file this list is associated with (Open/Save As), or ``None``."""
+        return self._current_path
 
-        Any write failure is surfaced as a warning dialog rather than crashing
-        the GUI thread.
-        """
-        path, _ = QFileDialog.getSaveFileName(self, "Save memory", "", _JSON_FILTER)
-        if not path:
-            return  # user cancelled
-        try:
-            memory.save_store(self.store(), path)
-        except Exception as exc:  # I/O, permissions, etc.
-            QMessageBox.warning(self, "Save failed", f"Could not save memory:\n{exc}")
-
-    def _on_load_clicked(self) -> None:
+    def open_memory(self) -> bool:
         """Prompt for a path, load a store, and replace the current list.
 
         A malformed or too-new file raises ``ValueError`` from
         :func:`memory.load_store`; we report it as a warning and leave the
         current entries untouched. On success the panel rebuilds from the loaded
-        store and re-emits it via ``store_loaded``.
+        store, remembers the path, and re-emits it via ``store_loaded``.
+        Returns whether a store was loaded.
         """
-        path, _ = QFileDialog.getOpenFileName(self, "Load memory", "", _JSON_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, "Open memory", "", _JSON_FILTER)
         if not path:
-            return  # user cancelled
+            return False  # user cancelled
         try:
             store = memory.load_store(path)
         except ValueError as exc:
-            QMessageBox.warning(self, "Load failed", f"Could not load memory:\n{exc}")
-            return
+            QMessageBox.warning(self, "Open failed", f"Could not open memory:\n{exc}")
+            return False
         self.load_store(store)
+        self._current_path = path
         self.store_loaded.emit(store)
+        return True
+
+    def save_memory(self) -> bool:
+        """Save to the current file if known; otherwise behave like *Save As*."""
+        if self._current_path:
+            return self._write(self._current_path)
+        return self.save_memory_as()
+
+    def save_memory_as(self) -> bool:
+        """Prompt for a path and write the current store as JSON; remember it."""
+        start = self._current_path or ""
+        path, _ = QFileDialog.getSaveFileName(self, "Save memory as", start, _JSON_FILTER)
+        if not path:
+            return False  # user cancelled
+        if self._write(path):
+            self._current_path = path
+            return True
+        return False
+
+    def _write(self, path: str) -> bool:
+        """Write the store to ``path``; surface any failure as a warning dialog."""
+        try:
+            memory.save_store(self.store(), path)
+        except Exception as exc:  # I/O, permissions, etc.
+            QMessageBox.warning(self, "Save failed", f"Could not save memory:\n{exc}")
+            return False
+        return True
+
+    def close_memory(self) -> None:
+        """Clear all entries and forget the associated file (Close Memory)."""
+        self.clear()
+        self._current_path = None
 
     # ------------------------------------------------------------------ public
     def add_entry(self, entry: MemoryEntry) -> None:
