@@ -110,7 +110,13 @@ class _TileDecodeTask(QRunnable):
             # A decode failure must not crash the pool thread; just drop the
             # tile (the painter falls back to a coarser cached level).
             return
-        self._signals.done.emit(self._level, self._cx, self._cy, arr, self._generation)
+        try:
+            self._signals.done.emit(self._level, self._cx, self._cy, arr, self._generation)
+        except RuntimeError:
+            # The viewport (and its signals object) may have been destroyed while
+            # this decode was in flight (e.g. the window closed). Dropping the
+            # result is correct — there is nothing left to paint into.
+            return
 
 
 # --------------------------------------------------------------------------- #
@@ -254,7 +260,9 @@ class ImageViewport(QGraphicsView):
         # We drive everything by hand (rubber-band, panning, anchors) so disable
         # the built-in drag mode and let mapToScene handle DPR-aware mapping.
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
-        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        # The zoom paths set their own anchor (wheel: NoAnchor + manual cursor
+        # re-centre, DPR-safe; set_zoom: AnchorViewCenter), so the default is moot.
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setMouseTracking(True)
@@ -476,12 +484,17 @@ class ImageViewport(QGraphicsView):
         self._emit_view_changed()
 
     def set_zoom(self, view_scale: float) -> None:
-        """Set absolute zoom (viewport px per image px), clamped to limits."""
+        """Set absolute zoom (viewport px per image px), clamped to limits.
+
+        Programmatic zoom pivots on the view centre. We set the anchor explicitly
+        because the wheel path leaves it on ``NoAnchor`` (it re-centres manually).
+        """
         if self._doc is None:
             return
         target = self._clamp(view_scale, self._min_scale, self._max_scale)
         if target <= 0:
             return
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         factor = target / self._view_scale if self._view_scale else target
         self.scale(factor, factor)
         self._view_scale = target
@@ -653,18 +666,33 @@ class ImageViewport(QGraphicsView):
 
     # ------------------------------------------------------------- wheel zoom
     def wheelEvent(self, e) -> None:
-        """Zoom under the cursor; authoritative scale kept as a double (§E.5)."""
+        """Zoom keeping the point under the cursor fixed (§E.5).
+
+        We anchor MANUALLY rather than via ``AnchorUnderMouse``: Qt's built-in
+        anchor mis-tracks the cursor on fractional HiDPI displays (e.g. GNOME at
+        150%), zooming toward the view centre instead of the cursor. Reading the
+        wheel event's own ``position()`` (device-independent logical px, the same
+        space ``mapToScene`` uses) and translating by the scene-point delta is
+        DPR-correct on any scale factor.
+        """
         if self._doc is None:
             e.ignore()
             return
-        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         # angleDelta is in 1/8-degree units; 1.0015**delta is a smooth exp ramp.
         step = 1.0015 ** e.angleDelta().y()
         target = self._clamp(self._view_scale * step, self._min_scale, self._max_scale)
         if target != self._view_scale and self._view_scale > 0:
+            vp_pos = e.position().toPoint()  # cursor in viewport (logical) px
+            # NoAnchor + explicit re-centering: pin the scene point under the
+            # cursor across the scale (works regardless of display scaling).
+            self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
+            before = self.mapToScene(vp_pos)
             factor = target / self._view_scale
             self.scale(factor, factor)
             self._view_scale = target
+            after = self.mapToScene(vp_pos)
+            delta = after - before
+            self.translate(delta.x(), delta.y())
             self._bump_generation()
             self._update_lod()
             self._emit_view_changed()
