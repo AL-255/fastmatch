@@ -436,6 +436,19 @@ class ImageViewport(QGraphicsView):
         if self._overlay is not None:
             self._overlay.set_source_box(None)
 
+    def set_template_rect(self, rect: QRect | None) -> None:
+        """Set the template selection + its highlighted (blue) source box.
+
+        Used to restore the reference box when recalling a saved Memory entry, so
+        the blue box returns to the remembered selection location.
+        """
+        if rect is None:
+            self.clear_template()
+            return
+        self._template_rect = QRect(rect)
+        if self._overlay is not None:
+            self._overlay.set_source_box(QRect(rect))
+
     # --------------------------------------------------------------- view ctl
     def set_mode(self, mode: "ImageViewport.Mode") -> None:
         """Switch interaction mode (SELECT vs PAN) and update the cursor."""

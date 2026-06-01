@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QMessageBox,
     QPushButton,
@@ -119,6 +120,11 @@ class MemoryPanel(QWidget):
         self._add_button.setToolTip("Save the current selection and its matches as a memory entry.")
         self._add_button.clicked.connect(self.add_requested)
         buttons.addWidget(self._add_button)
+
+        self._rename_button = QPushButton("Rename…", self)
+        self._rename_button.setToolTip("Give the selected memory entry a custom name.")
+        self._rename_button.clicked.connect(self._on_rename_clicked)
+        buttons.addWidget(self._rename_button)
 
         self._remove_button = QPushButton("Remove", self)
         self._remove_button.setToolTip("Delete the selected memory entries.")
@@ -227,6 +233,44 @@ class MemoryPanel(QWidget):
         row = item.row()
         if 0 <= row < len(self._entries):
             self.entry_activated.emit(self._entries[row])
+
+    def _refresh_row(self, row: int) -> None:
+        """Re-populate one row's cells + tooltip from its (possibly edited) entry."""
+        if not (0 <= row < len(self._entries)):
+            return
+        entry = self._entries[row]
+        tooltip = self._params_tooltip(entry)
+        for col, text in enumerate(self._row_cells(entry)):
+            item = self._table.item(row, col)
+            if item is None:
+                item = QTableWidgetItem(text)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self._table.setItem(row, col, item)
+            else:
+                item.setText(text)
+            item.setToolTip(tooltip)
+
+    def _on_rename_clicked(self) -> None:
+        """Prompt for a custom name for the selected entry (empty -> auto label).
+
+        Sets ``entry.label`` (which the Label column / ``summary()`` use and which
+        is persisted to JSON); a blank name clears it back to the auto summary.
+        """
+        rows = sorted({idx.row() for idx in self._table.selectionModel().selectedRows()})
+        if not rows:
+            QMessageBox.information(self, "Rename", "Select a memory entry to rename.")
+            return
+        row = rows[0]
+        if not (0 <= row < len(self._entries)):
+            return
+        entry = self._entries[row]
+        current = entry.label or entry.summary()
+        name, ok = QInputDialog.getText(self, "Rename entry", "Name:", text=current)
+        if not ok:
+            return
+        entry.label = name.strip()
+        self._refresh_row(row)
+        self._select_row(row)
 
     def _on_remove_clicked(self) -> None:
         """Delete the selected rows and their entries, keeping the lists aligned.

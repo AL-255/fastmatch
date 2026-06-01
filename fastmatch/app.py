@@ -387,16 +387,24 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Added {len(visible)} matches to memory.", 6000)
 
     def _on_revisit_entry(self, entry: object) -> None:
-        """Show a saved entry's boxes on the viewport (revisit).
+        """Recall a saved entry: restore its reference box and matches (revisit).
 
-        Pushes the entry's recorded matches straight onto the overlay and drops
-        the live threshold to 0 so every saved box shows regardless of the
-        current slider. Revisit only makes sense for the current image; if the
-        entry was recorded against a different image the boxes will not line up,
-        which is the user's call.
+        Pushes the entry's recorded matches onto the overlay, restores the blue
+        reference box to the entry's remembered selection (so the source is shown
+        where it was captured), and drops the live threshold to 0 so every saved
+        box shows regardless of the current slider. Revisit only makes sense for
+        the current image; if the entry was recorded against a different image the
+        boxes will not line up, which is the user's call.
         """
         matches = list(entry.matches)  # type: ignore[attr-defined]
         self._viewport.set_matches(matches)
+        # Restore the reference (blue) box to the remembered selection, and make
+        # it the active selection so a subsequent Run / param change uses it.
+        sx, sy, sw, sh = entry.selection  # type: ignore[attr-defined]
+        rect = QRect(int(sx), int(sy), int(sw), int(sh))
+        self._viewport.set_template_rect(rect)
+        self._last_rect = QRect(rect)
+        self._params_panel.set_run_enabled(True)
         # Show every saved box: the entry already holds the matches the user
         # chose to remember, so do not re-filter them by the current slider.
         try:

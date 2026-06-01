@@ -102,7 +102,7 @@ stamps and exits; load that file separately to search it.
 | **Threshold slider** | **Live-filters** the displayed results — no re-run (works for every method). |
 | **View ▸ Match boxes** menu | Configure the overlay box outlines: **Line width** (1–6 px, zoom-independent) and **XOR with background** (invert the outline against whatever is underneath so it stays visible on any background). |
 | **Add to Memory** | Save the current selection + all current matches as an entry in the Memory list. See [Saved-match Memory](#saved-match-memory). |
-| **Double-click a Memory entry** | Revisit that saved search (re-selects its template region). |
+| **Double-click a Memory entry** | Revisit that saved search — restores the blue reference box to its remembered selection and re-shows its matches. |
 
 The **source region you selected is excluded** from the matches (it would
 otherwise always be a perfect self-match), and that exclusion is shown in the
@@ -211,9 +211,11 @@ compare interesting matches across a session.
   2 matches show as 3 occurrences), score range, and a compact per-orientation
   breakdown (e.g. `R0:2 R90:1 MY:1`); hovering a row shows **all** of that
   entry's settings.
+- **Rename…** — give the selected entry a custom name (a blank name reverts to
+  the auto summary); the name is shown in the list and saved to JSON.
 - **Remove** — deletes the selected line(s) from the list.
-- **Double-click** an entry to **revisit** it — FastMatch re-selects that saved
-  search's template region.
+- **Double-click** an entry to **revisit** it — FastMatch restores the blue
+  reference box to the entry's remembered selection and re-shows its matches.
 - **Save / Load (JSON)** — *Save* writes the whole Memory to a `.json` file that
   records the **source image** (its path and pixel size) and **every entry**
   (selection, settings, and each match with its score, scale and orientation);
