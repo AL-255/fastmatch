@@ -25,6 +25,7 @@ at module top-level beyond what PySide6 already requires.
 from __future__ import annotations
 
 import dataclasses
+import os
 import tempfile
 from pathlib import Path
 
@@ -44,6 +45,8 @@ from PySide6.QtWidgets import (
 
 from .device import device_banner_text, resolve_device
 from .document import ImageDocument
+from .memory import MemoryEntry
+from .memory_panel import MemoryPanel
 from .params_panel import ParamsPanel
 from .types import CONV_METHODS, MatchParams
 
@@ -124,6 +127,17 @@ class MainWindow(QMainWindow):
         )
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._dock)
 
+        # --- Memory panel dock --------------------------------------------
+        # A bottom dock so the per-entry stats table has horizontal room. The
+        # panel holds the list of saved searches; the source header is seeded
+        # here and re-seeded on every document swap so saved coords stay tied to
+        # the right image.
+        self._memory = MemoryPanel(self)
+        self._memory.set_source(self._doc.path, self._viewport.image_size())
+        self._memory_dock = QDockWidget("Memory", self)
+        self._memory_dock.setWidget(self._memory)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._memory_dock)
+
         # --- Toolbar -------------------------------------------------------
         self._build_toolbar()
 
@@ -181,6 +195,13 @@ class MainWindow(QMainWindow):
         self._act_clear.triggered.connect(self._on_clear_matches)
         tb.addAction(self._act_clear)
 
+        self._act_add_memory = QAction("Add to Memory", self)
+        self._act_add_memory.setToolTip(
+            "Save the current selection and its matches as a Memory entry."
+        )
+        self._act_add_memory.triggered.connect(self._on_add_to_memory)
+        tb.addAction(self._act_add_memory)
+
         tb.addSeparator()
 
         self._act_selftest = QAction("Self-test", self)
@@ -205,6 +226,12 @@ class MainWindow(QMainWindow):
 
         # Params panel: threshold is a live filter, everything else re-runs.
         self._params_panel.params_changed.connect(self._on_params_changed)
+
+        # Memory panel: add the current search, revisit a saved entry's boxes,
+        # and react to a freshly loaded store (possibly switching images).
+        self._memory.add_requested.connect(self._on_add_to_memory)
+        self._memory.entry_activated.connect(self._on_revisit_entry)
+        self._memory.store_loaded.connect(self._on_memory_loaded)
 
     # ----------------------------------------------------------------- actions
     def _on_open(self) -> None:
@@ -274,6 +301,9 @@ class MainWindow(QMainWindow):
         self._viewport.fit_in_view()
         self._count_label.setText("0 matches")
         self._params_panel.set_match_count(0)
+        # Re-seed the Memory panel's source header so entries added after the
+        # swap record the new image (existing entries are left untouched).
+        self._memory.set_source(self._doc.path, self._viewport.image_size())
 
     def _on_mode_toggled(self, checked: bool) -> None:
         """Switch the viewport between Pan (checked) and Select (unchecked)."""
@@ -291,6 +321,97 @@ class MainWindow(QMainWindow):
         self._all_matches = []
         self._count_label.setText("0 matches")
         self._params_panel.set_match_count(0)
+
+    # ----------------------------------------------------------------- memory
+    def _on_add_to_memory(self) -> None:
+        """Append the current selection + visible matches as a Memory entry.
+
+        The matches stored are the ones currently *above* the live threshold
+        (what the user sees in the overlay), captured from the engine's full
+        result set in :attr:`_all_matches`. A no-op (with a status hint) if there
+        is no completed search to save.
+        """
+        if self._last_rect is None or not self._all_matches:
+            self.statusBar().showMessage("Run a match first to add to memory.", 6000)
+            return
+        visible = [m for m in self._all_matches if m.score >= self._params.threshold]
+        rect = self._last_rect
+        sel = (rect.x(), rect.y(), rect.width(), rect.height())
+        entry = MemoryEntry(
+            selection=sel,
+            method=self._params.method,
+            threshold=self._params.threshold,
+            matches=list(visible),
+            enable_rotation=self._params.enable_rotation,
+            enable_flipping=self._params.enable_flipping,
+        )
+        self._memory.add_entry(entry)
+        self.statusBar().showMessage(f"Added {len(visible)} matches to memory.", 6000)
+
+    def _on_revisit_entry(self, entry: object) -> None:
+        """Show a saved entry's boxes on the viewport (revisit).
+
+        Pushes the entry's recorded matches straight onto the overlay and drops
+        the live threshold to 0 so every saved box shows regardless of the
+        current slider. Revisit only makes sense for the current image; if the
+        entry was recorded against a different image the boxes will not line up,
+        which is the user's call.
+        """
+        matches = list(entry.matches)  # type: ignore[attr-defined]
+        self._viewport.set_matches(matches)
+        # Show every saved box: the entry already holds the matches the user
+        # chose to remember, so do not re-filter them by the current slider.
+        try:
+            self._viewport.set_match_threshold(0.0)
+        except Exception:
+            pass
+        self._all_matches = matches
+        try:
+            shown = self._viewport.visible_match_count()
+        except Exception:
+            shown = len(matches)
+        self._count_label.setText(self._count_text(shown, matches, 0.0))
+        self._params_panel.set_match_count(shown)
+        self.statusBar().showMessage(
+            f"Revisiting memory entry: showing {len(matches)} saved matches.", 6000
+        )
+
+    def _on_memory_loaded(self, store: object) -> None:
+        """React to a store loaded from disk: optionally switch to its image.
+
+        If the loaded store names a different source image than the current
+        document, offer to open it (so the entries' coords line up). If the file
+        is missing, warn non-blockingly that the entries were recorded for a
+        different image. The store's entries are already loaded into the panel by
+        the panel itself; we only handle the image side here.
+        """
+        source = getattr(store, "source_image", "")
+        if not source or source == self._doc.path:
+            return
+        if os.path.exists(source):
+            reply = QMessageBox.question(
+                self,
+                "Open source image?",
+                "These saved searches were recorded against a different image:\n"
+                f"{source}\n\nOpen it so the saved boxes line up?",
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                from .loader import load_image
+
+                try:
+                    doc = load_image(source)
+                except Exception as exc:  # surface load failures rather than crash
+                    QMessageBox.critical(
+                        self, "Open failed", f"Could not load image:\n{exc}"
+                    )
+                    return
+                self._swap_document(doc)
+        else:
+            self.statusBar().showMessage(
+                "Loaded memory entries were recorded for a different image "
+                f"({source}), which was not found; saved boxes may not line up.",
+                10000,
+            )
 
     # --------------------------------------------------------- viewport events
     def _on_region_selected(self, rect: QRect) -> None:

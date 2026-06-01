@@ -660,3 +660,134 @@ is approximate, callers should treat the reflection-vs-rotation family as reliab
   Plus an SSD spot-check (orientation is method-agnostic for the conv methods).
 - **Feature** (`cv2` `importorskip`): a feature-rich motif stamped upright + mirrored; `method="features"` with
   flipping ON recovers the mirrored copy tagged as a reflection, and with flipping OFF does not report it.
+
+---
+
+# M. SAVED-MATCH MEMORY (list + JSON)
+
+User requirement: a **Memory** of saved searches. After a search completes, the user clicks **Add to
+Memory** to append an entry capturing the current selection plus all current matches; the panel lists
+per-entry stats; **Remove** deletes the selected line(s); and **Save / Load** persist the whole Memory to a
+JSON file that records the source image and every entry. Double-clicking an entry **revisits** it (re-selects
+that template region). The data model + JSON layer live in `fastmatch/memory.py` and are **Qt-free and
+frozen**; the GUI panel `fastmatch/memory_panel.py` renders a store on top of them.
+
+### M.1 Data model (`fastmatch/memory.py`, frozen, Qt-free)
+
+```python
+@dataclass
+class MemoryEntry:                       # one saved search
+    selection: tuple[int, int, int, int] # boxed template (x, y, w, h), image px, half-open
+    method: str                          # "ncc" | "ssd" | "ccorr" | "features"
+    threshold: float                     # score threshold in effect when captured
+    matches: list[Match] = []            # the recorded matches (source image px space)
+    enable_rotation: bool = False        # orientation checkboxes (DESIGN §L) in effect
+    enable_flipping: bool = False
+    label: str = ""                      # optional; summary() supplies an auto-label when empty
+
+@dataclass
+class MemoryStore:                       # the source image + its saved entries
+    source_image: str = ""               # path of the image the entries were captured against
+    image_size: tuple[int, int] = (0, 0) # (width, height) in px
+    entries: list[MemoryEntry] = []
+```
+
+Each `MemoryEntry` exposes **derived stats** for display, all computed from its `matches`:
+`count()`, `score_range() -> (min, max)`, `mean_score()`, `orientation_counts() -> dict[str, int]`
+(per-orientation tally in canonical `ORIENTATIONS` order, **nonzero only**), `orientation_summary()` (a
+compact `"R0:2 R90:1 MY:1"` string) and `summary()` (a one-line description used as the auto-label, e.g.
+`"ncc · 5 matches · sel 32×24@(100,200) · score 0.65–0.91"`). An empty entry returns `0` / `(0.0, 0.0)` /
+`0.0` / `{}` / `""` respectively.
+
+**Coordinate convention:** like every other cross-boundary type (DESIGN §F.3), a `MemoryEntry`'s `selection`
+and every `Match` it stores are in the **source image's integer pixel space**, origin top-left, half-open
+`(x, y, w, h)`. They are NOT re-based to the selection or to any display level, so a loaded Memory's boxes
+line up with the same source image exactly. `MemoryStore.image_size` records that source's `(width, height)`
+so a consumer can sanity-check a loaded Memory against the image it has open.
+
+### M.2 The panel (`fastmatch/memory_panel.py`)
+
+`MemoryPanel(QWidget)` renders a `MemoryStore` as a list of stats rows and wires the four actions. Contract:
+
+```python
+class MemoryPanel(QWidget):
+    add_requested  = Signal()          # "Add to Memory" clicked
+    entry_activated = Signal(object)   # MemoryEntry — a row was double-clicked (revisit)
+    store_loaded   = Signal(object)    # MemoryStore — emitted after a successful Load
+    def add_entry(self, entry: MemoryEntry) -> None       # append + stats row; select it
+    def set_source(self, source_image: str, image_size: tuple[int, int]) -> None
+    def store(self) -> MemoryStore                        # build from current entries + header
+    def load_store(self, store: MemoryStore) -> None      # replace entries + header; rebuild rows
+    def clear(self) -> None
+```
+
+- **Add to Memory** — `app.py` builds a `MemoryEntry` from the live state (the current selection box, the
+  active `method` / `threshold` / orientation flags, and the matches currently held) and calls
+  `panel.add_entry(entry)`; the panel appends a stats row (using the entry's `summary()` /
+  `orientation_summary()`) and selects it. The button is enabled only when there is a completed search to
+  capture.
+- **Remove** — deletes the selected row(s) and their entries.
+- **Save** — `panel.store()` assembles a `MemoryStore` from the current header (`set_source(...)`) + entries
+  and `save_store(store, path)` writes it to a user-chosen `.json`.
+- **Load** — `load_store(path)` reads a `MemoryStore`; the panel calls `panel.load_store(store)` to rebuild
+  its rows and emits `store_loaded(store)` so `app.py` can react (e.g. note the recorded source image).
+- **Revisit** — double-clicking a row emits `entry_activated(entry)`; `app.py` re-selects that entry's
+  `selection` box (and may re-issue its search) so the user returns to a saved search.
+
+The panel is the only Qt piece; all persistence and stats are the Qt-free `memory.py` so they are unit-tested
+headlessly (DESIGN §M.4).
+
+### M.3 JSON schema
+
+`save_store` / `load_store` (and `store_to_dict` / `store_from_dict`) use this pretty-printed, UTF-8 shape:
+
+```json
+{
+  "version": 1,
+  "source_image": "/path/to/scan.png",
+  "image_size": [4096, 3072],
+  "entries": [
+    {
+      "label": "oriented motif",
+      "selection": [100, 200, 32, 24],
+      "method": "ncc",
+      "threshold": 0.6,
+      "enable_rotation": true,
+      "enable_flipping": true,
+      "matches": [
+        {"x": 100, "y": 200, "w": 32, "h": 24, "score": 0.91, "scale": 1.0, "orientation": "R0"},
+        {"x": 400, "y": 120, "w": 24, "h": 32, "score": 0.72, "scale": 1.0, "orientation": "R90"}
+      ]
+    }
+  ]
+}
+```
+
+- The top level **records the source image** (`source_image`) and its `image_size` `[width, height]`, plus
+  the list of `entries`. Match coordinates inside an entry are in that **source image's pixel space**
+  (half-open `(x, y, w, h)`), as are the entry `selection`s — so reloading a Memory against the same image
+  overlays exactly.
+- `version` is `MEMORY_JSON_VERSION` (currently `1`), bumped only on an incompatible schema change. Readers
+  **tolerate older / minor shapes** — `store_from_dict` / `entry_from_dict` default any missing optional key
+  (`orientation` → `"R0"`, `enable_rotation` / `enable_flipping` → `False`, `label` → `""`, `score` → `0.0`,
+  `scale` → `1.0`) — but **refuse a newer major `version`** with `ValueError`.
+- `load_store` raises `ValueError` on malformed JSON or a dict that is not a FastMatch memory file (no
+  `entries` key) as well as on a too-new version, so the UI can show a clean error instead of crashing.
+- A label-less entry is serialized with its `summary()` baked into `label` (so the file is self-describing);
+  an explicit user label is written verbatim.
+
+### M.4 Tests
+
+`tests/test_memory.py` (no Qt, no engine — `memory.py` is Qt-free; the suite imports neither torch/cv2 nor
+PySide6, so no `@pytest.mark.cpu`):
+- **Stats**: build an entry with several varied-score / orientation-tagged matches and assert `count()`,
+  `score_range()`, `mean_score()`, `orientation_counts()` (canonical order, nonzero only),
+  `orientation_summary()`, and that `summary()` mentions the method, the match count and the selection (and
+  that an explicit `label` overrides it).
+- **JSON round-trip**: a `MemoryStore` (source + size + two entries, one with rotation/flipping flags and
+  orientation-tagged matches) survives `store_to_dict` → `store_from_dict` and `save_store` →
+  `load_store(tmp_path)` **dataclass-equal** to the original; matches round-trip EXACTLY (`Match` equality
+  includes `orientation`). (Entries are explicitly labelled so the auto-label rule above does not perturb
+  equality; a dedicated test pins that auto-label-on-write behaviour.)
+- **Robustness**: a too-new `version` and non-JSON text both raise `ValueError`; `store_from_dict` tolerates
+  entries missing optional keys (defaults as in §M.3); a dict without `entries` is rejected.

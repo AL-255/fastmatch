@@ -97,6 +97,8 @@ stamps and exits; load that file separately to search it.
 | **Method dropdown** | Pick the matching method (NCC / SSD / CCORR / Feature matching). Changing it **re-runs** the search on the current selection. See [Matching methods](#matching-methods). |
 | **Rotation / Flipping checkboxes** | Also search the template under quarter-turn rotations and/or mirror reflections. Changing either **re-runs** the search. See [Orientation search](#orientation-search). |
 | **Threshold slider** | **Live-filters** the displayed results — no re-run (works for every method). |
+| **Add to Memory** | Save the current selection + all current matches as an entry in the Memory list. See [Saved-match Memory](#saved-match-memory). |
+| **Double-click a Memory entry** | Revisit that saved search (re-selects its template region). |
 
 The **source region you selected is excluded** from the matches (it would
 otherwise always be a perfect self-match), and that exclusion is shown in the
@@ -187,6 +189,30 @@ under, so a hit can be a rotated or mirrored copy of your selection. With both
 boxes off, behaviour is exactly the upright-only search described above (no
 extra cost). Changing either checkbox re-runs the search on your current
 selection; the threshold slider stays a live, no-re-run filter.
+
+---
+
+## Saved-match Memory
+
+The **Memory** panel keeps a list of saved searches so you can collect and
+compare interesting matches across a session.
+
+- **Add to Memory** — after a search completes, click *Add to Memory* to append
+  an entry that captures the **current selection box** plus **all current
+  matches** (and the method / threshold / orientation settings used).
+- **Per-entry stats** — each row shows a one-line summary: the method, the
+  number of matches, the selection size and position, the score range, and a
+  compact per-orientation breakdown (e.g. `R0:2 R90:1 MY:1`).
+- **Remove** — deletes the selected line(s) from the list.
+- **Double-click** an entry to **revisit** it — FastMatch re-selects that saved
+  search's template region.
+- **Save / Load (JSON)** — *Save* writes the whole Memory to a `.json` file that
+  records the **source image** (its path and pixel size) and **every entry**
+  (selection, settings, and each match with its score, scale and orientation);
+  *Load* reads one back. Match coordinates are stored in the **source image's
+  pixel space**, so a Memory loaded against the same image lines its boxes up
+  exactly. A file written by a newer FastMatch (a higher schema version), or any
+  malformed/non-JSON file, is refused with a clear error rather than crashing.
 
 ---
 
