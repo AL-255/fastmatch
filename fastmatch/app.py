@@ -110,6 +110,8 @@ class MainWindow(QMainWindow):
         self._params = dataclasses.replace(
             self._params_panel.current_params(), device=self._device_pref
         )
+        # Auto Run state (panel default is on -> preserves the run-on-change UX).
+        self._auto_run = self._params_panel.auto_run_enabled()
         # Render the image as the matcher sees it: grayscale in luminance mode,
         # colour in rgb mode (the channel-mode combo drives the display).
         self._viewport.set_display_grayscale(self._params.channel_mode == "luminance")
@@ -260,6 +262,9 @@ class MainWindow(QMainWindow):
 
         # Params panel: threshold is a live filter, everything else re-runs.
         self._params_panel.params_changed.connect(self._on_params_changed)
+        # Run button + Auto Run toggle.
+        self._params_panel.run_clicked.connect(self._on_run)
+        self._params_panel.auto_run_changed.connect(self._on_auto_run_changed)
 
         # Memory panel: add the current search, revisit a saved entry's boxes,
         # and react to a freshly loaded store (possibly switching images).
@@ -319,6 +324,7 @@ class MainWindow(QMainWindow):
         self._doc = doc
         self._last_rect = None
         self._all_matches = []
+        self._params_panel.set_run_enabled(False)  # new image -> no selection yet
         self._viewport.clear_matches()
         self._viewport.clear_template()
         self._viewport.set_image(doc)
@@ -355,6 +361,7 @@ class MainWindow(QMainWindow):
         self._viewport.clear_template()
         self._last_rect = None
         self._all_matches = []
+        self._params_panel.set_run_enabled(False)  # nothing to Run anymore
         self._count_label.setText("0 matches")
         self._params_panel.set_match_count(0)
 
@@ -446,9 +453,26 @@ class MainWindow(QMainWindow):
 
     # --------------------------------------------------------- viewport events
     def _on_region_selected(self, rect: QRect) -> None:
-        """Forward a freshly drawn selection rect to the controller."""
+        """Record a freshly drawn selection; search now only if Auto Run is on."""
         self._last_rect = QRect(rect)  # copy: caller may reuse/mutate its QRect
-        self._controller.request(rect, self._params)
+        self._params_panel.set_run_enabled(True)  # there is now something to Run
+        if self._auto_run:
+            self._controller.request(rect, self._params)
+        else:
+            self.statusBar().showMessage("Selection set — press Run to search.", 4000)
+
+    def _on_run(self) -> None:
+        """Run the search on the current selection (the Run button / manual)."""
+        if self._last_rect is None:
+            self.statusBar().showMessage("Draw a selection box first.", 4000)
+            return
+        self._controller.request(self._last_rect, self._params)
+
+    def _on_auto_run_changed(self, on: bool) -> None:
+        """Track the Auto Run toggle; turning it on runs the pending selection."""
+        self._auto_run = bool(on)
+        if self._auto_run and self._last_rect is not None:
+            self._controller.request(self._last_rect, self._params)
 
     def _on_cursor_pos(self, x: int, y: int) -> None:
         """Update the status-bar cursor readout (-1,-1 == outside image)."""
@@ -574,9 +598,10 @@ class MainWindow(QMainWindow):
 
         self._params = new  # type: ignore[assignment]
 
-        if engine_relevant_changed and self._last_rect is not None:
-            # Re-run the last selection with the new parameters (latest-wins
-            # debounce inside the controller coalesces rapid spinbox edits).
+        if engine_relevant_changed and self._last_rect is not None and self._auto_run:
+            # Auto Run on: re-run the last selection with the new parameters
+            # (latest-wins debounce in the controller coalesces rapid edits).
+            # With Auto Run off, the new params are stored and applied on Run.
             self._controller.request(self._last_rect, self._params)
 
     def _announce_method(self, method: str) -> None:

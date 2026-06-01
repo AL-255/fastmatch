@@ -35,7 +35,9 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFormLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
+    QPushButton,
     QSlider,
     QSpinBox,
     QStackedWidget,
@@ -97,9 +99,17 @@ class ParamsPanel(QWidget):
     Signals:
         params_changed: Emitted with the current ``MatchParams`` whenever any
             control changes (including the live threshold slider).
+        run_clicked: Emitted when the user presses the **Run** button (manually
+            trigger the search on the current selection).
+        auto_run_changed: Emitted with the new state of the **Auto Run** checkbox.
+            When Auto Run is on, the main window re-issues the search on a new
+            selection or an engine-relevant settings change; when off, it waits
+            for Run.
     """
 
     params_changed = Signal(object)  # MatchParams
+    run_clicked = Signal()
+    auto_run_changed = Signal(bool)
 
     def __init__(self, effective_device: str, parent: QWidget | None = None) -> None:
         """Build the panel for a resolved device.
@@ -125,6 +135,28 @@ class ParamsPanel(QWidget):
         self._emitting = False
 
         root = QVBoxLayout(self)
+
+        # --- Run controls (top) --------------------------------------------
+        # A manual "Run" button plus an "Auto Run" toggle. Auto Run defaults ON
+        # so the established behaviour (draw a box / change a setting -> search
+        # runs) is preserved; turning it off lets the user set up the selection
+        # and parameters and trigger a single search with Run (useful when each
+        # run is expensive, e.g. CPU multi-scale).
+        run_row = QHBoxLayout()
+        self._run_button = QPushButton("Run", self)
+        self._run_button.setToolTip("Run the search on the current selection.")
+        self._run_button.setEnabled(False)  # enabled once a region is selected
+        self._run_button.clicked.connect(lambda *_: self.run_clicked.emit())
+        run_row.addWidget(self._run_button, 1)
+        self._auto_run = QCheckBox("Auto Run", self)
+        self._auto_run.setChecked(True)
+        self._auto_run.setToolTip(
+            "When on, the search runs automatically as you draw a selection or "
+            "change settings. When off, click Run to search."
+        )
+        self._auto_run.toggled.connect(self.auto_run_changed)
+        run_row.addWidget(self._auto_run)
+        root.addLayout(run_row)
 
         # --- Method selector (top, DESIGN.md §J.5) -------------------------
         method_box = QGroupBox("Method", self)
@@ -445,3 +477,11 @@ class ParamsPanel(QWidget):
     def set_match_count(self, n: int) -> None:
         """Update the match-count readout label."""
         self._count_label.setText(f"Matches shown: {n}")
+
+    def auto_run_enabled(self) -> bool:
+        """Whether the **Auto Run** checkbox is currently checked."""
+        return self._auto_run.isChecked()
+
+    def set_run_enabled(self, enabled: bool) -> None:
+        """Enable/disable the **Run** button (e.g. only once a region exists)."""
+        self._run_button.setEnabled(bool(enabled))
