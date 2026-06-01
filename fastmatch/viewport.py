@@ -227,10 +227,17 @@ class ImageViewport(QGraphicsView):
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
 
-        # OpenGL viewport with smart updates so async tile arrivals only repaint
-        # the affected region (§E.8).
+        # OpenGL viewport. It MUST use FullViewportUpdate: a QOpenGLWidget is
+        # double-buffered and swaps the whole framebuffer each frame, so a partial
+        # (Smart/Minimal) update — which repaints only the changed region — leaves
+        # the rest of the swapped buffer showing stale/undefined content, i.e. the
+        # image FLICKERS (most visibly when zoomed in, where partial repaints and
+        # async tile arrivals cover large screen areas). Qt documents
+        # FullViewportUpdate as the correct mode for GL viewports; redrawing the
+        # whole viewport is free for GL, which composites the full scene per frame
+        # regardless. (§E.8)
         self.setViewport(QOpenGLWidget())
-        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.SmartViewportUpdate)
+        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
         self.setRenderHints(self.renderHints())  # no MSAA; keep defaults
         self.setBackgroundBrush(_BG_COLOR)
         self.setFrameShape(QGraphicsView.Shape.NoFrame)
