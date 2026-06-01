@@ -178,10 +178,16 @@ def _greedy_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thr: float) -> to
     areas = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
     order = torch.argsort(scores, descending=True)
 
-    keep: list[int] = []
+    # Greedy NMS is inherently sequential with only a few ops per kept box, so we
+    # must NOT force a host<->device sync per iteration: `int(order[0])` would
+    # block on the GPU every loop (thousands of stalls -> GPU far slower than
+    # CPU). Instead we accumulate the kept *index tensors* and stack once at the
+    # end — a single sync. (_run_nms additionally runs this on the CPU for CUDA
+    # inputs, where this tiny sequential loop is faster still.)
+    keep: list[torch.Tensor] = []
     while order.numel() > 0:
         i = order[0]
-        keep.append(int(i))
+        keep.append(i)
         if order.numel() == 1:
             break
         rest = order[1:]
@@ -196,7 +202,7 @@ def _greedy_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thr: float) -> to
         # Keep only the boxes that do NOT overlap box i too much.
         order = rest[iou <= iou_thr]
 
-    return torch.as_tensor(keep, dtype=torch.long, device=boxes.device)
+    return torch.stack(keep)
 
 
 def _run_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thr: float) -> torch.Tensor:
@@ -205,9 +211,16 @@ def _run_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thr: float) -> torch
         return torch.empty(0, dtype=torch.long, device=boxes.device)
     if _HAVE_TV_NMS:
         # torchvision.ops.nms wants float boxes/scores and returns sorted-desc
-        # kept indices — identical contract to our fallback.
+        # kept indices — identical contract to our fallback. Fused CUDA kernel,
+        # so it runs in-place on the GPU.
         return _tv_nms(boxes.float(), scores.float(), float(iou_thr))
-    return _greedy_nms(boxes, scores, iou_thr)
+    # Pure-torch fallback. The greedy loop is sequential with tiny per-step work
+    # — the worst case for a GPU (per-iteration kernel-launch latency dominates).
+    # Running it on the CPU over the (small) candidate set and shipping the kept
+    # indices back is dramatically faster for CUDA inputs, and a no-op transfer
+    # for CPU inputs (so the CPU path — what the tests pin — is unchanged).
+    keep = _greedy_nms(boxes.detach().to("cpu"), scores.detach().to("cpu"), iou_thr)
+    return keep.to(boxes.device)
 
 
 def _iou_against_box(
@@ -1305,43 +1318,50 @@ class Matcher:
         roi_y0 = (cy2 - _REFINE_RADIUS).clamp(min=0, max=max_y0)
         roi_x0 = (cx2 - _REFINE_RADIUS).clamp(min=0, max=max_x0)
 
-        # Build the (N,1,win_h,win_w) batch per channel via vectorized gather: an
-        # index grid added to each ROI's top-left, no Python per-candidate loop.
+        # Build the (M,1,win_h,win_w) ROI batch per channel via vectorized gather
+        # (an index grid added to each ROI's top-left — no Python per-candidate
+        # loop). The gather + its index grids scale with the candidate count N, so
+        # for large N on a VRAM-tight GPU (e.g. the display sharing the card) it
+        # would OOM and force the whole query onto the slow full-res fallback. We
+        # therefore process candidates in memory-budgeted CHUNKS: each chunk is an
+        # independent batched refinement; results are concatenated and the single
+        # cross-candidate dedupe below is unchanged, so the output is identical to
+        # the one-shot path — it just never exceeds the free-VRAM budget.
         n = roi_y0.numel()
         ar_h = torch.arange(win_h, device=device)
         ar_w = torch.arange(win_w, device=device)
-        rows = (roi_y0.view(n, 1, 1) + ar_h.view(1, win_h, 1)).expand(n, win_h, win_w)
-        cols = (roi_x0.view(n, 1, 1) + ar_w.view(1, 1, win_w)).expand(n, win_h, win_w)
+        chunk = self._refine_chunk(win_h, win_w, len(planes), sth, stw)
 
-        roi_planes: list[torch.Tensor] = []
-        for p in planes:
-            plane = p[0, 0]  # (Hl,Wl)
-            roi = plane[rows, cols]  # (N,win_h,win_w) advanced-indexing gather
-            roi_planes.append(roi.unsqueeze(1))  # (N,1,win_h,win_w)
+        gy_parts: list[torch.Tensor] = []
+        gx_parts: list[torch.Tensor] = []
+        val_parts: list[torch.Tensor] = []
+        for start in range(0, n, chunk):
+            ry0 = roi_y0[start : start + chunk]
+            rx0 = roi_x0[start : start + chunk]
+            m = ry0.numel()
+            rows = (ry0.view(m, 1, 1) + ar_h.view(1, win_h, 1)).expand(m, win_h, win_w)
+            cols = (rx0.view(m, 1, 1) + ar_w.view(1, 1, win_w)).expand(m, win_h, win_w)
 
-        # ONE batched score map over all N ROIs (§K.1 performance kernel).
-        maps = self._score_map(roi_planes, per_channel, sth, stw, method)  # (N,oh,ow)
-        maps = torch.nan_to_num(maps, nan=-1.0, posinf=-1.0, neginf=-1.0)
-        oh, ow = maps.shape[-2], maps.shape[-1]
+            roi_planes = [p[0, 0][rows, cols].unsqueeze(1) for p in planes]
+            maps = self._score_map(roi_planes, per_channel, sth, stw, method)  # (m,oh,ow)
+            maps = torch.nan_to_num(maps, nan=-1.0, posinf=-1.0, neginf=-1.0)
+            oh, ow = maps.shape[-2], maps.shape[-1]
 
-        # Per-ROI argmax peak: the ROI's valid output grid is exactly the ±radius
-        # window, so its best cell is a local maximum within that window and gives
-        # one peak per candidate.
-        flat = maps.reshape(n, oh * ow)
-        best_val, best_idx = flat.max(dim=1)
-        keep = best_val >= thr
-        if not bool(keep.any()):
+            # Per-ROI argmax peak: the valid output grid is exactly the ±radius
+            # window, so its best cell is a local maximum and gives one peak/ROI.
+            flat = maps.reshape(m, oh * ow)
+            best_val, best_idx = flat.max(dim=1)
+            keep = best_val >= thr  # mask (no sync); empty chunks concat harmlessly
+            bi = best_idx[keep]
+            gy_parts.append(ry0[keep] + bi // ow)
+            gx_parts.append(rx0[keep] + bi % ow)
+            val_parts.append(best_val[keep])
+
+        gy = torch.cat(gy_parts) if gy_parts else empty_l
+        gx = torch.cat(gx_parts) if gx_parts else empty_l
+        best_val = torch.cat(val_parts) if val_parts else empty_f
+        if gy.numel() == 0:
             return empty_l, empty_l, empty_f
-
-        best_idx = best_idx[keep]
-        best_val = best_val[keep]
-        roi_y0k = roi_y0[keep]
-        roi_x0k = roi_x0[keep]
-        peak_r = best_idx // ow
-        peak_c = best_idx % ow
-        # Absolute top-left in this level's grid.
-        gy = roi_y0k + peak_r
-        gx = roi_x0k + peak_c
 
         # Dedupe candidates that landed on the same level cell (overlapping ROIs
         # from neighbouring coarse candidates can converge on one true peak),
@@ -1390,6 +1410,46 @@ class Matcher:
         # the docstring) and per-tile scratch stays small. 1024 is a good balance
         # of halo overhead vs. cancellation latency on the (slow) CPU fallback.
         return 1024
+
+    def _refine_chunk(
+        self, win_h: int, win_w: int, channels: int, sth: int, stw: int
+    ) -> int:
+        """Max candidates per refinement batch that fit the free-VRAM budget (§K.1).
+
+        The ROI gather in :meth:`_refine_level` allocates, per candidate, two
+        ``int64`` index grids plus ``channels`` ROI planes of ``win_h x win_w``,
+        and ``_score_map`` adds scratch. When the cross-correlation backend is FFT
+        the dominant cost is instead the batched ``rfft2``/``irfft2`` transforms
+        (and cuFFT's own work area), which are much larger than the spatial
+        scratch — so we size the chunk to whichever the active backend uses. We
+        keep a batch within ``vram_fraction`` of *currently free* VRAM — which on
+        a display-shared GPU may be a small slice of the card — so a query with
+        many coarse candidates refines in several passes instead of OOM-/cuFFT-
+        failing onto the slow full-resolution search. CPU runs in a single pass.
+        """
+        if self._device.type != "cuda":
+            return 1 << 30  # effectively "no chunking" on CPU
+        try:
+            free, _ = torch.cuda.mem_get_info()
+        except Exception:
+            free = 0
+        # Halve the headroom: cuFFT's work area is not counted by PyTorch and the
+        # transforms allocate transient complex buffers, so stay well clear of OOM.
+        budget = int(free * self._vram_fraction * 0.5)
+        dtype_size = 2 if self._compute_dtype == "float16" else 4
+        # Always present: two int64 index grids + the gathered ROI plane(s).
+        per_cand = win_h * win_w * (8 + 8 + channels * dtype_size)
+        if self._cross_backend(sth, stw) == "fft":
+            # FFT pads to a smooth (fh x fw); per ROI it holds a half-spectrum
+            # complex buffer + a full real buffer, plus comparable cuFFT scratch.
+            fh = _next_smooth(win_h + sth - 1)
+            fw = _next_smooth(win_w + stw - 1)
+            per_cand += fh * (fw // 2 + 1) * 8 * 2 + fh * fw * 4 * 3
+        else:
+            per_cand += win_h * win_w * 8 * dtype_size  # spatial conv scratch
+        if budget <= 0 or per_cand <= 0:
+            return 256  # conservative fixed batch when the probe is unavailable
+        return max(1, budget // per_cand)
 
     def _plan_tiles(self, sth: int, stw: int) -> list[tuple[int, int, int, int]]:
         """Partition the valid output grid into halo-padded core tiles.
@@ -1568,6 +1628,7 @@ class Matcher:
         sth: int,
         stw: int,
         method: str,
+        backend: str | None = None,
     ) -> torch.Tensor:
         """Compute the per-window score map for one of the convolution methods.
 
@@ -1596,7 +1657,7 @@ class Matcher:
         is bit-for-bit identical to the legacy NCC map — the regression baseline),
         and already in ``[0, 1]`` for SSD/CCORR.
         """
-        terms = self._compute_score_terms(img_planes, per_channel, sth, stw)
+        terms = self._compute_score_terms(img_planes, per_channel, sth, stw, backend)
         return self._score_from_terms(method, terms)
 
     def _compute_score_terms(
@@ -1605,6 +1666,7 @@ class Matcher:
         per_channel: list[dict],
         sth: int,
         stw: int,
+        backend: str | None = None,
     ) -> dict:
         """Compute the per-window score *terms*, summed across channels (§K.1).
 
@@ -1620,7 +1682,11 @@ class Matcher:
         legacy one so the resulting NCC map is bit-for-bit unchanged.
         """
         n = per_channel[0]["n"]
-        backend = self._cross_backend(sth, stw)
+        # A caller may force the backend (the batched ROI refinement forces
+        # "spatial": FFT over a batch of small ROIs needs a huge work area and only
+        # yields a tiny valid window — spatial conv is cheaper and VRAM-light, and
+        # avoids cuFFT failing to allocate on a memory-tight/display-shared GPU).
+        backend = backend or self._cross_backend(sth, stw)
         channels = len(per_channel)
 
         # Per-channel accumulators, summed BEFORE the single division (§J.2 RGB).
@@ -1782,9 +1848,17 @@ class Matcher:
         tzf = torch.flip(tz[0, 0], dims=(0, 1))  # flip so circular conv == correlation
 
         # rfft2 transforms the trailing two dims, broadcasting the leading batch.
-        img_fft = torch.fft.rfft2(img2, s=(fh, fw))
-        tz_fft = torch.fft.rfft2(tzf, s=(fh, fw))
-        conv = torch.fft.irfft2(img_fft * tz_fft, s=(fh, fw))
+        # cuFFT can fail to allocate its work area on a VRAM-tight/display-shared
+        # GPU (CUFFT_INTERNAL_ERROR) even when the tensors fit; spatial conv needs
+        # no work area, so fall back to it rather than aborting the whole query.
+        try:
+            img_fft = torch.fft.rfft2(img2, s=(fh, fw))
+            tz_fft = torch.fft.rfft2(tzf, s=(fh, fw))
+            conv = torch.fft.irfft2(img_fft * tz_fft, s=(fh, fw))
+        except RuntimeError as exc:
+            if "fft" not in str(exc).lower() and "cufft" not in str(exc).lower():
+                raise
+            return self._cross_spatial(img, tz)
 
         # The valid cross-correlation output lives at offset (sth-1, stw-1) and
         # spans (ih-sth+1, iw-stw+1).
