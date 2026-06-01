@@ -245,3 +245,68 @@ def test_normalize_theme_coerces_unknown_to_default() -> None:
     assert theme.normalize_theme(None) == theme.DEFAULT_THEME
     assert theme.normalize_theme("chartreuse") == theme.DEFAULT_THEME
     assert theme.DEFAULT_THEME in theme.THEME_KEYS
+
+
+# ----------------------------------------------------- calibration / measure
+from PySide6.QtCore import QPointF, QRect  # noqa: E402
+from PySide6.QtWidgets import QInputDialog  # noqa: E402
+from fastmatch.viewport import ImageViewport  # noqa: E402
+
+
+def test_tools_menu_present(window) -> None:
+    labels = [a.text() for a in window._tools_menu.actions() if a.text()]
+    assert window._tools_menu.title() == "&Tools"
+    assert labels == ["Calibrate", "Measure", "Clear measurement", "Clear calibration"]
+
+
+def test_calibrate_tool_enters_calibrate_mode(window) -> None:
+    window._act_mode.setChecked(False)  # Select mode
+    window._on_calibrate_tool()
+    assert window._viewport._mode is ImageViewport.Mode.CALIBRATE
+
+
+def test_calibration_sets_scale_coords_and_area(window, monkeypatch) -> None:
+    """Picking a span + entering a length calibrates; coords/area become physical."""
+    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("5 mm", True)))
+    window._on_calibrate_tool()
+    # Longer span = max(|dx|=100, |dy|=50) = 100 px -> 5 mm / 100 px = 0.05 mm/px.
+    window._on_calibration_picked(QPointF(10, 20), QPointF(110, 70))
+    cal = window._calibration
+    assert cal is not None
+    assert cal.scale == pytest.approx(0.05)
+    assert cal.unit == "mm"
+    assert cal.origin == (10.0, 20.0)
+    # Mode restored to Select after the one-shot tool.
+    assert window._viewport._mode is ImageViewport.Mode.SELECT
+    # Physical cursor coords relative to the origin.
+    window._on_cursor_pos(110, 20)
+    assert "5, 0) mm" in window._cursor_label.text()
+    # Physical area of a 100x200 px selection: 5 mm * 10 mm = 50 mm².
+    window._on_region_selected(QRect(0, 0, 100, 200))
+    assert window._area_label.text() == "area 50 mm²"
+
+
+def test_calibration_rejects_tiny_span(window, monkeypatch) -> None:
+    called = {"n": 0}
+    monkeypatch.setattr(QInputDialog, "getText",
+                        staticmethod(lambda *a, **k: (called.__setitem__("n", called["n"] + 1) or "1 mm", True)))
+    window._on_calibration_picked(QPointF(5, 5), QPointF(5.5, 5.2))  # < 1 px span
+    assert window._calibration is None
+    assert called["n"] == 0  # never even prompted
+
+
+def test_measure_reports_physical_distance(window, monkeypatch) -> None:
+    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("5 mm", True)))
+    window._on_calibration_picked(QPointF(0, 0), QPointF(100, 50))  # 0.05 mm/px
+    window._on_measure_picked(QPointF(0, 0), QPointF(30, 40))       # 50 px -> 2.5 mm
+    assert "2.5 mm" in window.statusBar().currentMessage()
+
+
+def test_clear_calibration_resets(window, monkeypatch) -> None:
+    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("5 mm", True)))
+    window._on_calibration_picked(QPointF(0, 0), QPointF(100, 50))
+    window._on_region_selected(QRect(0, 0, 50, 50))
+    assert window._area_label.text() != ""
+    window._on_clear_calibration()
+    assert window._calibration is None
+    assert window._area_label.text() == ""

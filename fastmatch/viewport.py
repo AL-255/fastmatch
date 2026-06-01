@@ -27,6 +27,7 @@ import numpy as np
 from PySide6.QtCore import (
     QObject,
     QPoint,
+    QPointF,
     QRect,
     QRectF,
     QRunnable,
@@ -46,7 +47,7 @@ from PySide6.QtWidgets import (
 )
 
 from .document import ImageDocument
-from .overlay import MatchOverlayItem
+from .overlay import MatchOverlayItem, MeasureOverlayItem
 from .pyramid import TILE, ImagePyramid, TileCache
 from .types import Match
 
@@ -228,11 +229,15 @@ class ImageViewport(QGraphicsView):
 
         SELECT = enum.auto()
         PAN = enum.auto()
+        CALIBRATE = enum.auto()   # one-shot: left-drag picks the calibration span
+        MEASURE = enum.auto()     # one-shot: left-drag measures a distance
 
     # Signals (§C.8) -------------------------------------------------------- #
     regionSelected = Signal(QRect)        # template rect, full-res image px, half-open
     matchesChanged = Signal(int)          # count currently shown (post threshold)
     cursorImagePos = Signal(int, int)     # live image px under cursor (-1,-1 outside)
+    calibrationPicked = Signal(QPointF, QPointF)  # two image-px points spanning a length
+    measurePicked = Signal(QPointF, QPointF)      # two image-px points to measure
     zoomChanged = Signal(float, int)      # (view_scale, current_pyramid_level)
     viewChanged = Signal(QRect)           # visible image-px rect (prefetch hint)
 
@@ -306,6 +311,12 @@ class ImageViewport(QGraphicsView):
         self._rubber = QRubberBand(QRubberBand.Shape.Rectangle, self.viewport())
         self._template_rect: QRect | None = None
 
+        # Calibration / measurement (ruler) state.
+        self._measure_overlay: MeasureOverlayItem | None = None
+        self._measuring = False
+        self._measure_p1: QPointF | None = None
+        self._measure_kind = "measure"   # "measure" | "calibrate" for the active drag
+
         self._apply_cursor()
 
     # ------------------------------------------------------------------ image
@@ -343,6 +354,11 @@ class ImageViewport(QGraphicsView):
         self._overlay.set_xor(self._box_xor)
         self._scene.addItem(self._overlay)
 
+        # Ruler/calibration overlay sits above the match boxes.
+        self._measure_overlay = MeasureOverlayItem(doc.width, doc.height)
+        self._measure_overlay.set_line_width(max(2, self._box_line_width + 1))
+        self._scene.addItem(self._measure_overlay)
+
         # Min scale: never zoom out further than the whole image fitting a small
         # window; max stays at the hard 64x cap.
         longest = max(doc.width, doc.height)
@@ -364,6 +380,9 @@ class ImageViewport(QGraphicsView):
         self._pyramid = None
         self._pyramid_item = None
         self._overlay = None
+        self._measure_overlay = None
+        self._measuring = False
+        self._measure_p1 = None
         self._template_rect = None
         self.tile_cache.clear()
         self._pending_tiles.clear()
@@ -429,6 +448,28 @@ class ImageViewport(QGraphicsView):
         """Set the canvas colour behind tiles (follows the application theme)."""
         self.setBackgroundBrush(QColor(color))
         self.viewport().update()
+
+    # --------------------------------------------------- calibration / ruler
+    def set_calibration(self, scale: float | None, unit: str) -> None:
+        """Set the physical scale (units/px) used to label ruler/calibration lines."""
+        if self._measure_overlay is not None:
+            self._measure_overlay.set_calibration(scale, unit)
+
+    def set_calibration_line(self, p1: QPointF | None, p2: QPointF | None) -> None:
+        """Show (or clear) the persistent calibration reference line."""
+        if self._measure_overlay is not None:
+            self._measure_overlay.set_calibration_line(p1, p2)
+
+    def clear_measurement(self) -> None:
+        """Remove the committed ruler line."""
+        if self._measure_overlay is not None:
+            self._measure_overlay.set_measure(None, None)
+
+    def clear_calibration(self) -> None:
+        """Remove the calibration reference line and forget the physical scale."""
+        if self._measure_overlay is not None:
+            self._measure_overlay.set_calibration_line(None, None)
+            self._measure_overlay.set_calibration(None, "")
 
     # ------------------------------------------------------ selection/template
     def template_rect(self) -> QRect | None:
@@ -752,6 +793,22 @@ class ImageViewport(QGraphicsView):
             e.accept()
             return
         if btn == Qt.MouseButton.LeftButton:
+            if self._mode in (
+                ImageViewport.Mode.CALIBRATE,
+                ImageViewport.Mode.MEASURE,
+            ):
+                # Begin a two-point span (calibration or ruler) drag.
+                self._measuring = True
+                self._measure_kind = (
+                    "calibrate" if self._mode is ImageViewport.Mode.CALIBRATE else "measure"
+                )
+                self._measure_p1 = self._clamped_image_point(e.position().toPoint())
+                if self._measure_overlay is not None:
+                    self._measure_overlay.set_pending(
+                        self._measure_p1, self._measure_p1, self._measure_kind
+                    )
+                e.accept()
+                return
             # Start a rubber-band selection in viewport coordinates.
             self._selecting = True
             self._sel_origin = e.position().toPoint()
@@ -779,6 +836,13 @@ class ImageViewport(QGraphicsView):
             e.accept()
             return
 
+        if self._measuring and self._measure_p1 is not None:
+            p2 = self._clamped_image_point(pos)
+            if self._measure_overlay is not None:
+                self._measure_overlay.set_pending(self._measure_p1, p2, self._measure_kind)
+            e.accept()
+            return
+
         if self._selecting and self._sel_origin is not None:
             self._rubber.setGeometry(QRect(self._sel_origin, pos).normalized())
             e.accept()
@@ -798,6 +862,24 @@ class ImageViewport(QGraphicsView):
             e.accept()
             return
 
+        if self._measuring and e.button() == Qt.MouseButton.LeftButton:
+            self._measuring = False
+            p1, p2 = self._measure_p1, self._clamped_image_point(e.position().toPoint())
+            self._measure_p1 = None
+            if self._measure_overlay is not None:
+                self._measure_overlay.set_pending(None, None, self._measure_kind)
+            if p1 is not None and (abs(p2.x() - p1.x()) >= 1 or abs(p2.y() - p1.y()) >= 1):
+                if self._measure_kind == "calibrate":
+                    if self._measure_overlay is not None:
+                        self._measure_overlay.set_calibration_line(p1, p2)
+                    self.calibrationPicked.emit(p1, p2)
+                else:
+                    if self._measure_overlay is not None:
+                        self._measure_overlay.set_measure(p1, p2)
+                    self.measurePicked.emit(p1, p2)
+            e.accept()
+            return
+
         if self._selecting and e.button() == Qt.MouseButton.LeftButton:
             self._selecting = False
             self._rubber.hide()
@@ -814,6 +896,12 @@ class ImageViewport(QGraphicsView):
         super().mouseReleaseEvent(e)
 
     # -------------------------------------------------------- coord helpers
+    def _clamped_image_point(self, viewport_pt: QPoint) -> QPointF:
+        """Map a viewport point to image-px coords (QPointF), clamped to the image."""
+        sp = self.mapToScene(viewport_pt)
+        w = float(self._doc.width) if self._doc is not None else 0.0
+        h = float(self._doc.height) if self._doc is not None else 0.0
+        return QPointF(min(max(0.0, sp.x()), w), min(max(0.0, sp.y()), h))
     def _viewport_band_to_image_rect(self) -> QRect | None:
         """Convert the rubber-band (viewport px) to a half-open image-px rect.
 

@@ -161,6 +161,7 @@ exits; load that file separately to search it.
 | **View ▸ Match boxes** menu | Configure the overlay box outlines: **Line width** (1–6 px, zoom-independent) and **XOR with background** (invert the outline against whatever is underneath so it stays visible on any background). |
 | **Engine** menu | Switch the compute backend on the fly: **Auto (prefer GPU)**, **CUDA (GPU)**, or **CPU**. CUDA is greyed out when no working GPU is detected. Switching rebuilds the engine on the new device, updates the status banner, re-gates the GPU-only multi-scale search, and re-runs the current selection. |
 | **Theme** menu | Switch the application look: **System** (follow the desktop), **Light**, or **Dark**. The whole UI and the image canvas re-theme instantly, and the choice is remembered for next launch. |
+| **Tools** menu | **Calibrate scale** and **Measure distance** (physical units). See [Measurement & calibration](#measurement--calibration). |
 | **Add to Memory** | Save the current selection + all current matches as an entry in the Memory list. See [Saved-match Memory](#saved-match-memory). |
 | **Double-click a Memory entry** | Revisit that saved search — restores the blue reference box to its remembered selection and re-shows its matches. |
 
@@ -304,6 +305,33 @@ compare interesting matches across a session.
   persisted (via `QSettings`) and re-applied on the next launch, before the first
   paint, so there is no startup flash. Match/selection box colours are kept
   constant across themes (a match always reads as the same green).
+
+---
+
+## Measurement & calibration
+
+The **Tools** menu (and toolbar) add physical-scale measurement on top of the
+pixel grid:
+
+- **Calibrate scale** — click *Calibrate*, then drag a line along a span of known
+  physical length (a scale bar, a chip edge). Enter the length when prompted
+  (e.g. `5.36 mm` — a bare number reuses the last unit). The entered length maps
+  to the **longer** of the horizontal/vertical pixel spans (`max(|Δx|, |Δy|)`),
+  the natural choice for a feature aligned to one axis. The **first point becomes
+  the physical-grid origin**. The reference line stays drawn (orange) labelled
+  with its length.
+- **Measure distance** — click *Measure*, then drag a line; its **physical
+  distance** (true Euclidean length × scale) is labelled on the line (amber) and
+  shown in the status bar. Before calibration it reports pixels.
+- **Physical cursor coordinates** — once calibrated, the status bar shows the
+  cursor position in physical units relative to the calibration origin, alongside
+  the pixel coordinate, e.g. `(1203, 540) px   (5.36, 2.41) mm`.
+- **Selection area** — the status bar shows the **physical area** of the current
+  selection box, e.g. `area 31.3 mm²` (pixel `w·h × scale²`).
+
+Both tools are one-shot (a single drag, then the previous Pan/Select mode is
+restored). Calibration is per-image and resets when you open/close an image;
+*Clear calibration* and *Clear measurement* remove them.
 
 ---
 

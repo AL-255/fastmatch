@@ -14,8 +14,10 @@ the threshold slider re-filters instantly without re-running the engine.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
-from PySide6.QtCore import QRect, QRectF, Qt
+from PySide6.QtCore import QLineF, QPointF, QRect, QRectF, Qt
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QGraphicsItem, QStyleOptionGraphicsItem, QWidget
 
@@ -255,3 +257,116 @@ class MatchOverlayItem(QGraphicsItem):
                 _draw_boxes([QRectF(sb)], _SOURCE_COLOR)
 
         painter.restore()
+
+
+# zValue above the match overlay so ruler lines/labels are never hidden.
+_RULER_Z = 11.0
+_MEASURE_COLOR = QColor(255, 210, 0)   # ruler line: amber
+_CALIB_COLOR = QColor(255, 120, 0)     # calibration reference: orange
+
+
+class MeasureOverlayItem(QGraphicsItem):
+    """Draws the calibration reference line, the ruler line, and the in-progress
+    drag line, each labelled with its physical (or pixel) length.
+
+    Like :class:`MatchOverlayItem` it paints in scene px (== image px) with
+    cosmetic pens so geometry stays pixel-locked at any zoom. Labels and endpoint
+    dots are drawn in *device* space (reset transform) so they stay a constant
+    on-screen size and legible regardless of zoom.
+    """
+
+    def __init__(self, w: int, h: int, parent: QGraphicsItem | None = None) -> None:
+        super().__init__(parent)
+        self._w, self._h = int(w), int(h)
+        self.setZValue(_RULER_Z)
+        self._line_width = 2
+        self._scale: float | None = None    # units/px, for labels (None -> px)
+        self._unit = ""
+        self._pending: tuple[QPointF, QPointF, str] | None = None  # (p1,p2,kind)
+        self._measure: tuple[QPointF, QPointF] | None = None
+        self._calib: tuple[QPointF, QPointF] | None = None
+
+    def boundingRect(self) -> QRectF:
+        # Generous (matches the viewport's padded scene rect) so device-space
+        # labels near the image edges are never clipped by item culling.
+        return QRectF(-self._w, -self._h, 3 * self._w, 3 * self._h)
+
+    # -- setters (each repaints) --------------------------------------------
+    def set_line_width(self, px: int) -> None:
+        self._line_width = max(1, int(px))
+        self.update()
+
+    def set_calibration(self, scale: float | None, unit: str) -> None:
+        self._scale = scale
+        self._unit = unit or ""
+        self.update()
+
+    def set_pending(self, p1: QPointF | None, p2: QPointF | None, kind: str) -> None:
+        self._pending = (p1, p2, kind) if (p1 is not None and p2 is not None) else None
+        self.update()
+
+    def set_measure(self, p1: QPointF | None, p2: QPointF | None) -> None:
+        self._measure = (p1, p2) if (p1 is not None and p2 is not None) else None
+        self.update()
+
+    def set_calibration_line(self, p1: QPointF | None, p2: QPointF | None) -> None:
+        self._calib = (p1, p2) if (p1 is not None and p2 is not None) else None
+        self.update()
+
+    def clear_all(self) -> None:
+        self._pending = self._measure = self._calib = None
+        self.update()
+
+    # -- painting -----------------------------------------------------------
+    def _label(self, p1: QPointF, p2: QPointF, kind: str) -> str:
+        dx, dy = abs(p2.x() - p1.x()), abs(p2.y() - p1.y())
+        # Calibration is defined on the longer axis; the ruler uses true distance.
+        span = max(dx, dy) if kind == "calibrate" else math.hypot(dx, dy)
+        if self._scale:
+            return f"{self._scale * span:.4g} {self._unit}".rstrip()
+        return f"{span:.0f} px"
+
+    def _draw_segment(self, painter, p1, p2, color, label) -> None:
+        pen = QPen(color)
+        pen.setCosmetic(True)
+        pen.setWidth(self._line_width)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawLine(QLineF(p1, p2))
+        # Endpoint dots: a fatter cosmetic point => constant on-screen diameter.
+        dot = QPen(color)
+        dot.setCosmetic(True)
+        dot.setWidth(self._line_width + 5)
+        dot.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(dot)
+        painter.drawPoints([p1, p2])
+        if label:
+            self._draw_label(painter, QLineF(p1, p2).pointAt(0.5), label, color)
+
+    def _draw_label(self, painter, scene_pt: QPointF, text: str, color: QColor) -> None:
+        # Map the midpoint to device px, then draw text/background unscaled.
+        dev = painter.worldTransform().map(scene_pt)
+        painter.save()
+        painter.resetTransform()
+        fm = painter.fontMetrics()
+        box = fm.boundingRect(text).adjusted(-5, -3, 5, 3)
+        box.moveTo(int(dev.x()) + 10, int(dev.y()) - box.height() // 2)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 170))
+        painter.drawRect(box)
+        painter.setPen(color)
+        painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+        painter.restore()
+
+    def paint(self, painter, option: QStyleOptionGraphicsItem, widget: QWidget | None = None) -> None:
+        if self._calib is not None:
+            p1, p2 = self._calib
+            self._draw_segment(painter, p1, p2, _CALIB_COLOR, self._label(p1, p2, "calibrate"))
+        if self._measure is not None:
+            p1, p2 = self._measure
+            self._draw_segment(painter, p1, p2, _MEASURE_COLOR, self._label(p1, p2, "measure"))
+        if self._pending is not None:
+            p1, p2, kind = self._pending
+            color = _CALIB_COLOR if kind == "calibrate" else _MEASURE_COLOR
+            self._draw_segment(painter, p1, p2, color, self._label(p1, p2, kind))

@@ -29,12 +29,13 @@ import os
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QRect, Qt, QTimer
+from PySide6.QtCore import QPointF, QRect, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
     QFileDialog,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -44,6 +45,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .calibration import Calibration
 from .device import device_banner_text, resolve_device
 from .document import ImageDocument
 from .memory import MemoryEntry
@@ -88,6 +90,11 @@ class MainWindow(QMainWindow):
         self._params: MatchParams = MatchParams(device=device)
         # Remember the last selection so non-threshold param changes can re-run it.
         self._last_rect: QRect | None = None
+        # Physical-scale calibration (None until the user calibrates); reset per
+        # image. _tool_return_mode restores Pan/Select after a one-shot tool.
+        self._calibration: Calibration | None = None
+        self._last_cursor: tuple[int, int] | None = None
+        self._tool_return_mode = None
         # Last full result set from the engine, kept so a live threshold change can
         # refresh the orientation breakdown without re-running the engine.
         self._all_matches: list = []
@@ -163,6 +170,7 @@ class MainWindow(QMainWindow):
 
         # --- Status bar ----------------------------------------------------
         self._cursor_label = QLabel("(-, -)", self)
+        self._area_label = QLabel("", self)        # physical area of the selection
         self._count_label = QLabel("0 matches", self)
         self._progress = QProgressBar(self)
         self._progress.setRange(0, 100)
@@ -170,6 +178,7 @@ class MainWindow(QMainWindow):
         self._progress.setVisible(False)
         sb = self.statusBar()
         sb.addPermanentWidget(self._cursor_label)
+        sb.addPermanentWidget(self._area_label)
         sb.addPermanentWidget(self._count_label)
         sb.addPermanentWidget(self._progress)
 
@@ -230,6 +239,23 @@ class MainWindow(QMainWindow):
         )
         self._act_add_memory.triggered.connect(self._on_add_to_memory)
         tb.addAction(self._act_add_memory)
+
+        tb.addSeparator()
+
+        # Measurement tools (also listed under the Tools menu).
+        self._act_calibrate = QAction("Calibrate", self)
+        self._act_calibrate.setToolTip(
+            "Drag a line of known physical length, then enter that length to set the "
+            "pixel↔physical scale (uses the longer of the horizontal/vertical span; "
+            "the first point becomes the physical origin)."
+        )
+        self._act_calibrate.triggered.connect(self._on_calibrate_tool)
+        tb.addAction(self._act_calibrate)
+
+        self._act_measure = QAction("Measure", self)
+        self._act_measure.setToolTip("Drag a line on the image to measure its physical distance.")
+        self._act_measure.triggered.connect(self._on_measure_tool)
+        tb.addAction(self._act_measure)
 
         tb.addSeparator()
 
@@ -301,8 +327,26 @@ class MainWindow(QMainWindow):
         self._act_box_xor.toggled.connect(self._viewport.set_box_xor)
         boxes_menu.addAction(self._act_box_xor)
 
+        self._build_tools_menu()
         self._build_theme_menu()
         self._build_engine_menu()
+
+    def _build_tools_menu(self) -> None:
+        """&Tools menu — physical-scale calibration and the measuring ruler.
+
+        Reuses the Calibrate / Measure actions created on the toolbar.
+        """
+        tools_menu = self._tools_menu = self.menuBar().addMenu("&Tools")
+        tools_menu.addAction(self._act_calibrate)
+        tools_menu.addAction(self._act_measure)
+
+        tools_menu.addSeparator()
+        self._act_clear_measure = QAction("Clear measurement", self)
+        self._act_clear_measure.triggered.connect(self._on_clear_measurement)
+        tools_menu.addAction(self._act_clear_measure)
+        self._act_clear_calib = QAction("Clear calibration", self)
+        self._act_clear_calib.triggered.connect(self._on_clear_calibration)
+        tools_menu.addAction(self._act_clear_calib)
 
     def _build_theme_menu(self) -> None:
         """&Theme menu — switch the application look (System / Light / Dark).
@@ -416,6 +460,9 @@ class MainWindow(QMainWindow):
         self._viewport.regionSelected.connect(self._on_region_selected)
         # Live cursor readout.
         self._viewport.cursorImagePos.connect(self._on_cursor_pos)
+        # Measurement tools: two-point picks for calibration and the ruler.
+        self._viewport.calibrationPicked.connect(self._on_calibration_picked)
+        self._viewport.measurePicked.connect(self._on_measure_picked)
 
         # Controller results / state. With no image at startup there is no
         # controller yet; _install_new_controller wires these when one is opened.
@@ -469,6 +516,8 @@ class MainWindow(QMainWindow):
         self._viewport.clear_image()
         self._last_rect = None
         self._all_matches = []
+        self._calibration = None  # calibration is image-specific
+        self._area_label.setText("")
         self._params_panel.set_run_enabled(False)
         self._params_panel.set_match_count(0)
         self._memory.set_source("", (0, 0))
@@ -530,6 +579,8 @@ class MainWindow(QMainWindow):
         self._doc = doc
         self._last_rect = None
         self._all_matches = []
+        self._calibration = None  # calibration is per-image; drop it on swap
+        self._area_label.setText("")
         self._params_panel.set_run_enabled(False)  # new image -> no selection yet
         self._viewport.clear_matches()
         self._viewport.clear_template()
@@ -666,10 +717,132 @@ class MainWindow(QMainWindow):
         """Record a freshly drawn selection; search now only if Auto Run is on."""
         self._last_rect = QRect(rect)  # copy: caller may reuse/mutate its QRect
         self._params_panel.set_run_enabled(True)  # there is now something to Run
+        self._update_area_label()
         if self._auto_run:
             self._controller.request(rect, self._params)
         else:
             self.statusBar().showMessage("Selection set — press Run to search.", 4000)
+
+    # ------------------------------------------------- calibration / measure
+    def _enter_tool(self, mode) -> None:
+        """Enter a one-shot measurement tool, remembering the mode to restore."""
+        if self._doc is None:
+            self.statusBar().showMessage("Open an image first.", 4000)
+            return
+        from .viewport import ImageViewport
+
+        self._tool_return_mode = (
+            ImageViewport.Mode.PAN if self._act_mode.isChecked() else ImageViewport.Mode.SELECT
+        )
+        self._viewport.set_mode(mode)
+
+    def _exit_tool(self) -> None:
+        """Restore the Pan/Select mode after a one-shot tool completes."""
+        from .viewport import ImageViewport
+
+        self._viewport.set_mode(self._tool_return_mode or ImageViewport.Mode.SELECT)
+
+    def _on_calibrate_tool(self) -> None:
+        from .viewport import ImageViewport
+
+        self._enter_tool(ImageViewport.Mode.CALIBRATE)
+        if self._doc is not None:
+            self.statusBar().showMessage(
+                "Calibrate: drag a line along a span of known physical length.", 6000
+            )
+
+    def _on_measure_tool(self) -> None:
+        from .viewport import ImageViewport
+
+        self._enter_tool(ImageViewport.Mode.MEASURE)
+        if self._doc is not None:
+            self.statusBar().showMessage("Measure: drag a line to measure its distance.", 6000)
+
+    def _on_calibration_picked(self, p1: QPointF, p2: QPointF) -> None:
+        """Two points picked: ask for the physical length and set the scale."""
+        self._exit_tool()
+        ref_px = Calibration.reference_span((p1.x(), p1.y()), (p2.x(), p2.y()))
+        if ref_px < 1.0:
+            self.statusBar().showMessage("Calibration span too short — try a longer drag.", 5000)
+            self._viewport.clear_calibration()
+            return
+        default = self._calibration.unit if self._calibration is not None else "mm"
+        text, ok = QInputDialog.getText(
+            self,
+            "Calibrate scale",
+            f"The longer span is {ref_px:.1f} px.\n"
+            "Enter its physical length (e.g. '5.36 mm'):",
+            text=f"1 {default}",
+        )
+        if not ok or not text.strip():
+            return
+        length, unit = self._parse_length(text, default)
+        if length is None or length <= 0:
+            self.statusBar().showMessage("Could not read a positive length from that input.", 5000)
+            return
+        try:
+            cal = Calibration.from_two_points((p1.x(), p1.y()), (p2.x(), p2.y()), length, unit)
+        except ValueError:
+            self.statusBar().showMessage("Degenerate calibration; please try again.", 5000)
+            return
+        self._set_calibration(cal)
+        self.statusBar().showMessage(
+            f"Calibrated: {length:g} {unit} over {ref_px:.1f} px "
+            f"→ {cal.scale:.4g} {unit}/px.",
+            8000,
+        )
+
+    def _on_measure_picked(self, p1: QPointF, p2: QPointF) -> None:
+        """Two points picked: report the distance (physical if calibrated)."""
+        self._exit_tool()
+        import math
+
+        px = math.hypot(p2.x() - p1.x(), p2.y() - p1.y())
+        if self._calibration is not None:
+            phys = self._calibration.format_length(px)
+            self.statusBar().showMessage(f"Distance: {phys}  ({px:.1f} px)", 0)
+        else:
+            self.statusBar().showMessage(
+                f"Distance: {px:.1f} px  (calibrate to show physical units)", 0
+            )
+
+    @staticmethod
+    def _parse_length(text: str, fallback_unit: str) -> tuple[float | None, str]:
+        """Parse '<number> [unit]' -> (value, unit); unit falls back if omitted."""
+        import re
+
+        m = re.match(r"\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)\s*(.*)$", text.strip())
+        if not m:
+            return None, fallback_unit
+        value = float(m.group(1))
+        unit = m.group(2).strip() or fallback_unit
+        return value, unit
+
+    def _set_calibration(self, cal: Calibration | None) -> None:
+        """Store the calibration and refresh everything that depends on it."""
+        self._calibration = cal
+        self._viewport.set_calibration(cal.scale if cal else None, cal.unit if cal else "")
+        self._update_area_label()
+        if self._last_cursor is not None:  # refresh the physical-coord readout
+            self._on_cursor_pos(*self._last_cursor)
+
+    def _update_area_label(self) -> None:
+        """Show the physical area of the current selection (blank if not calibrated)."""
+        if self._calibration is not None and self._last_rect is not None:
+            self._area_label.setText(
+                "area " + self._calibration.format_area(self._last_rect.width(), self._last_rect.height())
+            )
+        else:
+            self._area_label.setText("")
+
+    def _on_clear_measurement(self) -> None:
+        self._viewport.clear_measurement()
+        self.statusBar().showMessage("Measurement cleared.", 3000)
+
+    def _on_clear_calibration(self) -> None:
+        self._set_calibration(None)
+        self._viewport.clear_calibration()
+        self.statusBar().showMessage("Calibration cleared.", 3000)
 
     def _on_run(self) -> None:
         """Run the search on the current selection (the Run button / manual)."""
@@ -685,11 +858,19 @@ class MainWindow(QMainWindow):
             self._controller.request(self._last_rect, self._params)
 
     def _on_cursor_pos(self, x: int, y: int) -> None:
-        """Update the status-bar cursor readout (-1,-1 == outside image)."""
-        if x < 0 or y < 0:
+        """Update the status-bar cursor readout (-1,-1 == outside image).
+
+        Shows pixel coords always, plus physical coordinates (relative to the
+        calibration origin) once calibrated.
+        """
+        self._last_cursor = None if (x < 0 or y < 0) else (x, y)
+        if self._last_cursor is None:
             self._cursor_label.setText("(-, -)")
-        else:
-            self._cursor_label.setText(f"({x}, {y})")
+            return
+        text = f"({x}, {y}) px"
+        if self._calibration is not None:
+            text += "   " + self._calibration.format_point(x, y)
+        self._cursor_label.setText(text)
 
     # ------------------------------------------------------- controller events
     def _on_matches_ready(self, matches: object) -> None:
