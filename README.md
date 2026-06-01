@@ -27,7 +27,19 @@ desktop-only (it needs OpenCV, unavailable under Pyodide).
 
 The browser engine (`docs/fastmatch_web.py`) is pure NumPy, so it runs in
 CPython too and is unit-tested (`tests/test_web_engine.py`), including a recall
-**parity check against the desktop torch engine**.
+**parity check against the desktop torch engine** and a check that the parallel
+worker decomposition reproduces the single-call `match()`.
+
+**Multi-core + responsive:** the search runs in a **pool of Web Workers** (one
+Pyodide per core — `docs/worker.js`), not on the UI thread. The work is split
+into independent *(orientation × scale)* tasks dispatched across the pool, and
+the page merges the candidates (greedy NMS / source-exclusion / top-K). Because
+the UI thread stays free, a **spinner** animates during a search and it is
+**interruptible** — drawing a new box, changing a parameter, **Cancel**, or
+`Esc` supersedes the in-flight search immediately (a monotonic generation token
+discards stale worker results). Multi-core uses a worker pool rather than
+Pyodide's pthreads because `SharedArrayBuffer` needs COOP/COEP headers that
+GitHub Pages can't send.
 
 **Try it locally:**
 
@@ -36,8 +48,9 @@ python -m http.server -d docs 8000   # then open http://localhost:8000
 ```
 
 Open an image (or **Load sample**), drag a box around a pattern, and it finds
-every similar region. Everything is client-side; large images (more than a few
-thousand px per side) are slow in the browser — the WASM engine is single-threaded.
+every similar region. Everything is client-side; it scales across CPU cores, but
+very large images (more than a few thousand px per side) are still heavier in
+WASM than on the native desktop engine.
 
 **Deploy on GitHub Pages:** the repo ships a workflow
 (`.github/workflows/pages.yml`) that publishes `docs/` via the official Pages

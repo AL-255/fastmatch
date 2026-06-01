@@ -217,8 +217,99 @@ def _iou_xywh(a, b) -> float:
 
 
 # --------------------------------------------------------------------------- #
-# Public entry point.
+# Public entry points.
+#
+# The work decomposes into independent (orientation x scale) TASKS. The browser
+# runs each task in its own Web Worker (one Pyodide per core) and merges the
+# candidates with :func:`finalize`; ``match`` is the single-call equivalent used
+# by CPython tests and as the reference. All three share the same per-task code,
+# so the parallel and serial paths produce identical candidates.
 # --------------------------------------------------------------------------- #
+def prepare_planes(image, channel_mode: str = "luminance") -> list[np.ndarray]:
+    """Image -> the float32 plane(s) the score maps run on (cache once per image)."""
+    arr = np.asarray(image)
+    if channel_mode == "rgb" and arr.ndim == 3 and arr.shape[2] >= 3:
+        return [np.ascontiguousarray(arr[..., c].astype(np.float32) / 255.0) for c in range(3)]
+    return [_to_gray(arr)]
+
+
+def candidates_for(
+    planes: list[np.ndarray],
+    sel,
+    method: str,
+    threshold: float,
+    scale: float,
+    orient: str,
+    cap: int,
+) -> list[dict]:
+    """Candidate boxes for ONE (scale, orientation) — the parallelizable unit.
+
+    Returns ``{x,y,w,h,score,scale,orientation}`` for every above-threshold
+    position (capped at ``cap`` strongest), pre-NMS. :func:`finalize` dedupes
+    the pooled candidates from all tasks.
+    """
+    method = method if method in CONV_METHODS else "ncc"
+    sx, sy, sw, sh = (int(v) for v in sel)
+    H, W = planes[0].shape
+    sx2, sy2 = min(W, sx + sw), min(H, sy + sh)
+    tmpls0 = [p[sy:sy2, sx:sx2] for p in planes]
+    if tmpls0[0].shape[0] < 2 or tmpls0[0].shape[1] < 2:
+        return []
+    tmpls_o = [apply_orientation(t, orient) for t in tmpls0]
+    oth, otw = tmpls_o[0].shape
+    th, tw = max(2, round(oth * scale)), max(2, round(otw * scale))
+    if th > H or tw > W:
+        return []
+    tmpls_s = [_resize2d(t, th, tw) for t in tmpls_o] if (th, tw) != (oth, otw) else tmpls_o
+
+    smap = None
+    for img_p, tmpl_p in zip(planes, tmpls_s):
+        m = _score_map(img_p, tmpl_p, method)
+        smap = m if smap is None else smap + m
+    smap = np.nan_to_num((smap / len(planes)).astype(np.float32), nan=-1.0, posinf=-1.0, neginf=-1.0)
+
+    ys, xs = np.nonzero(smap >= threshold)
+    if ys.size == 0:
+        return []
+    sc = smap[ys, xs]
+    if sc.size > cap:  # keep only the strongest when a low threshold floods
+        top = np.argpartition(sc, -cap)[-cap:]
+        ys, xs, sc = ys[top], xs[top], sc[top]
+    so = float(scale)
+    return [
+        {"x": int(x), "y": int(y), "w": int(tw), "h": int(th),
+         "score": float(v), "scale": so, "orientation": orient}
+        for x, y, v in zip(xs.tolist(), ys.tolist(), sc.tolist())
+    ]
+
+
+def finalize(cands, sel, nms_iou=0.3, exclude_iou=0.3, max_results=200) -> list[dict]:
+    """Pool of candidates -> final matches: global greedy NMS, source exclusion, top-K."""
+    if not cands:
+        return []
+    boxes = np.array([[c["x"], c["y"], c["x"] + c["w"], c["y"] + c["h"]] for c in cands], np.float32)
+    scores = np.array([c["score"] for c in cands], np.float32)
+    keep = _greedy_nms(boxes, scores, float(nms_iou))
+    sx, sy, sw, sh = (int(v) for v in sel)
+    out = []
+    for i in keep:
+        c = cands[i]
+        cx, cy = c["x"] + c["w"] / 2.0, c["y"] + c["h"] / 2.0
+        if (sx <= cx < sx + sw and sy <= cy < sy + sh) or \
+                _iou_xywh((c["x"], c["y"], c["w"], c["h"]), (sx, sy, sw, sh)) > float(exclude_iou):
+            continue
+        out.append(c)
+        if len(out) >= max_results:
+            break
+    return out
+
+
+def tasks_for(enable_rotation: bool, enable_flipping: bool, scales) -> list[tuple[str, float]]:
+    """The (orientation, scale) task list the browser distributes across workers."""
+    scales = tuple(float(s) for s in scales) or (1.0,)
+    return [(o, s) for o in active_orientations(bool(enable_rotation), bool(enable_flipping)) for s in scales]
+
+
 def match(
     image,
     sel_x: int,
@@ -236,106 +327,17 @@ def match(
     nms_iou: float = 0.3,
     exclude_iou: float = 0.3,
 ):
-    """Find instances of the selected region in ``image``.
+    """Single-call match (reference / CPython path): all tasks then :func:`finalize`.
 
-    Args:
-        image: ``(H,W,3|4)`` uint8 RGB(A) or ``(H,W)`` array (e.g. canvas pixels).
-        sel_x/sel_y/sel_w/sel_h: the source selection rectangle (image px).
-        method: ``"ncc"`` | ``"ssd"`` | ``"ccorr"``.
-        channel_mode: ``"luminance"`` (default) or ``"rgb"`` (rgb averages the
-            three per-channel score maps — a light approximation of the desktop's
-            summed-numerator path, enough for the browser demo).
-        threshold: keep matches with score >= this (in [0,1]).
-        scales: template scale grid (e.g. ``(0.9, 1.0, 1.1)``).
-        enable_rotation/enable_flipping: dihedral-orientation search.
-        max_results, nms_iou, exclude_iou: as the desktop engine.
-
-    Returns:
-        ``list[dict]`` ``{x,y,w,h,score,scale,orientation}`` in image px, sorted
-        by score desc, source region excluded, capped at ``max_results``.
+    Returns ``list[dict]`` ``{x,y,w,h,score,scale,orientation}`` in image px,
+    sorted by score desc, source region excluded, capped at ``max_results``.
     """
-    method = method if method in CONV_METHODS else "ncc"
-    arr = np.asarray(image)
-    H, W = arr.shape[:2]
-    sel_x, sel_y = int(sel_x), int(sel_y)
-    sel_w, sel_h = int(sel_w), int(sel_h)
+    sel_x, sel_y, sel_w, sel_h = int(sel_x), int(sel_y), int(sel_w), int(sel_h)
     if sel_w < 2 or sel_h < 2 or sel_x < 0 or sel_y < 0:
         return []
-    sel_x2, sel_y2 = min(W, sel_x + sel_w), min(H, sel_y + sel_h)
-
-    use_rgb = channel_mode == "rgb" and arr.ndim == 3 and arr.shape[2] >= 3
-    if use_rgb:
-        planes = [np.ascontiguousarray(arr[..., c].astype(np.float32) / 255.0) for c in range(3)]
-    else:
-        planes = [_to_gray(arr)]
-
-    tmpls0 = [p[sel_y:sel_y2, sel_x:sel_x2] for p in planes]
-    base_h, base_w = tmpls0[0].shape
-    if base_h < 2 or base_w < 2:
-        return []
-
-    orients = active_orientations(bool(enable_rotation), bool(enable_flipping))
-    scales = tuple(float(s) for s in scales) or (1.0,)
-    cap_pre = max(4 * max_results, 4000)  # bound candidates fed to NMS
-
-    boxes_all: list[tuple[float, float, float, float]] = []
-    score_all: list[float] = []
-    scale_all: list[float] = []
-    orient_all: list[str] = []
-
-    for orient in orients:
-        tmpls_o = [apply_orientation(t, orient) for t in tmpls0]
-        oth, otw = tmpls_o[0].shape
-        for s in scales:
-            sh, sw = max(2, round(oth * s)), max(2, round(otw * s))
-            if sh > H or sw > W:
-                continue
-            tmpls_s = [_resize2d(t, sh, sw) for t in tmpls_o] if (sh, sw) != (oth, otw) else tmpls_o
-            smap = None
-            for img_p, tmpl_p in zip(planes, tmpls_s):
-                m = _score_map(img_p, tmpl_p, method)
-                smap = m if smap is None else smap + m
-            smap = (smap / len(planes)).astype(np.float32)
-            smap = np.nan_to_num(smap, nan=-1.0, posinf=-1.0, neginf=-1.0)
-
-            ys, xs = np.nonzero(smap >= threshold)
-            if ys.size == 0:
-                continue
-            sc = smap[ys, xs]
-            if sc.size > cap_pre:  # keep the strongest candidates only
-                top = np.argpartition(sc, -cap_pre)[-cap_pre:]
-                ys, xs, sc = ys[top], xs[top], sc[top]
-            for x, y, v in zip(xs.tolist(), ys.tolist(), sc.tolist()):
-                boxes_all.append((x, y, x + sw, y + sh))
-                score_all.append(float(v))
-                scale_all.append(float(s))
-                orient_all.append(orient)
-
-    if not boxes_all:
-        return []
-
-    boxes = np.asarray(boxes_all, dtype=np.float32)
-    scores = np.asarray(score_all, dtype=np.float32)
-    keep = _greedy_nms(boxes, scores, float(nms_iou))
-
-    src = (sel_x, sel_y, sel_w, sel_h)
-    results = []
-    for i in keep:
-        bx, by, bx2, by2 = boxes[i]
-        w, h = int(round(bx2 - bx)), int(round(by2 - by))
-        cand = (int(round(bx)), int(round(by)), w, h)
-        cx, cy = cand[0] + w / 2.0, cand[1] + h / 2.0
-        in_src = sel_x <= cx < sel_x + sel_w and sel_y <= cy < sel_y + sel_h
-        if in_src or _iou_xywh(cand, src) > float(exclude_iou):
-            continue
-        results.append(
-            {
-                "x": cand[0], "y": cand[1], "w": w, "h": h,
-                "score": float(scores[i]),
-                "scale": scale_all[i],
-                "orientation": orient_all[i],
-            }
-        )
-        if len(results) >= max_results:
-            break
-    return results
+    planes = prepare_planes(image, channel_mode)
+    cap = max(4 * int(max_results), 4000)
+    cands = []
+    for orient, s in tasks_for(enable_rotation, enable_flipping, scales):
+        cands += candidates_for(planes, (sel_x, sel_y, sel_w, sel_h), method, threshold, s, orient, cap)
+    return finalize(cands, (sel_x, sel_y, sel_w, sel_h), nms_iou, exclude_iou, max_results)

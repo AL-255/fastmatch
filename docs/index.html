@@ -23,7 +23,12 @@
     <section id="stage">
       <canvas id="view" tabindex="0"></canvas>
       <div id="hint" class="overlay-hint">
-        Loading the Python engine… first load fetches Pyodide + NumPy (~10&nbsp;MB).
+        Loading the Python engines… first load fetches Pyodide + NumPy (~10&nbsp;MB).
+      </div>
+      <div id="spinner" class="spinner hidden">
+        <div class="ring"></div>
+        <div id="spinLabel" class="spin-label">matching…</div>
+        <button id="cancelBtn" class="btn">Cancel (Esc)</button>
       </div>
       <div id="readout" class="readout"></div>
     </section>
@@ -66,7 +71,7 @@
 
       <div class="group counts">
         <div><strong id="matchCount">0</strong> matches</div>
-        <div class="muted" id="imgInfo">no image</div>
+        <div class="muted"><span id="imgInfo">no image</span> · <span id="poolInfo">…</span></div>
       </div>
 
       <details class="group help">

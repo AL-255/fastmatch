@@ -2,30 +2,39 @@
 /*
  * FastMatch — browser edition front-end.
  *
- * Boots Pyodide + NumPy, loads the pure-NumPy engine (fastmatch_web.py), and
- * wires an HTML5-canvas viewport (pan / zoom-to-cursor / draw selection) to it.
- * Everything runs client-side; no server, so it hosts as static files on
- * GitHub Pages. See README for the matching algorithm (it mirrors the desktop
- * app's full-resolution NCC/SSD/CCORR path).
+ * The matching runs in a POOL of Web Workers (one Pyodide + NumPy per core) so
+ * it uses multiple cores AND stays off the UI thread — that is what makes the
+ * spinner animate and lets a search be interrupted. The work is split into
+ * (orientation x scale) tasks dispatched across the pool; the page pools the
+ * candidates and runs the final greedy NMS / source-exclusion / top-K here.
+ * A monotonic "generation" token cancels an in-flight search the instant a new
+ * selection is drawn or a parameter changes.
  */
 
 const $ = (id) => document.getElementById(id);
 const canvas = $("view");
 const ctx = canvas.getContext("2d");
 
+const POOL_SIZE = Math.max(1, Math.min((navigator.hardwareConcurrency || 4), 6));
+const ORIENTATION_ORDER = ["R0", "R90", "R180", "R270", "MX", "MY", "MXR90", "MYR90"];
+
 const state = {
-  pyodide: null,
-  ready: false,
-  busy: false,
-  bitmap: null,        // ImageBitmap for fast rendering
+  poolReady: false,
+  imageReady: false,
+  bitmap: null,
+  rgbaBuf: null,        // ArrayBuffer of RGBA pixels (cloned to each worker)
   imgW: 0,
   imgH: 0,
   view: { scale: 1, ox: 0, oy: 0 },
-  mode: "select",       // "select" | "pan"
-  selection: null,      // {x,y,w,h} in image px
+  mode: "select",
+  selection: null,
   matches: [],
-  dragging: null,       // {kind, ...}
+  dragging: null,
 };
+
+const workers = [];     // {worker, ready, busy, readyResolve, imgResolve}
+let currentGen = 0;     // bumping this cancels any in-flight search
+let genState = null;    // {gen, tasks, params, next, pending, collected, resolve}
 
 // ----------------------------------------------------------------- rendering
 function dpr() { return window.devicePixelRatio || 1; }
@@ -41,10 +50,7 @@ function resizeCanvas() {
 function screenToImage(clientX, clientY) {
   const r = canvas.getBoundingClientRect();
   const v = state.view;
-  return {
-    x: (clientX - r.left - v.ox) / v.scale,
-    y: (clientY - r.top - v.oy) / v.scale,
-  };
+  return { x: (clientX - r.left - v.ox) / v.scale, y: (clientY - r.top - v.oy) / v.scale };
 }
 
 function fitView() {
@@ -64,19 +70,15 @@ function render() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   if (!state.bitmap) return;
 
-  // image -> backing-store px (folds in devicePixelRatio).
   ctx.setTransform(d * v.scale, 0, 0, d * v.scale, d * v.ox, d * v.oy);
   ctx.imageSmoothingEnabled = v.scale < 3;
   ctx.drawImage(state.bitmap, 0, 0);
 
-  const lw = 1.5 / v.scale; // constant ~1.5 CSS px outline regardless of zoom
-
-  // matches: green
+  const lw = 1.5 / v.scale;
   ctx.lineWidth = lw;
   ctx.strokeStyle = "rgba(40,220,70,0.95)";
   for (const m of state.matches) ctx.strokeRect(m.x, m.y, m.w, m.h);
 
-  // selection (source): cyan
   if (state.selection) {
     const s = state.selection;
     ctx.lineWidth = lw * 1.4;
@@ -85,7 +87,7 @@ function render() {
   }
 }
 
-// ---------------------------------------------------------------- readout/UI
+// ---------------------------------------------------------------- UI helpers
 function setHint(text) {
   const h = $("hint");
   if (text === null) { h.classList.add("hidden"); return; }
@@ -93,93 +95,213 @@ function setHint(text) {
   h.innerHTML = text;
 }
 function setReadout(text) { $("readout").textContent = text || ""; }
-function setBusy(b) {
-  state.busy = b;
-  $("topbar").classList.toggle("busy", b);
-  updateRunEnabled();
+function showSpinner(on, label) {
+  $("spinner").classList.toggle("hidden", !on);
+  if (label) $("spinLabel").textContent = label;
 }
 function updateRunEnabled() {
-  $("runBtn").disabled = !(state.ready && state.bitmap && state.selection && !state.busy);
+  $("runBtn").disabled = !(state.poolReady && state.imageReady && state.selection);
 }
+
+// --------------------------------------------------------------- worker pool
+function handleWorkerMessage(wk, msg) {
+  if (msg.type === "ready") { wk.readyResolve && wk.readyResolve(); }
+  else if (msg.type === "imageAck") { wk.imgResolve && wk.imgResolve(); }
+  else if (msg.type === "taskDone") {
+    if (msg.error) console.warn("[worker task error]", msg.error);
+    onTaskDone(wk, msg);
+  }
+}
+
+async function bootPool() {
+  setHint(`Loading ${POOL_SIZE} Python engine${POOL_SIZE > 1 ? "s" : ""}… ` +
+          `first load fetches Pyodide + NumPy (~10&nbsp;MB, cached after).`);
+  const readies = [];
+  for (let i = 0; i < POOL_SIZE; i++) {
+    const worker = new Worker("worker.js");
+    const wk = { worker, ready: false, busy: false, readyResolve: null, imgResolve: null };
+    workers.push(wk);
+    worker.onmessage = (e) => handleWorkerMessage(wk, e.data);
+    worker.onerror = (e) => { console.error("worker error", e.message || e); };
+    readies.push(new Promise((res) => { wk.readyResolve = res; }));
+    worker.postMessage({ type: "init" });
+  }
+  await Promise.all(readies);
+  workers.forEach((wk) => { wk.ready = true; });
+  state.poolReady = true;
+}
+
+async function setImageOnWorkers() {
+  if (!state.poolReady || !state.rgbaBuf) return;
+  state.imageReady = false;
+  const acks = workers.map((wk) => new Promise((res) => { wk.imgResolve = res; }));
+  for (const wk of workers) {
+    // Clone the buffer per worker (no transfer) so each holds its own copy.
+    wk.worker.postMessage({ type: "image", buf: state.rgbaBuf.slice(0), w: state.imgW, h: state.imgH });
+  }
+  await Promise.all(acks);
+  state.imageReady = true;
+}
+
+// ------------------------------------------------------ dispatch / cancel
+function startMatch(tasks, params) {
+  const gen = ++currentGen;
+  if (genState) { const old = genState; genState = null; old.resolve(old.collected); } // supersede
+  return new Promise((resolve) => {
+    genState = { gen, tasks, params, next: 0, pending: 0, collected: [], resolve };
+    pump();
+  });
+}
+
+function pump() {
+  const gs = genState;
+  if (!gs) return;
+  for (const wk of workers) {
+    if (!wk.ready || wk.busy) continue;
+    if (gs.next >= gs.tasks.length) break;
+    const [orient, scale] = gs.tasks[gs.next++];
+    wk.busy = true;
+    gs.pending++;
+    const s = gs.params.sel;
+    wk.worker.postMessage({
+      type: "task",
+      gen: gs.gen,
+      params: {
+        x: s.x, y: s.y, w: s.w, h: s.h,
+        method: gs.params.method, channel: gs.params.channel,
+        threshold: gs.params.threshold, scale, orient, cap: gs.params.cap,
+      },
+    });
+  }
+  if (gs.next >= gs.tasks.length && gs.pending === 0) {
+    const resolve = gs.resolve, collected = gs.collected;
+    genState = null;
+    resolve(collected);
+  }
+}
+
+function onTaskDone(wk, msg) {
+  wk.busy = false;
+  const gs = genState;
+  if (gs && msg.gen === gs.gen) {
+    if (msg.candidates && msg.candidates.length) gs.collected.push(...msg.candidates);
+    gs.pending--;
+  }
+  pump(); // dispatch the next queued task to this now-idle worker (any generation)
+}
+
+function cancelMatch() {
+  const had = !!genState;
+  currentGen++;                 // in-flight worker results become stale
+  if (genState) { const r = genState.resolve, c = genState.collected; genState = null; r(c); }
+  showSpinner(false);
+  if (had) setReadout("cancelled");
+}
+
+// ------------------------------------------------------------- finalize (JS)
+function iouBox(a, b) {
+  const ix = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x));
+  const iy = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+  const inter = ix * iy, uni = a.w * a.h + b.w * b.h - inter;
+  return uni > 0 ? inter / uni : 0;
+}
+
+function finalize(cands, sel, nmsIou, excludeIou, maxResults) {
+  if (!cands.length) return [];
+  const order = cands.map((_, i) => i).sort((a, b) => cands[b].score - cands[a].score);
+  const kept = [];
+  for (const i of order) {
+    const c = cands[i];
+    let suppressed = false;
+    for (const k of kept) { if (iouBox(c, cands[k]) > nmsIou) { suppressed = true; break; } }
+    if (!suppressed) kept.push(i);
+  }
+  const out = [];
+  for (const i of kept) {
+    const c = cands[i], cx = c.x + c.w / 2, cy = c.y + c.h / 2;
+    const inSrc = sel.x <= cx && cx < sel.x + sel.w && sel.y <= cy && cy < sel.y + sel.h;
+    if (inSrc || iouBox(c, sel) > excludeIou) continue;
+    out.push(c);
+    if (out.length >= maxResults) break;
+  }
+  return out;
+}
+
+// --------------------------------------------------------------- the search
+function activeOrientations(rot, flip) {
+  const a = new Set(["R0"]);
+  if (rot) { a.add("R90"); a.add("R180"); a.add("R270"); }
+  if (flip) { a.add("MX"); a.add("MY"); }
+  if (rot && flip) { a.add("MXR90"); a.add("MYR90"); }
+  return ORIENTATION_ORDER.filter((o) => a.has(o));
+}
+
+function gatherParams() {
+  const s = state.selection;
+  const maxResults = parseInt($("maxResults").value, 10);
+  const scales = $("multiscale").checked ? [0.8, 0.9, 1.0, 1.1, 1.25] : [1.0];
+  const orients = activeOrientations($("rotation").checked, $("flipping").checked);
+  return {
+    sel: { x: Math.round(s.x), y: Math.round(s.y), w: Math.round(s.w), h: Math.round(s.h) },
+    method: $("method").value,
+    channel: $("channel").value,
+    threshold: parseFloat($("threshold").value),
+    maxResults,
+    cap: Math.max(2 * maxResults, 1500),
+    nms_iou: 0.3,
+    exclude_iou: 0.3,
+    scales,
+    tasks: orients.flatMap((o) => scales.map((sc) => [o, sc])),
+  };
+}
+
+async function runMatch() {
+  if (!(state.poolReady && state.imageReady && state.selection)) return;
+  const params = gatherParams();
+  showSpinner(true, `matching… (${POOL_SIZE} cores)`);
+  const t0 = performance.now();
+  const gen = currentGen + 1; // the gen startMatch will assign
+  const cands = await startMatch(params.tasks, params);
+  if (gen !== currentGen) return; // superseded by a newer search; let it finish
+  const matches = finalize(cands, params.sel, params.nms_iou, params.exclude_iou, params.maxResults);
+  state.matches = matches;
+  $("matchCount").textContent = String(matches.length);
+  setReadout(`${matches.length} matches · ${Math.round(performance.now() - t0)} ms · ` +
+             `${params.tasks.length} tasks / ${POOL_SIZE} cores`);
+  render();
+  showSpinner(false);
+}
+
+function autoRun() { if ($("autorun").checked) runMatch(); }
 
 // ------------------------------------------------------------ image loading
 async function loadImageFromBlobOrURL(src) {
-  let blob;
-  if (typeof src === "string") {
-    const resp = await fetch(src);
-    if (!resp.ok) throw new Error(`could not fetch ${src}`);
-    blob = await resp.blob();
-  } else {
-    blob = src;
-  }
+  cancelMatch();   // abandon any in-flight search on the previous image
+  let blob = (typeof src === "string") ? await (await fetch(src)).blob() : src;
   const bitmap = await createImageBitmap(blob);
   state.bitmap = bitmap;
   state.imgW = bitmap.width;
   state.imgH = bitmap.height;
   state.selection = null;
   state.matches = [];
+  state.imageReady = false;
   $("matchCount").textContent = "0";
   $("imgInfo").textContent = `${bitmap.width}×${bitmap.height}px`;
 
-  // Extract RGBA pixels and hand them to the Python engine once.
   const off = document.createElement("canvas");
-  off.width = bitmap.width;
-  off.height = bitmap.height;
+  off.width = bitmap.width; off.height = bitmap.height;
   const octx = off.getContext("2d", { willReadFrequently: true });
   octx.drawImage(bitmap, 0, 0);
-  const id = octx.getImageData(0, 0, bitmap.width, bitmap.height);
-  if (state.ready) {
-    state.pyodide.globals.set("_imgbuf", new Uint8Array(id.data.buffer));
-    await state.pyodide.runPythonAsync(`fm_set_image(_imgbuf, ${bitmap.width}, ${bitmap.height})`);
-    state.pyodide.globals.delete("_imgbuf");
-  }
-  setHint(state.ready ? null : "Engine still loading…");
+  state.rgbaBuf = octx.getImageData(0, 0, bitmap.width, bitmap.height).data.buffer;
+
   fitView();
-  updateRunEnabled();
-}
-
-// --------------------------------------------------------------- parameters
-function gatherParams() {
-  const s = state.selection;
-  const multiscale = $("multiscale").checked;
-  return {
-    x: Math.round(s.x), y: Math.round(s.y),
-    w: Math.round(s.w), h: Math.round(s.h),
-    method: $("method").value,
-    channel: $("channel").value,
-    threshold: parseFloat($("threshold").value),
-    maxResults: parseInt($("maxResults").value, 10),
-    scales: multiscale ? [0.8, 0.9, 1.0, 1.1, 1.25] : [1.0],
-    rotation: $("rotation").checked,
-    flipping: $("flipping").checked,
-  };
-}
-
-async function runMatch() {
-  if (!state.ready || !state.bitmap || !state.selection || state.busy) return;
-  setBusy(true);
-  setReadout("matching…");
-  const t0 = performance.now();
-  try {
-    const params = gatherParams();
-    const fn = state.pyodide.globals.get("fm_match");
-    const json = await fn(JSON.stringify(params));
-    fn.destroy?.();
-    state.matches = JSON.parse(json);
-    $("matchCount").textContent = String(state.matches.length);
-    const ms = Math.round(performance.now() - t0);
-    setReadout(`${state.matches.length} matches · ${ms} ms`);
-    render();
-  } catch (err) {
-    console.error(err);
-    setReadout("error: " + (err && err.message ? err.message : err));
-  } finally {
-    setBusy(false);
+  if (state.poolReady) {
+    setHint(null);
+    showSpinner(true, "staging image…");
+    await setImageOnWorkers();
+    showSpinner(false);
   }
-}
-
-function autoRun() {
-  if ($("autorun").checked) runMatch();
+  updateRunEnabled();
 }
 
 // --------------------------------------------------------------- interaction
@@ -195,10 +317,8 @@ canvas.addEventListener("wheel", (e) => {
   const r = canvas.getBoundingClientRect();
   const cx = e.clientX - r.left, cy = e.clientY - r.top;
   const before = screenToImage(e.clientX, e.clientY);
-  const factor = Math.exp(-e.deltaY * 0.0015);
   const v = state.view;
-  v.scale = Math.min(64, Math.max(0.02, v.scale * factor));
-  // keep the image point under the cursor fixed (zoom-to-cursor).
+  v.scale = Math.min(64, Math.max(0.02, v.scale * Math.exp(-e.deltaY * 0.0015)));
   v.ox = cx - before.x * v.scale;
   v.oy = cy - before.y * v.scale;
   render();
@@ -241,20 +361,16 @@ canvas.addEventListener("pointermove", (e) => {
   }
 });
 
-canvas.addEventListener("pointerup", (e) => {
+canvas.addEventListener("pointerup", () => {
   const dr = state.dragging;
   state.dragging = null;
   canvas.classList.remove("panning");
-  if (!dr) return;
-  if (dr.kind === "select") {
-    if (state.selection && state.selection.w >= 4 && state.selection.h >= 4) {
-      updateRunEnabled();
-      autoRun();
-    } else {
-      state.selection = null;
-      render();
-      updateRunEnabled();
-    }
+  if (!dr || dr.kind !== "select") return;
+  if (state.selection && state.selection.w >= 4 && state.selection.h >= 4) {
+    updateRunEnabled();
+    autoRun();
+  } else {
+    state.selection = null; render(); updateRunEnabled();
   }
 });
 
@@ -262,6 +378,7 @@ window.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
   if (e.key === "m" || e.key === "M") setMode(state.mode === "pan" ? "select" : "pan");
   else if (e.key === "f" || e.key === "F") fitView();
+  else if (e.key === "Escape") cancelMatch();
 });
 
 // ------------------------------------------------------------ control wiring
@@ -273,7 +390,9 @@ $("sampleBtn").addEventListener("click", () =>
   loadImageFromBlobOrURL("sample.png").catch((err) => setReadout("sample missing: " + err.message)));
 $("modeBtn").addEventListener("click", () => setMode(state.mode === "pan" ? "select" : "pan"));
 $("runBtn").addEventListener("click", runMatch);
+$("cancelBtn").addEventListener("click", cancelMatch);
 $("clearBtn").addEventListener("click", () => {
+  cancelMatch();
   state.selection = null; state.matches = [];
   $("matchCount").textContent = "0"; setReadout(""); render(); updateRunEnabled();
 });
@@ -282,59 +401,29 @@ $("threshold").addEventListener("input", () => { $("thVal").textContent = $("thr
 $("threshold").addEventListener("change", autoRun);
 $("maxResults").addEventListener("input", () => { $("mrVal").textContent = $("maxResults").value; });
 $("maxResults").addEventListener("change", autoRun);
-for (const id of ["method", "channel"]) $(id).addEventListener("change", autoRun);
-for (const id of ["multiscale", "rotation", "flipping"]) $(id).addEventListener("change", autoRun);
+for (const id of ["method", "channel", "multiscale", "rotation", "flipping"]) {
+  $(id).addEventListener("change", autoRun);
+}
 
 new ResizeObserver(resizeCanvas).observe($("stage"));
 
-// ------------------------------------------------------------ engine bootstrap
+// ------------------------------------------------------------------- bootstrap
 async function boot() {
   try {
-    state.pyodide = await loadPyodide();
-    setHint("Loading NumPy…");
-    await state.pyodide.loadPackage("numpy");
-    setHint("Loading the matching engine…");
-    const src = await (await fetch("fastmatch_web.py")).text();
-    state.pyodide.FS.writeFile("fastmatch_web.py", src);
-    await state.pyodide.runPythonAsync(`
-import json, numpy as np
-import fastmatch_web as fw
-_IMG = None
-def fm_set_image(buf, w, h):
-    global _IMG
-    if hasattr(buf, "to_py"):
-        buf = buf.to_py()   # JsProxy(Uint8Array) -> memoryview
-    _IMG = np.frombuffer(buf, dtype=np.uint8).reshape(int(h), int(w), 4).copy()
-def fm_match(params_json):
-    if _IMG is None:
-        return "[]"
-    p = json.loads(params_json)
-    res = fw.match(
-        _IMG, p["x"], p["y"], p["w"], p["h"],
-        method=p["method"], channel_mode=p["channel"],
-        threshold=p["threshold"], scales=tuple(p["scales"]),
-        enable_rotation=p["rotation"], enable_flipping=p["flipping"],
-        max_results=p["maxResults"],
-    )
-    return json.dumps(res)
-`);
-    state.ready = true;
+    await bootPool();
+    $("poolInfo").textContent = `${POOL_SIZE} core${POOL_SIZE > 1 ? "s" : ""}`;
+    if (state.rgbaBuf) {           // image was loaded before the pool finished
+      showSpinner(true, "staging image…");
+      await setImageOnWorkers();
+      showSpinner(false);
+    }
     setHint(state.bitmap ? null :
-      "Engine ready. <b>Open an image</b> or <b>Load sample</b>, then drag a box around a pattern.");
-    // If an image was loaded before the engine finished, push its pixels now.
-    if (state.bitmap) await loadImageFromBlobOrURL(await bitmapToBlob(state.bitmap));
+      "Engines ready. <b>Open an image</b> or <b>Load sample</b>, then drag a box around a pattern.");
     updateRunEnabled();
   } catch (err) {
     console.error(err);
-    setHint("Failed to load the Python engine.<br>" + (err && err.message ? err.message : err));
+    setHint("Failed to start the Python engines.<br>" + (err && err.message ? err.message : err));
   }
-}
-
-async function bitmapToBlob(bitmap) {
-  const c = document.createElement("canvas");
-  c.width = bitmap.width; c.height = bitmap.height;
-  c.getContext("2d").drawImage(bitmap, 0, 0);
-  return await new Promise((res) => c.toBlob(res, "image/png"));
 }
 
 setMode("select");

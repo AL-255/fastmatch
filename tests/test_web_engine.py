@@ -120,6 +120,47 @@ def test_tiny_selection_returns_empty():
     assert fw.match(img, 10, 10, 1, 1) == []
 
 
+# ------------------------------------------- parallel decomposition (workers)
+def test_tasks_for_enumeration():
+    assert fw.tasks_for(False, False, (1.0,)) == [("R0", 1.0)]
+    assert fw.tasks_for(True, False, (1.0,)) == [(o, 1.0) for o in ("R0", "R90", "R180", "R270")]
+    assert len(fw.tasks_for(True, True, (0.9, 1.0, 1.1))) == 8 * 3  # all orients x 3 scales
+
+
+@pytest.mark.parametrize(
+    "method,rot,flip,scales",
+    [("ncc", False, False, (1.0,)),
+     ("ssd", False, False, (1.0,)),
+     ("ncc", False, False, (0.9, 1.0, 1.1)),
+     ("ncc", True, True, (1.0,)),
+     ("ncc", True, True, (0.8, 0.9, 1.0, 1.1, 1.25))],
+)
+def test_parallel_decomposition_equals_match(method, rot, flip, scales):
+    """Per-task candidates_for + finalize (the worker path) == single-call match().
+
+    This is the contract the browser's worker pool relies on: splitting the
+    (orientation x scale) tasks across workers and merging must not change the
+    result versus running match() in one shot.
+    """
+    img, pos, (mh, mw) = _scene(seed=3)
+    sx, sy = pos[0]
+    sel = (sx, sy, mw, mh)
+    planes = fw.prepare_planes(img, "luminance")
+    cap = max(4 * 200, 4000)
+    cands = []
+    for orient, s in fw.tasks_for(rot, flip, scales):
+        cands += fw.candidates_for(planes, sel, method, 0.85, s, orient, cap)
+    parallel = fw.finalize(cands, sel, 0.3, 0.3, 200)
+
+    ref = fw.match(img, sx, sy, mw, mh, method=method, threshold=0.85,
+                   scales=scales, enable_rotation=rot, enable_flipping=flip)
+
+    def keyset(ms):
+        return sorted((m["x"], m["y"], m["w"], m["h"]) for m in ms)
+
+    assert keyset(parallel) == keyset(ref)
+
+
 # ------------------------------------------------------- parity vs desktop torch
 def test_recall_parity_with_desktop_engine():
     """The web NCC recovers the same instances the desktop torch engine does."""
