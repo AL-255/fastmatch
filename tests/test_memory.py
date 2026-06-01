@@ -36,11 +36,13 @@ from fastmatch.memory import (
     entry_from_dict,
     entry_to_dict,
     load_store,
+    params_from_dict,
+    params_to_dict,
     save_store,
     store_from_dict,
     store_to_dict,
 )
-from fastmatch.types import ORIENTATIONS, Match
+from fastmatch.types import ORIENTATIONS, Match, MatchParams
 
 
 # --------------------------------------------------------------------------- #
@@ -67,11 +69,13 @@ def _entry_with_varied_matches(*, label: str = "") -> MemoryEntry:
     ]
     return MemoryEntry(
         selection=(100, 200, 32, 24),
-        method="ncc",
-        threshold=0.6,
+        params=MatchParams(
+            method="ncc",
+            threshold=0.6,
+            enable_rotation=True,
+            enable_flipping=True,
+        ),
         matches=matches,
-        enable_rotation=True,
-        enable_flipping=True,
         label=label,
     )
 
@@ -82,7 +86,7 @@ def _entry_with_varied_matches(*, label: str = "") -> MemoryEntry:
 def test_entry_count() -> None:
     """``count()`` is the number of recorded matches; ``0`` for an empty entry."""
     assert _entry_with_varied_matches().count() == 5
-    empty = MemoryEntry(selection=(0, 0, 8, 8), method="ncc", threshold=0.85)
+    empty = MemoryEntry(selection=(0, 0, 8, 8), params=MatchParams())
     assert empty.count() == 0
 
 
@@ -93,7 +97,7 @@ def test_entry_score_range() -> None:
     assert lo == pytest.approx(0.65)
     assert hi == pytest.approx(0.91)
     # Empty -> (0.0, 0.0) per the frozen contract.
-    empty = MemoryEntry(selection=(0, 0, 8, 8), method="ncc", threshold=0.85)
+    empty = MemoryEntry(selection=(0, 0, 8, 8), params=MatchParams())
     assert empty.score_range() == (0.0, 0.0)
 
 
@@ -102,7 +106,7 @@ def test_entry_mean_score() -> None:
     e = _entry_with_varied_matches()
     expected = (0.91 + 0.72 + 0.88 + 0.65 + 0.80) / 5
     assert e.mean_score() == pytest.approx(expected)
-    empty = MemoryEntry(selection=(0, 0, 8, 8), method="ncc", threshold=0.85)
+    empty = MemoryEntry(selection=(0, 0, 8, 8), params=MatchParams())
     assert empty.mean_score() == 0.0
 
 
@@ -128,7 +132,7 @@ def test_entry_orientation_summary_string() -> None:
     # R0 before R90 before MY (canonical order), space-joined "code:count".
     assert e.orientation_summary() == "R0:2 R90:2 MY:1"
     # Empty entry -> empty string (no orientations).
-    empty = MemoryEntry(selection=(0, 0, 8, 8), method="ncc", threshold=0.85)
+    empty = MemoryEntry(selection=(0, 0, 8, 8), params=MatchParams())
     assert empty.orientation_summary() == ""
 
 
@@ -164,14 +168,16 @@ def _store_with_two_entries() -> MemoryStore:
     e1 = _entry_with_varied_matches(label="oriented motif")  # rotation+flipping on
     e2 = MemoryEntry(
         selection=(10, 20, 64, 48),
-        method="ssd",
-        threshold=0.5,
+        params=MatchParams(
+            method="ssd",
+            threshold=0.5,
+            enable_rotation=False,
+            enable_flipping=False,
+        ),
         matches=[
             Match(x=500, y=500, w=64, h=48, score=0.99, scale=1.0, orientation="R0"),
             Match(x=900, y=720, w=64, h=48, score=0.95, scale=1.25, orientation="R0"),
         ],
-        enable_rotation=False,
-        enable_flipping=False,
         label="exact copies",
     )
     return MemoryStore(
@@ -271,6 +277,191 @@ def test_save_load_accepts_str_path(tmp_path) -> None:
     path = str(tmp_path / "memory_str.json")
     save_store(store, path)
     assert load_store(path) == store
+
+
+# =========================================================================== #
+# Full-params round-trip
+# =========================================================================== #
+def _entry_with_full_params() -> MemoryEntry:
+    """An entry whose params set MANY non-default fields across the whole struct.
+
+    Exercises every awkward corner of params (de)serialization at once: a
+    non-default ``channel_mode``, a multi-element ``scales`` tuple, tweaked
+    NMS/exclude IoU, both orientation bits, a non-default feature detector and
+    min-inliers, and ``rotations`` left at its ``None`` default. The matches are
+    orientation-tagged so Match equality (which includes ``orientation``) is
+    pinned too.
+    """
+    params = MatchParams(
+        threshold=0.7,
+        threshold_floor=0.4,
+        scales=(0.9, 1.0, 1.1),
+        rotations=None,
+        max_results=250,
+        nms_iou=0.45,
+        exclude_iou=0.2,
+        device="cpu",
+        compute_dtype="float16",
+        channel_mode="rgb",
+        method="features",
+        enable_rotation=True,
+        enable_flipping=True,
+        feature_detector="akaze",
+        feature_ratio=0.8,
+        feature_min_inliers=20,
+        feature_max_instances=42,
+    )
+    return MemoryEntry(
+        selection=(12, 34, 56, 78),
+        params=params,
+        matches=[
+            Match(x=12, y=34, w=56, h=78, score=0.95, scale=1.0, orientation="R0"),
+            Match(x=300, y=400, w=78, h=56, score=0.81, scale=1.1, orientation="MX"),
+        ],
+        label="full params entry",
+    )
+
+
+def test_params_dict_round_trip_preserves_all_fields() -> None:
+    """``params_to_dict`` -> ``params_from_dict`` reproduces a MatchParams EXACTLY.
+
+    Tuples (``scales``) and the tuple-or-``None`` ``rotations`` survive the JSON
+    list/null normalization; every scalar field is preserved (frozen-dataclass
+    equality compares all fields at once).
+    """
+    p = _entry_with_full_params().params
+    back = params_from_dict(params_to_dict(p))
+    assert back == p
+    # Spot-check the tuple normalization explicitly.
+    assert isinstance(back.scales, tuple) and back.scales == (0.9, 1.0, 1.1)
+    assert back.rotations is None
+    assert back.channel_mode == "rgb"
+
+
+def test_full_params_survive_dict_and_file_round_trip(tmp_path) -> None:
+    """The FULL params (and matches) round-trip through both dict and file paths.
+
+    A non-default ``channel_mode="rgb"``, multi-element ``scales``, tweaked
+    ``nms_iou``, ``feature_detector="akaze"``, ``feature_min_inliers`` and the
+    orientation bits must all reappear unchanged after ``store_to_dict`` ->
+    ``store_from_dict`` AND ``save_store`` -> ``load_store``. The reloaded
+    entry's ``params`` must equal the original, and matches (incl. orientation).
+    """
+    entry = _entry_with_full_params()
+    store = MemoryStore(
+        source_image="/data/full.png",
+        image_size=(2048, 1536),
+        entries=[entry],
+    )
+
+    # 1) dict round-trip is dataclass-equal.
+    via_dict = store_from_dict(store_to_dict(store))
+    assert via_dict == store
+
+    # 2) file round-trip is dataclass-equal.
+    path = tmp_path / "full_params.json"
+    save_store(store, path)
+    loaded = load_store(path)
+    assert loaded == store
+
+    # 3) The reloaded entry's params equal the original params, field-for-field.
+    got = loaded.entries[0]
+    assert got.params == entry.params
+    # Pin the requested non-default settings explicitly.
+    assert got.params.channel_mode == "rgb"
+    assert got.params.scales == (0.9, 1.0, 1.1)
+    assert got.params.nms_iou == pytest.approx(0.45)
+    assert got.params.feature_detector == "akaze"
+    assert got.params.feature_min_inliers == 20
+    assert got.params.enable_rotation is True and got.params.enable_flipping is True
+    # The settings delegates reflect params after the round-trip.
+    assert got.method == "features"
+    assert got.channel_mode == "rgb"
+    assert got.threshold == pytest.approx(0.7)
+    # Matches (incl. orientation) survive exactly.
+    assert got.matches == entry.matches
+    assert [m.orientation for m in got.matches] == ["R0", "MX"]
+
+    # The serialized entry stores a "params" block (not the old flat keys).
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    entry_dict = on_disk["entries"][0]
+    assert "params" in entry_dict
+    assert entry_dict["params"]["channel_mode"] == "rgb"
+    assert entry_dict["params"]["scales"] == [0.9, 1.0, 1.1]
+    assert "method" not in entry_dict  # the flat key is gone
+
+
+# =========================================================================== #
+# Backward compatibility (old flat-key entries, no "params")
+# =========================================================================== #
+def test_entry_from_dict_loads_old_flat_keys_without_params() -> None:
+    """An OLD-style entry dict (flat method/threshold/enable_*, no "params") loads.
+
+    Files written before settings were captured as a full ``MatchParams`` stored
+    the method / threshold / orientation bits as flat keys. ``entry_from_dict``
+    must fold those into the entry's ``params`` so the delegating properties
+    reflect them, with the frozen defaults for every other field.
+    """
+    old = {
+        "label": "legacy entry",
+        "selection": [100, 200, 32, 24],
+        "method": "ssd",
+        "threshold": 0.6,
+        "enable_rotation": True,
+        "enable_flipping": False,
+        "matches": [
+            {"x": 100, "y": 200, "w": 32, "h": 24, "score": 0.9, "scale": 1.0, "orientation": "R0"},
+        ],
+    }
+    e = entry_from_dict(old)
+    # The flat fields are reflected through the params delegates.
+    assert e.method == "ssd"
+    assert e.threshold == pytest.approx(0.6)
+    assert e.enable_rotation is True
+    assert e.enable_flipping is False
+    # Everything else falls back to the frozen MatchParams defaults.
+    defaults = MatchParams()
+    assert e.params.threshold_floor == defaults.threshold_floor
+    assert e.params.scales == defaults.scales
+    assert e.params.nms_iou == defaults.nms_iou
+    assert e.params.channel_mode == defaults.channel_mode
+    assert e.channel_mode == "luminance"
+    assert e.params.feature_detector == defaults.feature_detector
+    # The non-params content still loads as before.
+    assert e.selection == (100, 200, 32, 24)
+    assert e.label == "legacy entry"
+    assert e.matches == [Match(x=100, y=200, w=32, h=24, score=0.9, scale=1.0, orientation="R0")]
+
+
+def test_store_from_dict_loads_old_flat_entries(tmp_path) -> None:
+    """A whole OLD-style store (entries with flat keys, no "params") loads via file."""
+    payload = {
+        "version": MEMORY_JSON_VERSION,
+        "source_image": "/data/legacy.png",
+        "image_size": [800, 600],
+        "entries": [
+            {
+                "label": "legacy",
+                "selection": [1, 2, 3, 4],
+                "method": "ccorr",
+                "threshold": 0.55,
+                "enable_rotation": False,
+                "enable_flipping": True,
+                "matches": [],
+            }
+        ],
+    }
+    path = tmp_path / "legacy.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    store = load_store(path)
+    assert store.source_image == "/data/legacy.png"
+    assert len(store.entries) == 1
+    e = store.entries[0]
+    assert e.method == "ccorr"
+    assert e.threshold == pytest.approx(0.55)
+    assert e.enable_rotation is False
+    assert e.enable_flipping is True
+    assert e.selection == (1, 2, 3, 4)
 
 
 # =========================================================================== #

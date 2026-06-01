@@ -91,8 +91,10 @@ stamps and exits; load that file separately to search it.
 | Action | Result |
 |---|---|
 | **Scroll wheel** | Zoom in/out, anchored **under the cursor** (max 64x). |
+| **F** | Zoom to fit the whole image. |
 | **Hold Space + drag**, or **middle-mouse drag** | Pan the view. |
 | **Left-drag** | Draw the selection box (the search template). |
+| **Channel dropdown** | `luminance` renders the image (and matches) in **grayscale** — what the matcher sees in luminance mode; `rgb` shows it in colour. |
 | Release a new selection | Re-runs the search; any in-flight search is **auto-cancelled** (latest-wins). |
 | **Method dropdown** | Pick the matching method (NCC / SSD / CCORR / Feature matching). Changing it **re-runs** the search on the current selection. See [Matching methods](#matching-methods). |
 | **Rotation / Flipping checkboxes** | Also search the template under quarter-turn rotations and/or mirror reflections. Changing either **re-runs** the search. See [Orientation search](#orientation-search). |
@@ -198,11 +200,13 @@ The **Memory** panel keeps a list of saved searches so you can collect and
 compare interesting matches across a session.
 
 - **Add to Memory** — after a search completes, click *Add to Memory* to append
-  an entry that captures the **current selection box** plus **all current
-  matches** (and the method / threshold / orientation settings used).
-- **Per-entry stats** — each row shows a one-line summary: the method, the
-  number of matches, the selection size and position, the score range, and a
-  compact per-orientation breakdown (e.g. `R0:2 R90:1 MY:1`).
+  an entry that captures the **current selection box**, **all current matches**,
+  and the **complete settings** used (the full `MatchParams`: method, channel
+  mode, threshold(s), scales, orientation flags, NMS/exclude IoU, max results,
+  compute dtype, and the feature-matching parameters).
+- **Per-entry stats** — each row shows the method, channel mode, selection,
+  match count, score range, and a compact per-orientation breakdown (e.g.
+  `R0:2 R90:1 MY:1`); hovering a row shows **all** of that entry's settings.
 - **Remove** — deletes the selected line(s) from the list.
 - **Double-click** an entry to **revisit** it — FastMatch re-selects that saved
   search's template region.

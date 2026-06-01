@@ -57,6 +57,11 @@ _LOD_HYSTERESIS = 0.25
 # Background behind tiles (and any region with no decoded tile yet).
 _BG_COLOR = QColor(30, 30, 30)
 
+# BT.601 luminance weights (R, G, B), matching the engine's convention (§D.1)
+# so the grayscale display mode shows exactly what the matcher "sees" in
+# luminance mode: L = 0.299R + 0.587G + 0.114B.
+_BT601 = (0.299, 0.587, 0.114)
+
 
 # --------------------------------------------------------------------------- #
 # Off-GUI tile decode worker
@@ -253,6 +258,10 @@ class ImageViewport(QGraphicsView):
         self._overlay: MatchOverlayItem | None = None
         self.tile_cache = TileCache(max_pixmaps=256, pinned_levels=2)
 
+        # When True, base-image tiles render in BT.601 luminance (grayscale) at
+        # the QImage step (the match-box overlay stays in colour). Default OFF.
+        self._display_grayscale: bool = False
+
         # --- tile decode plumbing ---
         self._pool = QThreadPool.globalInstance()
         self._tile_signals = _TileSignals()
@@ -383,6 +392,32 @@ class ImageViewport(QGraphicsView):
         self._mode = mode
         self._apply_cursor()
 
+    def set_display_grayscale(self, on: bool) -> None:
+        """Render base-image tiles in BT.601 luminance (grayscale) when ``on``.
+
+        Shows what the matcher "sees" in luminance mode (``L = 0.299R + 0.587G
+        + 0.114B``); the conversion happens at the tile -> QImage/QPixmap step
+        (see :meth:`_on_tile_decoded`). The match-box overlay is unaffected and
+        stays in colour over the grayscale base. Default OFF.
+
+        Toggling drops every cached tile pixmap (pinned included) so tiles
+        re-render in the new mode, bumps the view generation so in-flight decode
+        results from the old mode are discarded on arrival, and repaints.
+        Idempotent: a no-op if the mode is unchanged.
+        """
+        on = bool(on)
+        if on == self._display_grayscale:
+            return  # idempotent: mode unchanged
+        self._display_grayscale = on
+        # Drop colour pixmaps (incl. pinned tiles) so the painter re-requests
+        # tiles and they re-render in the new mode.
+        self.tile_cache.clear()
+        # Bump the view generation: any decode already in flight finalized its
+        # ndarray under the old mode bit; discarding it forces a fresh request.
+        self._bump_generation()
+        self.viewport().update()
+        self._scene.update()
+
     def fit_in_view(self) -> None:
         """Fit the whole image in the viewport and sync ``view_scale``/LOD."""
         if self._doc is None:
@@ -471,20 +506,48 @@ class ImageViewport(QGraphicsView):
         if not isinstance(arr, np.ndarray) or arr.size == 0:
             return
 
-        # Ensure C-contiguity (memmap-derived crops already are, but be safe) so
-        # bytesPerLine == strides[0] is valid.
-        buf = np.ascontiguousarray(arr)
-        h, w = buf.shape[0], buf.shape[1]
-        bytes_per_line = buf.strides[0]
+        if self._display_grayscale:
+            # Grayscale display: convert the decoded RGB tile to a single-channel
+            # BT.601 luminance image (what the matcher "sees" in luminance mode).
+            # A contiguous uint8 (H,W) array feeds Format_Grayscale8 with an
+            # explicit bytesPerLine == W. Build directly so the (H,W) buffer is
+            # already C-contiguous (so bytesPerLine == strides[0] == W).
+            buf = self._tile_to_luminance(arr)
+            h, w = buf.shape[0], buf.shape[1]
+            bytes_per_line = buf.strides[0]  # == w for a contiguous uint8 (H,W)
+            image = QImage(
+                buf.data, w, h, bytes_per_line, QImage.Format.Format_Grayscale8
+            )
+        else:
+            # Ensure C-contiguity (memmap-derived crops already are, but be safe)
+            # so bytesPerLine == strides[0] is valid.
+            buf = np.ascontiguousarray(arr)
+            h, w = buf.shape[0], buf.shape[1]
+            bytes_per_line = buf.strides[0]
+            image = QImage(buf.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
         # buf is referenced by `image` until fromImage copies; keep it alive
         # implicitly by holding the local until after the copy below.
-        image = QImage(buf.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
         pm = QPixmap.fromImage(image)  # copies pixels; ndarray/QImage now free
         pm.setDevicePixelRatio(1.0)    # trust scene mapping, not DPR scaling (§E.8)
         self.tile_cache.put(key, pm)
         # Pin coarsest-level tiles as they arrive so the fallback layer persists.
         self.tile_cache.pin_top_levels()
         self.viewport().update()
+
+    @staticmethod
+    def _tile_to_luminance(arr: np.ndarray) -> np.ndarray:
+        """Decoded RGB tile ``(H,W,3)`` uint8 -> contiguous BT.601 luminance uint8.
+
+        Reuses the engine's BT.601 weights (``L = 0.299R + 0.587G + 0.114B``).
+        Returns a C-contiguous ``(H,W)`` uint8 array so the caller can hand it to
+        ``QImage.Format_Grayscale8`` with ``bytesPerLine == W``. Rounds to nearest
+        (``+ 0.5`` then truncate) and clips to ``[0, 255]`` for fp safety.
+        """
+        rgb = np.asarray(arr, dtype=np.float32)
+        wr, wg, wb = _BT601
+        lum = rgb[:, :, 0] * wr + rgb[:, :, 1] * wg + rgb[:, :, 2] * wb
+        lum = np.clip(lum + 0.5, 0.0, 255.0)
+        return np.ascontiguousarray(lum.astype(np.uint8))
 
     # ------------------------------------------------------------- LOD / state
     def _update_lod(self, force: bool = False) -> None:

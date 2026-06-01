@@ -47,6 +47,7 @@ from .memory import MemoryEntry, MemoryStore
 _COLUMNS: tuple[str, ...] = (
     "Label",
     "Method",
+    "Channel",
     "Selection",
     "Matches",
     "Score",
@@ -156,20 +157,51 @@ class MemoryPanel(QWidget):
         return [
             entry.summary(),
             entry.method,
+            entry.channel_mode,
             f"({x},{y}) {w}×{h}",
             str(entry.count()),
             f"{lo:.2f}–{hi:.2f}",
             entry.orientation_summary(),
         ]
 
+    @staticmethod
+    def _params_tooltip(entry: MemoryEntry) -> str:
+        """A multi-line description of *all* settings in the entry's params.
+
+        Surfaces every :class:`~fastmatch.types.MatchParams` field on hover so the
+        full settings behind a saved search are visible without re-opening it.
+        """
+        p = entry.params
+        lines = [
+            f"method: {p.method}",
+            f"channel_mode: {p.channel_mode}",
+            f"threshold: {p.threshold:.2f}",
+            f"threshold_floor: {p.threshold_floor:.2f}",
+            f"scales: {', '.join(f'{s:g}' for s in p.scales)}",
+            f"enable_rotation: {p.enable_rotation}",
+            f"enable_flipping: {p.enable_flipping}",
+            f"nms_iou: {p.nms_iou:.2f}",
+            f"exclude_iou: {p.exclude_iou:.2f}",
+            f"max_results: {p.max_results}",
+            f"compute_dtype: {p.compute_dtype}",
+            f"feature_detector: {p.feature_detector}",
+            f"feature_ratio: {p.feature_ratio:.2f}",
+            f"feature_min_inliers: {p.feature_min_inliers}",
+            f"feature_max_instances: {p.feature_max_instances}",
+        ]
+        return "\n".join(lines)
+
     def _append_row(self, entry: MemoryEntry) -> int:
         """Append a read-only stats row for ``entry`` and return its row index."""
         row = self._table.rowCount()
         self._table.insertRow(row)
+        tooltip = self._params_tooltip(entry)
         for col, text in enumerate(self._row_cells(entry)):
             item = QTableWidgetItem(text)
             # Defensive: keep cells non-editable even if the table policy changes.
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            # Every cell on the row reveals the full settings on hover.
+            item.setToolTip(tooltip)
             self._table.setItem(row, col, item)
         return row
 

@@ -30,7 +30,7 @@ import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QRect, Qt, QTimer
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
@@ -110,6 +110,9 @@ class MainWindow(QMainWindow):
         self._params = dataclasses.replace(
             self._params_panel.current_params(), device=self._device_pref
         )
+        # Render the image as the matcher sees it: grayscale in luminance mode,
+        # colour in rgb mode (the channel-mode combo drives the display).
+        self._viewport.set_display_grayscale(self._params.channel_mode == "luminance")
 
         dock_body = QWidget(self)
         dock_layout = QVBoxLayout(dock_body)
@@ -188,6 +191,8 @@ class MainWindow(QMainWindow):
         tb.addAction(self._act_mode)
 
         self._act_fit = QAction("Fit", self)
+        self._act_fit.setShortcut(QKeySequence("F"))  # F = zoom-to-fit
+        self._act_fit.setToolTip("Zoom to fit the whole image (F)")
         self._act_fit.triggered.connect(self._viewport.fit_in_view)
         tb.addAction(self._act_fit)
 
@@ -288,6 +293,8 @@ class MainWindow(QMainWindow):
         self._viewport.clear_matches()
         self._viewport.clear_template()
         self._viewport.set_image(doc)
+        # Keep the display mode (grayscale/colour) consistent for the new image.
+        self._viewport.set_display_grayscale(self._params.channel_mode == "luminance")
         self._controller = MatchController(doc, self._params)
         # Reconnect the new controller's signals.
         self._controller.matches_ready.connect(self._on_matches_ready)
@@ -337,14 +344,9 @@ class MainWindow(QMainWindow):
         visible = [m for m in self._all_matches if m.score >= self._params.threshold]
         rect = self._last_rect
         sel = (rect.x(), rect.y(), rect.width(), rect.height())
-        entry = MemoryEntry(
-            selection=sel,
-            method=self._params.method,
-            threshold=self._params.threshold,
-            matches=list(visible),
-            enable_rotation=self._params.enable_rotation,
-            enable_flipping=self._params.enable_flipping,
-        )
+        # Record the COMPLETE settings (channel mode, orientation flags, scales,
+        # NMS/feature params, ...) via the full MatchParams snapshot.
+        entry = MemoryEntry(selection=sel, params=self._params, matches=list(visible))
         self._memory.add_entry(entry)
         self.statusBar().showMessage(f"Added {len(visible)} matches to memory.", 6000)
 
@@ -501,6 +503,10 @@ class MainWindow(QMainWindow):
 
         # Always reflect the threshold in the overlay's live filter.
         self._viewport.set_match_threshold(new.threshold)  # type: ignore[attr-defined]
+        # Channel mode also drives the display: luminance -> grayscale, rgb ->
+        # colour (a no-op in the viewport when unchanged).
+        if new.channel_mode != old.channel_mode:
+            self._viewport.set_display_grayscale(new.channel_mode == "luminance")
         # Keep the count readout in sync with the new live filter.
         try:
             shown = self._viewport.visible_match_count()
