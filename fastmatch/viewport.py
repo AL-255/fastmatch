@@ -316,8 +316,16 @@ class ImageViewport(QGraphicsView):
         self.tile_cache = TileCache(max_pixmaps=256, pinned_levels=2)
         self.tile_cache.set_num_levels(self._pyramid.num_levels())
 
-        # Scene spans the full image in image px.
-        self._scene.setSceneRect(0.0, 0.0, float(doc.width), float(doc.height))
+        # Scene = the image PLUS a generous margin on every side, so the canvas
+        # behaves as if it were unbounded. QGraphicsView clamps the view to the
+        # scene rect, so without padding a zoom-under-cursor near an image edge
+        # cannot keep the cursor point fixed (the view can't scroll past the
+        # image) and the point drifts. A one-image-size margin on each side lets
+        # any image point sit anywhere in the viewport at any zoom, so wheel zoom
+        # always pivots exactly under the cursor. Item coords (== image px) are
+        # unchanged; the margin is just empty scrollable space.
+        w, h = float(doc.width), float(doc.height)
+        self._scene.setSceneRect(-w, -h, 3.0 * w, 3.0 * h)
 
         self._pyramid_item = PyramidItem(self, self._pyramid)
         self._scene.addItem(self._pyramid_item)

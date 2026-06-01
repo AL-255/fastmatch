@@ -80,8 +80,16 @@ class MemoryEntry:
 
     # -- derived stats -------------------------------------------------------
     def count(self) -> int:
-        """Number of recorded matches."""
+        """Number of recorded matches (found instances, excluding the source)."""
         return len(self.matches)
+
+    def occurrences(self) -> int:
+        """Total occurrences of the pattern: the matches PLUS the reference box.
+
+        The boxed source selection is itself one occurrence, so the count shown to
+        the user includes it (2 matches + the reference == 3 occurrences).
+        """
+        return len(self.matches) + 1
 
     def score_range(self) -> tuple[float, float]:
         """``(min, max)`` recorded score, or ``(0.0, 0.0)`` if empty."""
@@ -114,7 +122,7 @@ class MemoryEntry:
         x, y, w, h = self.selection
         lo, hi = self.score_range()
         return (
-            f"{self.method}/{self.channel_mode} · {self.count()} matches · "
+            f"{self.method}/{self.channel_mode} · {self.occurrences()} occurrences · "
             f"sel {w}×{h}@({x},{y}) · score {lo:.2f}–{hi:.2f}"
         )
 

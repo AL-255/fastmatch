@@ -90,6 +90,13 @@ def test_entry_count() -> None:
     assert empty.count() == 0
 
 
+def test_entry_occurrences_includes_reference() -> None:
+    """``occurrences()`` == matches + 1 (the reference selection counts too)."""
+    assert _entry_with_varied_matches().occurrences() == 6  # 5 matches + reference
+    empty = MemoryEntry(selection=(0, 0, 8, 8), params=MatchParams())
+    assert empty.occurrences() == 1  # just the reference, even with no matches
+
+
 def test_entry_score_range() -> None:
     """``score_range()`` returns ``(min, max)`` over the matches' scores."""
     e = _entry_with_varied_matches()
@@ -136,13 +143,14 @@ def test_entry_orientation_summary_string() -> None:
     assert empty.orientation_summary() == ""
 
 
-def test_entry_summary_mentions_method_count_and_selection() -> None:
-    """``summary()`` is a one-liner containing the method, match count and selection."""
+def test_entry_summary_mentions_method_occurrences_and_selection() -> None:
+    """``summary()`` is a one-liner with the method, occurrence count and selection."""
     e = _entry_with_varied_matches()
     s = e.summary()
     assert isinstance(s, str)
-    assert "ncc" in s                      # the method
-    assert str(e.count()) in s             # the match count (5)
+    assert "ncc" in s                       # the method
+    assert "occurrences" in s               # counts occurrences, not "matches"
+    assert str(e.occurrences()) in s        # the occurrence count (6 = 5 + reference)
     # The selection's size and origin appear (sel is 32x24 @ (100, 200)).
     assert "32" in s and "24" in s
     assert "100" in s and "200" in s
@@ -238,7 +246,7 @@ def test_entry_round_trips_faithfully_when_unlabelled() -> None:
     assert back == e  # full identity, including the empty label
     # summary() still produces a descriptive string even with no stored label.
     assert back.summary() == e.summary()
-    assert e.method in back.summary() and str(back.count()) in back.summary()
+    assert e.method in back.summary() and str(back.occurrences()) in back.summary()
     assert back.enable_rotation == e.enable_rotation
     assert back.enable_flipping == e.enable_flipping
 

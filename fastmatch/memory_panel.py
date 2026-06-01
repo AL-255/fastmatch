@@ -49,7 +49,7 @@ _COLUMNS: tuple[str, ...] = (
     "Method",
     "Channel",
     "Selection",
-    "Matches",
+    "Occurrences",
     "Score",
     "Orientations",
 )
@@ -159,7 +159,7 @@ class MemoryPanel(QWidget):
             entry.method,
             entry.channel_mode,
             f"({x},{y}) {w}×{h}",
-            str(entry.count()),
+            str(entry.occurrences()),  # matches + the reference selection
             f"{lo:.2f}–{hi:.2f}",
             entry.orientation_summary(),
         ]

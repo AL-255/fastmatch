@@ -90,12 +90,13 @@ stamps and exits; load that file separately to search it.
 
 | Action | Result |
 |---|---|
-| **Scroll wheel** | Zoom in/out, anchored **under the cursor** (max 64x). |
+| **Scroll wheel** | Zoom in/out, always anchored **under the cursor** (max 64x). The canvas is treated as unbounded, so the cursor stays the pivot even at the image edges. |
 | **F** | Zoom to fit the whole image. |
 | **Hold Space + drag**, or **middle-mouse drag** | Pan the view. |
 | **Left-drag** | Draw the selection box (the search template). |
+| **Run** button / **Auto Run** checkbox | With *Auto Run* on (default) the search runs whenever you draw a selection or change a setting. Turn it off to stage the selection + parameters and trigger a single search with **Run** (handy when each run is expensive). |
 | **Channel dropdown** | `luminance` renders the image (and matches) in **grayscale** — what the matcher sees in luminance mode; `rgb` shows it in colour. |
-| Release a new selection | Re-runs the search; any in-flight search is **auto-cancelled** (latest-wins). |
+| Release a new selection | Runs the search (if Auto Run is on); any in-flight search is **auto-cancelled** (latest-wins). |
 | **Method dropdown** | Pick the matching method (NCC / SSD / CCORR / Feature matching). Changing it **re-runs** the search on the current selection. See [Matching methods](#matching-methods). |
 | **Rotation / Flipping checkboxes** | Also search the template under quarter-turn rotations and/or mirror reflections. Changing either **re-runs** the search. See [Orientation search](#orientation-search). |
 | **Threshold slider** | **Live-filters** the displayed results — no re-run (works for every method). |
@@ -206,8 +207,10 @@ compare interesting matches across a session.
   mode, threshold(s), scales, orientation flags, NMS/exclude IoU, max results,
   compute dtype, and the feature-matching parameters).
 - **Per-entry stats** — each row shows the method, channel mode, selection,
-  match count, score range, and a compact per-orientation breakdown (e.g.
-  `R0:2 R90:1 MY:1`); hovering a row shows **all** of that entry's settings.
+  **occurrences** (the number of matches **plus the reference selection** — e.g.
+  2 matches show as 3 occurrences), score range, and a compact per-orientation
+  breakdown (e.g. `R0:2 R90:1 MY:1`); hovering a row shows **all** of that
+  entry's settings.
 - **Remove** — deletes the selected line(s) from the list.
 - **Double-click** an entry to **revisit** it — FastMatch re-selects that saved
   search's template region.
