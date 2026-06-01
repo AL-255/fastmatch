@@ -280,6 +280,83 @@ class MainWindow(QMainWindow):
         self._act_box_xor.toggled.connect(self._viewport.set_box_xor)
         boxes_menu.addAction(self._act_box_xor)
 
+        self._build_engine_menu()
+
+    def _build_engine_menu(self) -> None:
+        """&Engine menu — pick the compute backend (CPU / CUDA / Auto) at runtime.
+
+        An exclusive radio group of three presets mirroring the device-preference
+        strings understood by :func:`resolve_device`. The CUDA entry is disabled
+        when no working CUDA device is present (the canary-gated probe failed), so
+        the user can never select an unavailable backend. The entry matching the
+        current :attr:`_device_pref` starts checked.
+        """
+        engine_menu = self._engine_menu = self.menuBar().addMenu("&Engine")
+        self._engine_group = QActionGroup(self)
+        self._engine_group.setExclusive(True)
+
+        cuda_available = resolve_device("cuda").type == "cuda"
+        # (preference-string, label, tooltip, enabled).
+        specs = (
+            ("auto", "&Auto (prefer GPU)",
+             "Use the GPU when available, otherwise fall back to the CPU."),
+            ("cuda", "&CUDA (GPU)",
+             "Force the CUDA GPU backend." if cuda_available
+             else "No working CUDA device was detected on this machine."),
+            ("cpu", "C&PU",
+             "Force the CPU backend (slower, but always available)."),
+        )
+        self._engine_actions: dict[str, QAction] = {}
+        for key, label, tip in specs:
+            act = QAction(label, self, checkable=True)
+            act.setToolTip(tip)
+            if key == "cuda" and not cuda_available:
+                act.setEnabled(False)
+            act.setChecked(key == self._device_pref)
+            act.triggered.connect(lambda _checked, k=key: self._on_select_engine(k))
+            self._engine_group.addAction(act)
+            engine_menu.addAction(act)
+            self._engine_actions[key] = act
+
+    def _on_select_engine(self, key: str) -> None:
+        """Switch the compute backend at runtime (menu callback).
+
+        Rebuilds the controller on the new device, re-gates device-dependent
+        controls (the multi-scale grid is GPU-only), refreshes the banner, and
+        re-runs the last query if Auto Run is on. If the in-flight controller is
+        still busy and won't join, the switch is aborted and the radio reverts to
+        the previous backend so the menu never lies about the live engine.
+        """
+        if key == self._device_pref:
+            return
+
+        previous = self._device_pref
+        if not self._teardown_controller():
+            # Busy worker parked: undo the radio selection and tell the user.
+            self._engine_actions[previous].setChecked(True)
+            QMessageBox.warning(
+                self, "Busy", "A search is still finishing; please wait and try again."
+            )
+            return
+
+        # Commit the new device across all the places that cache it.
+        self._device_pref = key
+        self._engine_actions[key].setChecked(True)  # keep the radio honest
+        self._resolved_device = resolve_device(key)
+        self._params_panel.set_device(self._resolved_device.type)
+        self._params = dataclasses.replace(
+            self._params_panel.current_params(), device=self._device_pref
+        )
+        self._banner.setText(device_banner_text(self._resolved_device))
+
+        # Build a fresh controller bound to the new device, then reset the busy UI.
+        self._install_new_controller()
+        self._on_busy_changed(False)
+
+        # Re-run the last query so results reflect the new engine immediately.
+        if self._auto_run and self._last_rect is not None:
+            self._controller.request(self._last_rect, self._params)
+
     def _connect_signals(self) -> None:
         """Connect viewport/controller/panel signals per DESIGN.md §F.2."""
         # Selection -> controller request.
@@ -346,33 +423,48 @@ class MainWindow(QMainWindow):
         self._act_close_image.setEnabled(False)  # nothing to close now
         self.statusBar().showMessage("Image closed.", 4000)
 
-    def _swap_document(self, doc: ImageDocument) -> None:
-        """Replace the current document, controller, and viewport image.
+    def _teardown_controller(self) -> bool:
+        """Shut down the current controller; park it (alive) if still busy.
 
-        Tears the old controller's worker thread down *before* building a new
-        one so two CUDA contexts / worker threads never live at once. If that
-        join times out (a wedged job), we MUST NOT drop the live thread (it
-        would be GC'd while running -> SIGABRT) nor build a second engine: park
-        the old controller and bail with a warning. Its
-        ``thread.finished -> deleteLater`` reclaims it once the job returns
-        (§C.3 / §C.6).
+        Returns True if the old controller's worker thread joined and was handed
+        to ``deleteLater`` (safe to build a replacement), or False if the bounded
+        join timed out — in which case the controller is PARKED (kept alive so its
+        still-running QThread is never GC'd -> SIGABRT) and the caller must not
+        build a new engine (§C.3 / §C.6).
+        """
+        old = self._controller
+        if not old.shutdown():
+            self._orphaned_controllers.append(old)
+            return False
+        old.deleteLater()
+        return True
+
+    def _install_new_controller(self) -> None:
+        """Build a fresh controller for the current doc + params and wire signals.
+
+        The previous controller must already have been relinquished via
+        :meth:`_teardown_controller`.
         """
         from .controller import MatchController
 
-        old = self._controller
-        if not old.shutdown():
-            # Still running after the bounded join: park it (alive) and abort the
-            # swap. Do not build a new engine; do not drop the running thread.
-            self._orphaned_controllers.append(old)
+        self._controller = MatchController(self._doc, self._params)
+        self._controller.matches_ready.connect(self._on_matches_ready)
+        self._controller.busy_changed.connect(self._on_busy_changed)
+        self._controller.progress.connect(self._on_progress)
+        self._controller.failed.connect(self._on_failed)
+
+    def _swap_document(self, doc: ImageDocument) -> None:
+        """Replace the current document, controller, and viewport image.
+
+        Tears the old controller's worker thread down *before* building a new one
+        (never two CUDA contexts / worker threads at once). If the join times out
+        (a wedged job), the old controller is parked and we bail with a warning.
+        """
+        if not self._teardown_controller():
             QMessageBox.warning(
-                self,
-                "Busy",
-                "A search is still finishing; please wait and try again.",
+                self, "Busy", "A search is still finishing; please wait and try again."
             )
             return
-        # Shutdown succeeded: the old controller's thread is down and its engine
-        # refs are dropped. It is safe to reclaim it and build the new one.
-        old.deleteLater()
 
         self._doc = doc
         self._last_rect = None
@@ -383,12 +475,7 @@ class MainWindow(QMainWindow):
         self._viewport.set_image(doc)
         # Keep the display mode (grayscale/colour) consistent for the new image.
         self._viewport.set_display_grayscale(self._params.channel_mode == "luminance")
-        self._controller = MatchController(doc, self._params)
-        # Reconnect the new controller's signals.
-        self._controller.matches_ready.connect(self._on_matches_ready)
-        self._controller.busy_changed.connect(self._on_busy_changed)
-        self._controller.progress.connect(self._on_progress)
-        self._controller.failed.connect(self._on_failed)
+        self._install_new_controller()
         # Reset the busy UI for the fresh controller: the old controller may have
         # been mid-search, leaving the progress bar visible (§C.17).
         self._progress.setValue(0)

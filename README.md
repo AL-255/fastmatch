@@ -101,6 +101,7 @@ stamps and exits; load that file separately to search it.
 | **Rotation / Flipping checkboxes** | Also search the template under quarter-turn rotations and/or mirror reflections. Changing either **re-runs** the search. See [Orientation search](#orientation-search). |
 | **Threshold slider** | **Live-filters** the displayed results — no re-run (works for every method). |
 | **View ▸ Match boxes** menu | Configure the overlay box outlines: **Line width** (1–6 px, zoom-independent) and **XOR with background** (invert the outline against whatever is underneath so it stays visible on any background). |
+| **Engine** menu | Switch the compute backend on the fly: **Auto (prefer GPU)**, **CUDA (GPU)**, or **CPU**. CUDA is greyed out when no working GPU is detected. Switching rebuilds the engine on the new device, updates the status banner, re-gates the GPU-only multi-scale search, and re-runs the current selection. |
 | **Add to Memory** | Save the current selection + all current matches as an entry in the Memory list. See [Saved-match Memory](#saved-match-memory). |
 | **Double-click a Memory entry** | Revisit that saved search — restores the blue reference box to its remembered selection and re-shows its matches. |
 
@@ -226,6 +227,14 @@ compare interesting matches across a session.
   its boxes up exactly; opening one recorded for a different image offers to open
   that image. A file written by a newer FastMatch (a higher schema version), or
   any malformed/non-JSON file, is refused with a clear error rather than crashing.
+- **Engine menu** — switch the compute backend without restarting: *Auto (prefer
+  GPU)*, *CUDA (GPU)*, or *CPU*. The CUDA entry is disabled when no working GPU
+  is detected (the same canary-gated probe used at launch), so you can never
+  select an unavailable backend. Switching tears down the old worker thread,
+  rebuilds the engine on the chosen device, refreshes the status banner, re-gates
+  the GPU-only multi-scale search, and re-runs the current selection — matching
+  the `--device` flag you could have launched with. The view, selection, and
+  Memory list are preserved across the switch.
 
 ---
 

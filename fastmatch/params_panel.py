@@ -231,21 +231,11 @@ class ParamsPanel(QWidget):
         conv_form.addRow("Channel mode", self._channel_mode)
         conv_layout.addLayout(conv_form)
         self._multiscale = QCheckBox("Search multiple scales", self)
-        if self._is_cuda:
-            self._multiscale.setChecked(True)
-            self._multiscale.setToolTip(
-                "Search the scale grid "
-                f"{', '.join(f'{s:g}x' for s in _SCALES_CUDA)} (GPU only)."
-            )
-            self._multiscale.toggled.connect(self._on_param_changed)
-        else:
-            # On CPU the full grid is unaffordable; force and lock single-scale.
-            self._multiscale.setChecked(False)
-            self._multiscale.setEnabled(False)
-            self._multiscale.setToolTip(
-                "Multi-scale search is GPU-only; CPU is locked to 1.0x to keep "
-                "queries responsive."
-            )
+        # Always connect the signal (even though it starts disabled on CPU) so it
+        # works after a runtime CPU->CUDA engine switch; enable/checked/tooltip are
+        # set by _apply_device_to_multiscale, called here and on set_device().
+        self._multiscale.toggled.connect(self._on_param_changed)
+        self._apply_device_to_multiscale()
         conv_layout.addWidget(self._multiscale)
         self._method_stack.addWidget(conv_box)  # index 0
 
@@ -485,3 +475,43 @@ class ParamsPanel(QWidget):
     def set_run_enabled(self, enabled: bool) -> None:
         """Enable/disable the **Run** button (e.g. only once a region exists)."""
         self._run_button.setEnabled(bool(enabled))
+
+    def _apply_device_to_multiscale(self) -> None:
+        """Set the multi-scale control for the current device (no signal emit).
+
+        CUDA: enabled + checked (the full grid is affordable on the GPU). CPU:
+        forced single-scale and disabled (the grid is unaffordable). Blocks the
+        toggled signal so this programmatic update never emits params_changed.
+        """
+        blocked = self._multiscale.blockSignals(True)
+        try:
+            if self._is_cuda:
+                self._multiscale.setEnabled(True)
+                self._multiscale.setChecked(True)
+                self._multiscale.setToolTip(
+                    "Search the scale grid "
+                    f"{', '.join(f'{s:g}x' for s in _SCALES_CUDA)} (GPU only)."
+                )
+            else:
+                self._multiscale.setChecked(False)
+                self._multiscale.setEnabled(False)
+                self._multiscale.setToolTip(
+                    "Multi-scale search is GPU-only; CPU is locked to 1.0x to keep "
+                    "queries responsive."
+                )
+        finally:
+            self._multiscale.blockSignals(blocked)
+
+    def set_device(self, effective_device: str) -> None:
+        """Re-gate device-dependent controls after a runtime engine switch.
+
+        Updates whether the multi-scale grid is offered (CUDA) or locked off
+        (CPU). Does not emit ``params_changed`` — the caller re-reads
+        :meth:`current_params` after switching the engine.
+        """
+        self._device = str(effective_device).lower()
+        new_is_cuda = self._device.startswith("cuda")
+        if new_is_cuda == self._is_cuda:
+            return
+        self._is_cuda = new_is_cuda
+        self._apply_device_to_multiscale()
