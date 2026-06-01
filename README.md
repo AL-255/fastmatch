@@ -99,6 +99,7 @@ stamps and exits; load that file separately to search it.
 | **Method dropdown** | Pick the matching method (NCC / SSD / CCORR / Feature matching). Changing it **re-runs** the search on the current selection. See [Matching methods](#matching-methods). |
 | **Rotation / Flipping checkboxes** | Also search the template under quarter-turn rotations and/or mirror reflections. Changing either **re-runs** the search. See [Orientation search](#orientation-search). |
 | **Threshold slider** | **Live-filters** the displayed results — no re-run (works for every method). |
+| **View ▸ Match boxes** menu | Configure the overlay box outlines: **Line width** (1–6 px, zoom-independent) and **XOR with background** (invert the outline against whatever is underneath so it stays visible on any background). |
 | **Add to Memory** | Save the current selection + all current matches as an entry in the Memory list. See [Saved-match Memory](#saved-match-memory). |
 | **Double-click a Memory entry** | Revisit that saved search (re-selects its template region). |
 

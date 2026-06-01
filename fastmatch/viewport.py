@@ -272,6 +272,10 @@ class ImageViewport(QGraphicsView):
         self._pyramid: ImagePyramid | None = None
         self._pyramid_item: PyramidItem | None = None
         self._overlay: MatchOverlayItem | None = None
+        # Box appearance (View menu); kept on the viewport so it persists across
+        # set_image() (which rebuilds the overlay) and is re-applied below.
+        self._box_line_width = 1
+        self._box_xor = False
         self.tile_cache = TileCache(max_pixmaps=256, pinned_levels=2)
 
         # When True, base-image tiles render in BT.601 luminance (grayscale) at
@@ -319,6 +323,8 @@ class ImageViewport(QGraphicsView):
         self._scene.addItem(self._pyramid_item)
 
         self._overlay = MatchOverlayItem(doc.width, doc.height)
+        self._overlay.set_line_width(self._box_line_width)
+        self._overlay.set_xor(self._box_xor)
         self._scene.addItem(self._overlay)
 
         # Min scale: never zoom out further than the whole image fitting a small
@@ -390,6 +396,18 @@ class ImageViewport(QGraphicsView):
         if self._overlay is None:
             return 0
         return self._overlay.visible_count()
+
+    def set_box_line_width(self, px: int) -> None:
+        """Set the overlay box outline width (device px; persists across images)."""
+        self._box_line_width = max(1, int(px))
+        if self._overlay is not None:
+            self._overlay.set_line_width(self._box_line_width)
+
+    def set_box_xor(self, on: bool) -> None:
+        """Toggle XOR-with-background compositing for the overlay boxes."""
+        self._box_xor = bool(on)
+        if self._overlay is not None:
+            self._overlay.set_xor(self._box_xor)
 
     # ------------------------------------------------------ selection/template
     def template_rect(self) -> QRect | None:

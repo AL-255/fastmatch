@@ -30,7 +30,7 @@ import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QRect, Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
@@ -141,8 +141,9 @@ class MainWindow(QMainWindow):
         self._memory_dock.setWidget(self._memory)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._memory_dock)
 
-        # --- Toolbar -------------------------------------------------------
+        # --- Toolbar + menu bar -------------------------------------------
         self._build_toolbar()
+        self._build_menus()
 
         # --- Status bar ----------------------------------------------------
         self._cursor_label = QLabel("(-, -)", self)
@@ -215,6 +216,34 @@ class MainWindow(QMainWindow):
         )
         self._act_selftest.triggered.connect(self._on_self_test)
         tb.addAction(self._act_selftest)
+
+    def _build_menus(self) -> None:
+        """Menu bar — overlay box appearance lives under 'View > Match boxes'."""
+        view_menu = self.menuBar().addMenu("&View")
+        view_menu.addAction(self._act_fit)  # Fit (F), also on the toolbar
+        view_menu.addSeparator()
+
+        boxes_menu = view_menu.addMenu("Match &boxes")
+
+        # Line width: an exclusive set of presets (cosmetic device px).
+        width_menu = boxes_menu.addMenu("Line &width")
+        self._box_width_group = QActionGroup(self)
+        self._box_width_group.setExclusive(True)
+        for px in (1, 2, 3, 4, 6):
+            act = QAction(f"{px} px", self, checkable=True)
+            act.setChecked(px == 1)  # default 1 px
+            act.triggered.connect(lambda _checked, w=px: self._viewport.set_box_line_width(w))
+            self._box_width_group.addAction(act)
+            width_menu.addAction(act)
+
+        # XOR-with-background toggle.
+        self._act_box_xor = QAction("&XOR with background", self, checkable=True)
+        self._act_box_xor.setToolTip(
+            "Draw box outlines XORed with the pixels underneath, so they stay "
+            "visible on any background."
+        )
+        self._act_box_xor.toggled.connect(self._viewport.set_box_xor)
+        boxes_menu.addAction(self._act_box_xor)
 
     def _connect_signals(self) -> None:
         """Connect viewport/controller/panel signals per DESIGN.md §F.2."""

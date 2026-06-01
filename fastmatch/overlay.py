@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import numpy as np
 from PySide6.QtCore import QRect, QRectF, Qt
-from PySide6.QtGui import QColor, QPen
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QGraphicsItem, QStyleOptionGraphicsItem, QWidget
 
 # zValue must sit above the pyramid item (which paints at the default 0) so the
@@ -54,6 +54,11 @@ class MatchOverlayItem(QGraphicsItem):
         self._mask = np.empty((0,), dtype=bool)
         self._threshold = 0.85
         self._source_box: QRect | None = None
+
+        # Configurable box appearance (set from the View menu).
+        self._line_width = 1     # cosmetic pen width in DEVICE px (immune to zoom)
+        self._xor = False        # XOR the box pixels with the background (always
+                                 # visible regardless of underlying colour)
 
         self.setZValue(_OVERLAY_Z)
         # The overlay is purely decorative; it must never intercept mouse events
@@ -103,6 +108,28 @@ class MatchOverlayItem(QGraphicsItem):
         self._source_box = QRect(rect) if rect is not None else None
         self.update()
 
+    def set_line_width(self, px: int) -> None:
+        """Set the box outline width in device px (cosmetic; zoom-independent)."""
+        w = max(1, int(px))
+        if w == self._line_width:
+            return
+        self._line_width = w
+        self.update()
+
+    def set_xor(self, on: bool) -> None:
+        """Toggle XOR-with-background compositing for the boxes.
+
+        When on, box pixels are bitwise-XORed with whatever is underneath, so the
+        outline stays visible on any background (and inverts again if redrawn over
+        itself) — the classic CAD/selection look. When off, boxes are drawn as
+        solid coloured lines.
+        """
+        on = bool(on)
+        if on == self._xor:
+            return
+        self._xor = on
+        self.update()
+
     def visible_count(self) -> int:
         """Number of match boxes currently at/above threshold."""
         return int(self._mask.sum()) if self._mask.size else 0
@@ -140,8 +167,10 @@ class MatchOverlayItem(QGraphicsItem):
 
         Culling: ``option.exposedRect`` is in item (== scene == image) px. We
         build a vectorized numpy mask of boxes that intersect it (half-open
-        overlap test) and feed only those to ``drawRects``. A cosmetic pen
-        (width 0) keeps every line exactly 1 device px wide at any zoom.
+        overlap test) and feed only those to ``drawRects``. The pen is cosmetic,
+        so its configured width is in device px and immune to view scale; the
+        ``XOR`` mode (View menu) composites the lines onto the background with a
+        bitwise XOR so they stay visible over any colour.
         """
         exposed = option.exposedRect
         # Expand the cull window by 1px so boxes straddling the edge still draw.
@@ -150,10 +179,28 @@ class MatchOverlayItem(QGraphicsItem):
         ex1 = exposed.right() + 1.0
         ey1 = exposed.bottom() + 1.0
 
-        pen = QPen(_MATCH_COLOR)
-        pen.setCosmetic(True)  # width measured in device px, immune to view scale
-        pen.setWidth(0)
-        painter.setPen(pen)
+        # Save/restore so the composition mode never leaks to other items.
+        painter.save()
+        if self._xor:
+            # "XOR with background": invert the box pixels against whatever is
+            # underneath so the outline is visible on ANY background. True bitwise
+            # XOR (RasterOp_SourceXorDestination) is NOT supported by Qt's OpenGL
+            # paint engine (the viewport is a QOpenGLWidget) — it warns and draws
+            # nothing useful. CompositionMode_Difference IS GL-supported and gives
+            # the same effect: |dest - colour| per channel, which inverts against
+            # the background (e.g. the box vanishes to black over its own colour
+            # and pops everywhere else).
+            painter.setCompositionMode(
+                QPainter.CompositionMode.CompositionMode_Difference
+            )
+
+        def _pen(color: QColor) -> QPen:
+            p = QPen(color)
+            p.setCosmetic(True)  # width in device px, immune to view scale
+            p.setWidth(self._line_width)
+            return p
+
+        painter.setPen(_pen(_MATCH_COLOR))
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
         if self._boxes.shape[0] and self._mask.any():
@@ -188,8 +235,7 @@ class MatchOverlayItem(QGraphicsItem):
                 and sb.y() < ey1
                 and (sb.y() + sb.height()) > ey0
             ):
-                spen = QPen(_SOURCE_COLOR)
-                spen.setCosmetic(True)
-                spen.setWidth(0)
-                painter.setPen(spen)
+                painter.setPen(_pen(_SOURCE_COLOR))
                 painter.drawRect(QRectF(sb))
+
+        painter.restore()
