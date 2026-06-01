@@ -46,6 +46,31 @@ Matcher = engine_mod.Matcher
 cpu = pytest.mark.cpu
 
 
+@cpu
+@pytest.mark.parametrize(
+    "h,w,kh,kw",
+    [(200, 200, 48, 48), (101, 233, 33, 17), (64, 64, 16, 16),
+     (150, 90, 1, 48), (90, 150, 48, 1), (77, 77, 7, 1)],
+)
+def test_separable_max_filter_matches_dense_maxpool(h, w, kh, kw) -> None:
+    """The separable local-max prefilter is bit-identical to the dense 2-D pool.
+
+    ``_max_filter_2d`` replaces a stride-1 ``(kh x kw)`` ``max_pool2d`` (the
+    profiler's single biggest CPU cost) with two O(k) 1-D passes; this pins that
+    the optimization never changes which positions are flagged as local maxima.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    torch.manual_seed(h * 1000 + w + kh + kw)
+    x = torch.randn(h, w)
+    sep = engine_mod._max_filter_2d(x, kh, kw)  # noqa: SLF001
+    dense = F.max_pool2d(
+        x[None, None], kernel_size=(kh, kw), stride=1, padding=(kh // 2, kw // 2)
+    )[0, 0, :h, :w]
+    assert torch.equal(sep, dense)
+
+
 # --------------------------------------------------------------------------- #
 # Synthetic-image helpers (no dependency on loader.generate_sample so engine
 # behaviour is pinned independently of the generator's exact internals).
