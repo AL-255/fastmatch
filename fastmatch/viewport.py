@@ -132,6 +132,15 @@ class PyramidItem(QGraphicsItem):
         self._vp = viewport
         self._pyramid = pyramid
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        # CRITICAL for large images: ask Qt to set option.exposedRect to the
+        # actually-exposed (visible) region in paint(). WITHOUT this flag Qt
+        # defaults exposedRect to the WHOLE boundingRect (the entire image), so
+        # _paint_level would request EVERY tile of the level on every repaint —
+        # e.g. all 675 level-0 tiles of a 6177x6747 image. With a 256-tile cache
+        # the working set never fits, so tiles are evicted and re-decoded forever:
+        # perpetual churn that flickers and "breaks" zoom on big images. With the
+        # flag, a deep-zoom paint exposes ~1 tile and the cache settles.
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemUsesExtendedStyleOption, True)
 
     def boundingRect(self) -> QRectF:
         """Full image rect in scene px."""
