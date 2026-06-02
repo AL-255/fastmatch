@@ -306,3 +306,84 @@ def test_features_recover_repeated_instances_on_demo() -> None:
         f"feature matching recovered only {recovered}/{len(others)} repeated copies"
     )
     assert false_pos == 0, f"feature matching produced {false_pos} false positive(s)"
+
+
+# --------------------------------------------------------------------------- #
+# Channel mode (luminance vs rgb): the appearance verification is colour-aware.
+# --------------------------------------------------------------------------- #
+def _make_colorful_motif(rng: np.random.Generator, h: int = 120, w: int = 120) -> np.ndarray:
+    """Dense, **per-channel-independent** random colour field (h, w, 3) uint8.
+
+    The luminance is high-frequency (so ORB fires plenty of keypoints), while the
+    three channels are decorrelated — so a same-luminance *gray* copy correlates
+    only weakly in rgb (≈0.5) even though it is identical in luminance (=1.0).
+    """
+    bs = 3
+    cy, cx = h // bs, w // bs
+    field = rng.integers(30, 256, size=(cy, cx, 3)).astype(np.uint8)
+    return np.repeat(np.repeat(field, bs, 0), bs, 1)
+
+
+@cpu
+def test_features_rgb_verification_is_colour_aware() -> None:
+    """``channel_mode="rgb"`` rejects a same-luminance/different-colour decoy.
+
+    Scene: an upright colour motif (source), an identical **colour** copy, and a
+    **gray** copy with the *exact same luminance* but no chroma. Keypoint
+    detection is on luminance, so the gray decoy is detected/matched identically
+    to the colour copy and is *proposed* in both modes. The difference is the
+    appearance verification:
+
+      * **luminance** mode -> the gray decoy correlates perfectly (ZNCC=1), so it
+        IS recovered (same as the colour copy);
+      * **rgb** mode -> the per-channel-summed NCC against the *colour* template
+        drops well below the accept floor for the chroma-less decoy, so it is
+        rejected — while the genuine colour copy (ZNCC=1) is still recovered.
+
+    This pins that rgb feature matching genuinely uses colour (not just luminance).
+    """
+    rng = np.random.default_rng(7)
+    motif = _make_colorful_motif(rng)
+    mh, mw = motif.shape[:2]
+    # Gray decoy: identical BT.601 luminance, zero chroma (R=G=B=luminance).
+    lum = motif[:, :, 0] * 0.299 + motif[:, :, 1] * 0.587 + motif[:, :, 2] * 0.114
+    lum_u8 = np.clip(np.rint(lum), 0, 255).astype(np.uint8)
+    decoy = np.repeat(lum_u8[:, :, None], 3, axis=2)
+
+    img = _make_background(mh + 40, 20 + 3 * (mw + 40), rng)
+    sx, tx, dx = 20, 20 + (mw + 40), 20 + 2 * (mw + 40)
+    y = 20
+    img[y : y + mh, sx : sx + mw] = motif       # source (colour)
+    img[y : y + mh, tx : tx + mw] = motif       # true colour copy
+    img[y : y + mh, dx : dx + mw] = decoy        # same-luminance gray decoy
+    src_box = (sx, y, mw, mh)
+    true_box = (tx, y, mw, mh)
+    decoy_box = (dx, y, mw, mh)
+    template = np.ascontiguousarray(img[y : y + mh, sx : sx + mw])
+
+    m = Matcher(device="cpu")
+    m.set_image(img)
+
+    def _run(mode: str):
+        params = MatchParams(
+            method="features", channel_mode=mode, threshold_floor=0.0,
+            feature_min_inliers=8, feature_max_instances=20,
+        )
+        return m.match(template, params, exclude_box=src_box)
+
+    def _hits(results, box):
+        return [r for r in results if _iou((r.x, r.y, r.w, r.h), box) >= 0.5]
+
+    lum_res = _run("luminance")
+    assert _hits(lum_res, true_box), "luminance mode missed the colour copy"
+    assert _hits(lum_res, decoy_box), "luminance mode should match the same-luminance decoy"
+
+    rgb_res = _run("rgb")
+    assert all(0.0 <= r.score <= 1.0 for r in rgb_res)
+    assert _hits(rgb_res, true_box), "rgb mode missed the genuine colour copy"
+    assert not _hits(rgb_res, decoy_box), (
+        "rgb mode should REJECT the chroma-less decoy (it differs in colour)"
+    )
+    # Source region excluded in both modes.
+    for r in rgb_res:
+        assert _iou((r.x, r.y, r.w, r.h), src_box) <= MatchParams().exclude_iou

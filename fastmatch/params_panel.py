@@ -9,13 +9,17 @@ matching ``DESIGN.md`` §H — CUDA scales ``(0.8, 0.9, 1.0, 1.1, 1.25)``, CPU
 ``(1.0,)``.
 
 A **Method** selector sits at the top (``DESIGN.md`` §J.5). The convolution
-methods (``ncc``/``ssd``/``ccorr``) share the GPU tiled machinery and expose the
-scale + channel controls; ``features`` (ORB/AKAZE/SIFT + RANSAC homography) is
-inherently scale/rotation tolerant and grayscale, so it instead exposes a
-detector + minimum-inliers control. The two control sets are swapped with a
-``QStackedWidget`` so only the relevant knobs are visible. The ``features``
-option is disabled (greyed, with an install hint) when OpenCV is not importable;
-we probe ``import cv2`` once at construction and *never* hard-depend on it.
+methods (``ncc``/``ssd``/``ccorr``) share the GPU tiled machinery and expose a
+scale-search control; ``features`` (ORB/AKAZE/SIFT, propose + appearance-verify)
+is inherently scale/rotation tolerant, so it instead exposes a detector +
+match-count control. Those method-specific sets are swapped with a
+``QStackedWidget`` so only the relevant knobs are visible. The **channel mode**
+(luminance/rgb) is common to all methods — it lives in the always-visible params
+box (conv methods combine the channels before normalizing; the feature method's
+appearance verification becomes colour-aware while detection stays grayscale).
+The ``features`` option is disabled (greyed, with an install hint) when OpenCV is
+not importable; we probe ``import cv2`` once at construction and *never*
+hard-depend on it.
 
 Threshold is special: it is a *live UI filter* (the engine returns everything at
 or above ``threshold_floor`` and the overlay filters up to ``threshold`` with no
@@ -46,12 +50,18 @@ from PySide6.QtWidgets import (
 )
 
 from .types import (
+    CHANNEL_MODES,
+    CHANNEL_NAMES,
     CONV_METHODS,
     METHOD_LABELS,
     METHODS,
     MatchParams,
     active_orientations,
+    normalize_weights,
 )
+
+#: Channel-weight slider resolution (ticks per slider; value/100 == the weight).
+_WEIGHT_TICKS = 100
 
 # Default multi-scale grids (DESIGN.md §H). CPU stays single-scale to avoid the
 # len(scales)x cost on a backend that is already minutes-slow.
@@ -206,15 +216,32 @@ class ParamsPanel(QWidget):
         self._max_results.valueChanged.connect(self._on_param_changed)
         form.addRow("Max results", self._max_results)
 
-        # Channel mode combo: luminance (fast, default) or rgb. Conv-only; the
-        # feature path is grayscale, so this lives in the conv control page.
+        # Channel mode combo: luminance (fast, default), rgb, or ycbcr. Applies to
+        # ALL methods — the conv methods combine the channels before normalizing,
+        # and the feature method's appearance verification becomes colour-aware
+        # (detection stays grayscale) — so it lives in the always-visible params box.
         self._channel_mode = QComboBox(self)
-        self._channel_mode.addItems(["luminance", "rgb"])
+        self._channel_mode.addItems(list(CHANNEL_MODES))
         self._channel_mode.setToolTip(
-            "luminance: single-channel NCC (3x less VRAM). rgb: combine all three "
-            "channels before normalizing."
+            "luminance: single BT.601 luma plane (faster, less VRAM). rgb / ycbcr: "
+            "weighted multi-channel matching (per-channel weights below) — applies "
+            "to the conv methods and feature matching's appearance verification."
         )
-        self._channel_mode.currentIndexChanged.connect(self._on_param_changed)
+        self._channel_mode.currentIndexChanged.connect(self._on_channel_mode_changed)
+        form.addRow("Channel mode", self._channel_mode)
+
+        # Per-channel weight sliders for the multi-channel modes (one group each;
+        # only the active mode's group is shown). The three sliders are relative
+        # weights; the matcher normalizes them to sum to 1.0 and the readout shows
+        # the normalized values. Default equal weights == unweighted multi-channel.
+        self._rgb_weight_box, self._rgb_weight_sliders, self._rgb_weight_readout = (
+            self._make_weight_group("rgb")
+        )
+        self._ycbcr_weight_box, self._ycbcr_weight_sliders, self._ycbcr_weight_readout = (
+            self._make_weight_group("ycbcr")
+        )
+        form.addRow(self._rgb_weight_box)
+        form.addRow(self._ycbcr_weight_box)
 
         root.addWidget(params_box)
 
@@ -224,12 +251,10 @@ class ParamsPanel(QWidget):
         # change so only the relevant knobs are visible (DESIGN.md §J.5).
         self._method_stack = QStackedWidget(self)
 
-        # Page 0: convolution-only controls.
+        # Page 0: convolution-only controls (scale search). Channel mode moved to
+        # the always-visible params box above (it now applies to features too).
         conv_box = QGroupBox("Scale search", self)
         conv_layout = QVBoxLayout(conv_box)
-        conv_form = QFormLayout()
-        conv_form.addRow("Channel mode", self._channel_mode)
-        conv_layout.addLayout(conv_form)
         self._multiscale = QCheckBox("Search multiple scales", self)
         # Always connect the signal (even though it starts disabled on CPU) so it
         # works after a runtime CPU->CUDA engine switch; enable/checked/tooltip are
@@ -309,6 +334,8 @@ class ParamsPanel(QWidget):
         self._sync_threshold_label()
         self._sync_orientation_label()
         self._sync_method_page()
+        self._sync_weight_readouts()
+        self._sync_weight_visibility()
         self.set_match_count(0)
 
     # ------------------------------------------------------------------ helpers
@@ -379,6 +406,72 @@ class ParamsPanel(QWidget):
     def _sync_method_page(self) -> None:
         """Show the control page (conv vs features) matching the current method."""
         self._method_stack.setCurrentIndex(0 if self._is_conv_method() else 1)
+
+    # ------------------------------------------------------- channel weights
+    def _make_weight_group(self, mode: str):
+        """Build a 3-slider weight group for ``mode`` ("rgb" / "ycbcr").
+
+        Returns ``(box, sliders, readout)``. The sliders are relative weights
+        (0..``_WEIGHT_TICKS``); the matcher normalizes them to sum to 1.0 and the
+        readout shows the normalized values. Defaults track ``MatchParams`` (equal
+        weights == unweighted multi-channel). Signals are connected AFTER the
+        initial ``setValue`` so construction never emits.
+        """
+        names = CHANNEL_NAMES[mode]
+        init = (
+            MatchParams().rgb_weights if mode == "rgb" else MatchParams().ycbcr_weights
+        )
+        box = QGroupBox(f"{mode.upper()} channel weights", self)
+        lay = QFormLayout(box)
+        sliders: list[QSlider] = []
+        for i, nm in enumerate(names):
+            s = QSlider(Qt.Orientation.Horizontal, self)
+            s.setRange(0, _WEIGHT_TICKS)
+            s.setValue(int(round(float(init[i]) * _WEIGHT_TICKS)))
+            s.setToolTip(
+                f"Relative weight of the {nm} channel "
+                "(the three are normalized to sum to 1.0)."
+            )
+            s.valueChanged.connect(self._on_weight_changed)
+            lay.addRow(nm, s)
+            sliders.append(s)
+        readout = QLabel(self)
+        readout.setTextFormat(Qt.TextFormat.PlainText)
+        lay.addRow("", readout)
+        return box, sliders, readout
+
+    def _weights_for(self, mode: str) -> tuple[float, float, float]:
+        """Normalized weights from the ``mode`` group's sliders (sum to 1.0)."""
+        sliders = self._rgb_weight_sliders if mode == "rgb" else self._ycbcr_weight_sliders
+        return normalize_weights([s.value() for s in sliders], 3)  # type: ignore[return-value]
+
+    def _sync_weight_readouts(self) -> None:
+        """Refresh both groups' normalized-weight readout labels."""
+        for mode, readout in (
+            ("rgb", self._rgb_weight_readout),
+            ("ycbcr", self._ycbcr_weight_readout),
+        ):
+            w = self._weights_for(mode)
+            names = CHANNEL_NAMES[mode]
+            readout.setText(
+                "  ".join(f"{n} {v:.2f}" for n, v in zip(names, w)) + "   (sum 1.00)"
+            )
+
+    def _sync_weight_visibility(self) -> None:
+        """Show only the active multi-channel mode's weight group (none for luma)."""
+        mode = self._channel_mode.currentText()
+        self._rgb_weight_box.setVisible(mode == "rgb")
+        self._ycbcr_weight_box.setVisible(mode == "ycbcr")
+
+    def _on_channel_mode_changed(self, *args: object) -> None:
+        """Channel mode switched: show the right weight group, then emit."""
+        self._sync_weight_visibility()
+        self._on_param_changed()
+
+    def _on_weight_changed(self, *args: object) -> None:
+        """A weight slider moved: refresh the readout, then emit (re-runs)."""
+        self._sync_weight_readouts()
+        self._on_param_changed()
 
     # ------------------------------------------------------------------- slots
     def _on_method_changed(self, *args: object) -> None:
@@ -455,6 +548,8 @@ class ParamsPanel(QWidget):
             device="auto",
             compute_dtype=MatchParams.compute_dtype,
             channel_mode=self._channel_mode.currentText(),
+            rgb_weights=self._weights_for("rgb"),
+            ycbcr_weights=self._weights_for("ycbcr"),
             method=self._current_method(),
             enable_rotation=self._enable_rotation.isChecked(),
             enable_flipping=self._enable_flipping.isChecked(),

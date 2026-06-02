@@ -46,6 +46,7 @@ from .types import (
     MatchParams,
     active_orientations,
     apply_orientation,
+    normalize_weights,
 )
 
 # torchvision is an *optional* dependency: we use its fused NMS kernel when it
@@ -64,6 +65,14 @@ except Exception:  # ImportError, or a broken/partial torchvision install
 
 #: BT.601 luminance weights (R, G, B). Matches the convention stated in §D.1.
 _BT601 = (0.299, 0.587, 0.114)
+
+#: Full-range BT.601 (JPEG) RGB[0,255] -> YCbCr[0,255]: rows are (wR, wG, wB, bias)
+#: for Y, Cb, Cr. Used to derive the staged ycbcr planes for channel_mode="ycbcr".
+_YCBCR_FROM_RGB = (
+    (0.299, 0.587, 0.114, 0.0),
+    (-0.168736, -0.331264, 0.5, 128.0),
+    (0.5, -0.418688, -0.081312, 128.0),
+)
 
 #: Below this NCC numerator threshold a template is considered featureless and
 #: rejected (variance on the [0,1]-normalized template). Mirrors §H ``var_floor``.
@@ -354,6 +363,11 @@ class Matcher:
         # _match_tile. None for grayscale sources (rgb mode falls back to
         # luminance there since there is no color information to sum).
         self._rgb: list[torch.Tensor] | None = None
+        # Per-channel Y,Cb,Cr image planes (each (1,1,H,W) UINT8, BT.601 full-range),
+        # for channel_mode="ycbcr". Derived LAZILY from self._rgb on the first ycbcr
+        # query (kept uint8 like _rgb to honour the gigapixel contract) and cached;
+        # None until used / for grayscale sources. Invalidated by set_image().
+        self._ycbcr: list[torch.Tensor] | None = None
         self._h: int = 0
         self._w: int = 0
 
@@ -366,9 +380,17 @@ class Matcher:
         # left empty so match() transparently uses the full path.
         self._pyr_lum: list[torch.Tensor] | None = None
         self._pyr_rgb: list[list[torch.Tensor]] | None = None
+        # Matching ycbcr pyramid, built lazily from self._ycbcr the first time the
+        # pyramid path runs in ycbcr mode (mirrors _pyr_rgb). None otherwise.
+        self._pyr_ycbcr: list[list[torch.Tensor]] | None = None
         # Host-side uint8 luminance for the OpenCV feature path (§J.3); the conv
         # methods never read it. Populated by set_image().
         self._lum_u8: np.ndarray | None = None
+        # Host-side uint8 RGB (H,W,3) for the feature path's ``channel_mode="rgb"``
+        # appearance verification. Built lazily from the staged per-channel planes
+        # on the first rgb feature query and cached; None until then and for
+        # grayscale sources (rgb mode falls back to luminance there).
+        self._rgb_u8: np.ndarray | None = None
 
         # Lazily-built OpenCV feature backend (only when method=="features"). It
         # owns a per-(image, detector) cache of downsampled-image keypoints/
@@ -449,6 +471,11 @@ class Matcher:
         # rebuilt lazily on the next match() against the new staged luminance/rgb.
         self._pyr_lum = None
         self._pyr_rgb = None
+        # ...the lazily-derived ycbcr planes + their pyramid...
+        self._ycbcr = None
+        self._pyr_ycbcr = None
+        # ...and the host RGB the feature path's rgb mode reconstructs lazily.
+        self._rgb_u8 = None
 
         # A new image invalidates any cached image features (§J.3/§J.4). The
         # matcher object itself is reused so its detector cache key still applies.
@@ -463,6 +490,53 @@ class Matcher:
         wr, wg, wb = _BT601
         lum = rgb[:, :, 0] * wr + rgb[:, :, 1] * wg + rgb[:, :, 2] * wb
         return lum / 255.0
+
+    def _ensure_ycbcr(self) -> bool:
+        """Lazily derive the staged Y,Cb,Cr planes from the RGB planes.
+
+        Returns ``True`` when ycbcr planes are available (3-channel source). The
+        planes are computed once from :attr:`_rgb` (BT.601 full-range), stored as
+        ``uint8`` ``(1,1,H,W)`` like :attr:`_rgb` (gigapixel-friendly), and cached
+        until :meth:`set_image` invalidates them. ``False`` for grayscale sources,
+        so ycbcr mode transparently falls back to luminance.
+        """
+        if self._ycbcr is not None:
+            return True
+        if self._rgb is None:
+            return False
+        r, g, b = (p.to(torch.float32) for p in self._rgb)
+        planes: list[torch.Tensor] = []
+        for wr, wg, wb, bias in _YCBCR_FROM_RGB:
+            c = wr * r + wg * g + wb * b + bias
+            planes.append(c.clamp(0.0, 255.0).round().to(torch.uint8))
+        self._ycbcr = planes
+        return True
+
+    def _ensure_ycbcr_pyramid(self) -> list[list[torch.Tensor]] | None:
+        """Build (lazily, once) the ycbcr image pyramid (mirrors :attr:`_pyr_rgb`).
+
+        Pools each Y/Cb/Cr plane in fp32 ``[0,1]`` to the same level count as the
+        luminance pyramid, so the level-``ell`` ROI conv runs against the same
+        normalized signal as the template channels. Returns ``None`` (caller uses
+        the full path) if ycbcr planes / the lum pyramid are absent, or on OOM.
+        """
+        if self._pyr_ycbcr is not None:
+            return self._pyr_ycbcr
+        if self._ycbcr is None or self._pyr_lum is None:
+            return None
+        try:
+            base = [p.to(torch.float32) / 255.0 for p in self._ycbcr]
+            levels: list[list[torch.Tensor]] = [base]
+            for _ in range(len(self._pyr_lum) - 1):
+                prev = levels[-1]
+                levels.append([F.avg_pool2d(p, kernel_size=2) for p in prev])
+            self._pyr_ycbcr = levels
+            return levels
+        except torch.cuda.OutOfMemoryError:
+            self._pyr_ycbcr = None
+            if self._device.type == "cuda":
+                torch.cuda.empty_cache()
+            return None
 
     # -- matching ------------------------------------------------------------
 
@@ -510,11 +584,25 @@ class Matcher:
         # Channel mode can be overridden per-call by params (the controller maps
         # the UI choice onto MatchParams); fall back to the constructor default.
         channel_mode = params.channel_mode or self._channel_mode
-        # rgb mode is only meaningful when both the image and template carry
+        # rgb/ycbcr modes are only meaningful when both the image and template carry
         # color; otherwise transparently fall back to luminance so the per-channel
-        # pairing in _score_map always lines up.
-        if channel_mode == "rgb" and (self._rgb is None or template.ndim != 3):
+        # pairing in _score_map always lines up. ycbcr additionally needs its
+        # (lazily-derived) Y,Cb,Cr planes — if they cannot be built, fall back too.
+        if channel_mode in ("rgb", "ycbcr") and (self._rgb is None or template.ndim != 3):
             channel_mode = "luminance"
+        if channel_mode == "ycbcr" and not self._ensure_ycbcr():
+            channel_mode = "luminance"
+
+        # Per-channel weights for the active multi-channel mode (normalized to sum
+        # to 1 so equal weights == the unweighted multi-channel behaviour). The
+        # weights ride on the prepared template's per-channel dicts so the tiled /
+        # pyramid machinery needs no new plumbing (see _prepare_template).
+        if channel_mode == "rgb":
+            weights = normalize_weights(params.rgb_weights, 3)
+        elif channel_mode == "ycbcr":
+            weights = normalize_weights(params.ycbcr_weights, 3)
+        else:
+            weights = (1.0,)
 
         # Orientation search (dihedral D4, §J / active_orientations). With both
         # checkboxes off this is exactly ("R0",) and the code below takes the
@@ -529,7 +617,7 @@ class Matcher:
             # --- legacy single-orientation path (no behaviour change) ----------
             # Prepare the device-resident template channels once (validated here).
             # The variance-floor rejection is gated on method (NCC only) inside.
-            tmpl = self._prepare_template(template, channel_mode, method)
+            tmpl = self._prepare_template(template, channel_mode, method, weights)
             th0, tw0 = tmpl["th"], tmpl["tw"]
             cands = self._search_template(tmpl, params, channel_mode, method, cancel, progress)
             if cancel is not None and cancel():
@@ -548,7 +636,7 @@ class Matcher:
             if cancel is not None and cancel():
                 return []
             t_oriented = apply_orientation(template, orient)
-            tmpl = self._prepare_template(t_oriented, channel_mode, method)
+            tmpl = self._prepare_template(t_oriented, channel_mode, method, weights)
             th0, tw0 = tmpl["th"], tmpl["tw"]
 
             # Scope the per-orientation progress into this orientation's slice of
@@ -621,6 +709,7 @@ class Matcher:
             # the degradation ladder run the plain full-resolution search.
             self._pyr_lum = None
             self._pyr_rgb = None
+            self._pyr_ycbcr = None
             cands = self._degrade_after_oom(
                 tmpl, scales, params, channel_mode, method, cancel, progress
             )
@@ -659,21 +748,31 @@ class Matcher:
     # -- template preparation / validation -----------------------------------
 
     def _prepare_template(
-        self, template: np.ndarray, channel_mode: str, method: str = "ncc"
+        self,
+        template: np.ndarray,
+        channel_mode: str,
+        method: str = "ncc",
+        weights: tuple[float, ...] = (1.0,),
     ) -> dict:
         """Validate and stage the template channels on the compute device.
 
         Returns a dict with the per-channel ``[0,1]`` template tensors (one for
-        luminance mode, three for rgb mode) plus ``th``/``tw``. Per-scale
-        zero-mean / norm are derived later in :meth:`_scaled_template`.
+        luminance mode, three for rgb/ycbcr mode), the per-channel ``weights``
+        (aligned with ``channels``, already normalized to sum to 1), and
+        ``th``/``tw``. Per-scale zero-mean / norm are derived later in
+        :meth:`_scaled_template`; the per-channel weight rides on each scaled
+        channel dict so the score machinery combines the channels weighted.
 
         Args:
             template: ``(th, tw, 3)`` uint8 RGB or ``(th, tw)`` uint8 crop.
-            channel_mode: ``"luminance"`` or ``"rgb"`` (controls channel staging).
+            channel_mode: ``"luminance"`` / ``"rgb"`` / ``"ycbcr"`` (controls the
+                channels staged: one luma plane, R/G/B, or Y/Cb/Cr).
             method: The matching method (§J.2). The variance-floor rejection only
                 applies to ``"ncc"`` — SSD/CCORR are *defined* to handle flat /
                 low-variance templates (that is their whole use case, §J.1/§J.2),
                 so they must not raise here.
+            weights: Per-channel weights for the multi-channel modes (luminance
+                ignores them — a single weight-1 channel).
 
         Raises:
             ValueError: side ``< 8`` px, or (``method=="ncc"`` only, per H1/§H)
@@ -696,17 +795,33 @@ class Matcher:
             )
 
         channels: list[torch.Tensor] = []
-        if channel_mode == "rgb" and template.ndim == 3:
-            rgb = np.asarray(template, dtype=np.float32) / 255.0
-            for c in range(3):
-                channels.append(torch.from_numpy(np.ascontiguousarray(rgb[:, :, c])).to(self._device))
+        if channel_mode in ("rgb", "ycbcr") and template.ndim == 3:
+            if channel_mode == "ycbcr":
+                # BT.601 full-range Y,Cb,Cr in [0,1] (matches the staged image
+                # planes; the /255 keeps Cb/Cr centred near 0.5 — NCC subtracts the
+                # mean, so the offset cancels).
+                rgbf = np.asarray(template, dtype=np.float32)
+                r, g, b = rgbf[:, :, 0], rgbf[:, :, 1], rgbf[:, :, 2]
+                planes = [
+                    (wr * r + wg * g + wb * b + bias) / 255.0
+                    for wr, wg, wb, bias in _YCBCR_FROM_RGB
+                ]
+            else:
+                rgbf = np.asarray(template, dtype=np.float32) / 255.0
+                planes = [rgbf[:, :, 0], rgbf[:, :, 1], rgbf[:, :, 2]]
+            for plane in planes:
+                channels.append(
+                    torch.from_numpy(np.ascontiguousarray(plane.astype(np.float32))).to(self._device)
+                )
+            chan_weights = list(normalize_weights(weights, 3))
         else:
-            # Luminance (or a genuinely grayscale template).
+            # Luminance (or a genuinely grayscale template) — single weight-1 plane.
             if template.ndim == 3:
                 lum = self._to_luminance(template)
             else:
                 lum = np.asarray(template, dtype=np.float32) / 255.0
             channels.append(torch.from_numpy(np.ascontiguousarray(lum)).to(self._device))
+            chan_weights = [1.0]
 
         # Variance floor: reject a near-flat template — but ONLY for NCC (§J.2).
         # NCC normalizes by the patch variance, so a featureless crop has an
@@ -724,7 +839,7 @@ class Matcher:
                     "select a more distinctive area, or use the SSD method"
                 )
 
-        return {"channels": channels, "th": th, "tw": tw}
+        return {"channels": channels, "th": th, "tw": tw, "weights": chan_weights}
 
     def _scaled_template(
         self, tmpl: dict, scale: float
@@ -758,8 +873,9 @@ class Matcher:
                 chans.append(r)
 
         n = float(sth * stw)
+        weights = tmpl.get("weights") or [1.0] * len(chans)
         per_channel: list[dict] = []
-        for c in chans:
+        for c, w in zip(chans, weights):
             mean = c.mean()
             tz = (c - mean)
             norm_tz = torch.sqrt((tz * tz).sum()).clamp(min=self._eps)
@@ -773,6 +889,7 @@ class Matcher:
                     "mean_t": mean,
                     "sum_t2": sum_t2,
                     "n": n,
+                    "weight": float(w),
                 }
             )
         return per_channel, sth, stw
@@ -822,8 +939,9 @@ class Matcher:
 
         sth, stw = pooled[0].shape[0], pooled[0].shape[1]
         n = float(sth * stw)
+        weights = tmpl.get("weights") or [1.0] * len(pooled)
         per_channel: list[dict] = []
-        for c in pooled:
+        for c, w in zip(pooled, weights):
             mean = c.mean()
             tz = c - mean
             norm_tz = torch.sqrt((tz * tz).sum()).clamp(min=self._eps)
@@ -835,6 +953,7 @@ class Matcher:
                     "mean_t": mean,
                     "sum_t2": sum_t2,
                     "n": n,
+                    "weight": float(w),
                 }
             )
         return per_channel, sth, stw
@@ -1040,6 +1159,7 @@ class Matcher:
         except torch.cuda.OutOfMemoryError:
             self._pyr_lum = None
             self._pyr_rgb = None
+            self._pyr_ycbcr = None
             if self._device.type == "cuda":
                 torch.cuda.empty_cache()
             return False
@@ -1049,12 +1169,17 @@ class Matcher:
     ) -> list[torch.Tensor]:
         """Image plane(s) at pyramid ``level`` matching the template channels.
 
-        Returns fp32 ``(1,1,Hl,Wl)`` slabs — three RGB planes when rgb mode is
-        active and the rgb pyramid is staged, else a single luminance plane —
-        paired positionally with ``per_channel`` exactly as :meth:`_match_tile`.
+        Returns fp32 ``(1,1,Hl,Wl)`` slabs — three RGB or Y,Cb,Cr planes when the
+        matching multi-channel pyramid is available, else a single luminance plane
+        — paired positionally with ``per_channel`` exactly as :meth:`_match_tile`.
+        The ycbcr pyramid is built lazily here on first use (mirrors _pyr_rgb).
         """
         if channel_mode == "rgb" and self._pyr_rgb is not None and channels == 3:
             return list(self._pyr_rgb[level])
+        if channel_mode == "ycbcr" and channels == 3:
+            pyr = self._ensure_ycbcr_pyramid()
+            if pyr is not None:
+                return list(pyr[level])
         assert self._pyr_lum is not None
         return [self._pyr_lum[level]]
 
@@ -1546,6 +1671,13 @@ class Matcher:
             img_planes = [
                 p[:, :, iy0:iy1, ix0:ix1].to(torch.float32) / 255.0 for p in self._rgb
             ]
+        elif channel_mode == "ycbcr" and self._ycbcr is not None and len(per_channel) == 3:
+            # Y,Cb,Cr planes are staged UINT8 (BT.601 full-range); same per-tile
+            # fp32 [0,1] conversion as rgb so they pair with the ycbcr template
+            # channels. The per-channel weights live on per_channel.
+            img_planes = [
+                p[:, :, iy0:iy1, ix0:ix1].to(torch.float32) / 255.0 for p in self._ycbcr
+            ]
         else:
             img_planes = [self._lum[:, :, iy0:iy1, ix0:ix1]]
 
@@ -1709,8 +1841,17 @@ class Matcher:
         ssd_sum: torch.Tensor | None = None         # Σ_c clamp(S2−2·cross_raw+sumT2, 0)
         flat: torch.Tensor | None = None            # featureless-window guard (NCC)
 
+        # Sum of the per-channel weights (== 1 for normalized multi-channel modes,
+        # == 1 for the single luminance channel). Used as the SSD normalizer so a
+        # weighted average of the per-channel squared error is taken.
+        sum_w = 0.0
         for img, ch in zip(img_planes, per_channel):
             img32 = img.to(torch.float32)
+            # Per-channel weight (luminance == 1.0, so the legacy path is a no-op
+            # multiply and stays bit-identical; multi-channel modes weight each
+            # channel's contribution to the combined score, §channel modes).
+            w = float(ch.get("weight", 1.0))
+            sum_w += w
 
             # Separable box filters give the windowed sum S1 and sum-of-squares
             # S2 for this channel in fp32 accumulators (§D.1).
@@ -1739,19 +1880,22 @@ class Matcher:
             # cross_raw = cross_z + meanT · S1.
             cross_raw = cr + ch["mean_t"] * s1
 
-            cross_z_sum = cr if cross_z_sum is None else (cross_z_sum + cr)
-            cross_raw_sum = cross_raw if cross_raw_sum is None else (cross_raw_sum + cross_raw)
-            s2_sum = s2 if s2_sum is None else (s2_sum + s2)
-            sum_t2_sum = ch["sum_t2"] if sum_t2_sum is None else (sum_t2_sum + ch["sum_t2"])
+            # Each per-channel contribution is scaled by its weight before the
+            # cross-channel sum (the single division then yields a weighted NCC /
+            # CCORR; SSD divides by n·Σw below). For NCC/CCORR a common scale on
+            # numerator and denominator cancels, so equal weights == unweighted.
+            cr_w = w * cr
+            cross_raw_w = w * cross_raw
+            s2_w = w * s2
+            sum_t2_w = w * ch["sum_t2"]
+            denom_c = w * (torch.sqrt(n_var) * ch["norm_tz"])
+            ssd_c = w * (s2 - 2.0 * cross_raw + ch["sum_t2"]).clamp(min=0.0)
 
-            # NCC per-channel denominator term sqrt(n*varI)*normTz, summed across
-            # channels BEFORE dividing (the legacy contract — kept bit-identical).
-            denom_c = torch.sqrt(n_var) * ch["norm_tz"]
+            cross_z_sum = cr_w if cross_z_sum is None else (cross_z_sum + cr_w)
+            cross_raw_sum = cross_raw_w if cross_raw_sum is None else (cross_raw_sum + cross_raw_w)
+            s2_sum = s2_w if s2_sum is None else (s2_sum + s2_w)
+            sum_t2_sum = sum_t2_w if sum_t2_sum is None else (sum_t2_sum + sum_t2_w)
             ncc_denom_sum = denom_c if ncc_denom_sum is None else (ncc_denom_sum + denom_c)
-
-            # SSD per channel: sum_w (I-T)^2 = S2 - 2·cross_raw + sumT2, summed
-            # across channels (§J.2 ssd RGB rule), clamp removes fp negatives.
-            ssd_c = (s2 - 2.0 * cross_raw + ch["sum_t2"]).clamp(min=0.0)
             ssd_sum = ssd_c if ssd_sum is None else (ssd_sum + ssd_c)
 
         assert (
@@ -1774,6 +1918,7 @@ class Matcher:
             "flat": flat,
             "n": n,
             "channels": channels,
+            "sum_w": sum_w if sum_w > 0 else 1.0,
         }
 
     def _score_from_terms(self, method: str, terms: dict) -> torch.Tensor:
@@ -1805,8 +1950,11 @@ class Matcher:
 
         if method == "ssd":
             # Normalized squared difference -> flat-friendly similarity score.
-            # rmse = sqrt(SSD / (n · channels)); score = clamp(1 - rmse, 0, 1).
-            rmse = torch.sqrt(terms["ssd"] / (terms["n"] * terms["channels"]))
+            # rmse = sqrt(weighted-SSD / (n · Σw)); score = clamp(1 - rmse, 0, 1).
+            # The per-channel SSD is weight-scaled (Σ w_c SSD_c), so dividing by
+            # n·Σw_c takes a weighted average per-pixel squared error. For a single
+            # channel (Σw=1) or equal weights this matches the legacy n·channels.
+            rmse = torch.sqrt(terms["ssd"] / (terms["n"] * terms.get("sum_w", terms["channels"])))
             return (1.0 - rmse).clamp(min=0.0, max=1.0)
 
         raise ValueError(f"unsupported convolution method {method!r}")
@@ -1899,6 +2047,7 @@ class Matcher:
         original_device = self._device
         original_lum = self._lum
         original_rgb = self._rgb
+        original_ycbcr = self._ycbcr
 
         # Rung 1-2: shrink the tile (only if not already forced by the caller).
         if original_forced is None:
@@ -1924,11 +2073,11 @@ class Matcher:
         except torch.cuda.OutOfMemoryError:
             pass
 
-        # Rung 4: CPU fallback. Move the staged luminance, the staged RGB planes
-        # (channel_mode="rgb" reads these in _match_tile), and the template
-        # channels to CPU, run there, then restore CUDA state for subsequent jobs.
-        # Leaving the RGB planes on the GPU here would crash the CPU run with a
-        # device mismatch (CUDA image × CPU template) in _cross_spatial/_cross_fft.
+        # Rung 4: CPU fallback. Move the staged luminance, the staged RGB / YCbCr
+        # planes (channel_mode rgb/ycbcr read these in _match_tile), and the
+        # template channels to CPU, run there, then restore CUDA state. Leaving any
+        # staged plane on the GPU would crash the CPU run with a device mismatch
+        # (CUDA image × CPU template) in _cross_spatial/_cross_fft.
         torch.cuda.empty_cache()
         try:
             self._device = torch.device("cpu")
@@ -1937,10 +2086,14 @@ class Matcher:
             self._rgb = (
                 [p.to("cpu") for p in original_rgb] if original_rgb is not None else None
             )
+            self._ycbcr = (
+                [p.to("cpu") for p in original_ycbcr] if original_ycbcr is not None else None
+            )
             cpu_tmpl = {
                 "channels": [c.to("cpu") for c in tmpl["channels"]],
                 "th": tmpl["th"],
                 "tw": tmpl["tw"],
+                "weights": tmpl.get("weights"),
             }
             return self._search_all_scales(
                 cpu_tmpl, scales, params, channel_mode, method, cancel, progress
@@ -1951,6 +2104,7 @@ class Matcher:
             self._forced_core_tile = original_forced
             self._lum = original_lum
             self._rgb = original_rgb
+            self._ycbcr = original_ycbcr
 
     # -- feature matching delegation (§J.3 / §J.4) ---------------------------
 
@@ -1971,6 +2125,14 @@ class Matcher:
         keypoints/descriptors per detector, invalidated by :meth:`set_image`.
         Feature matching always runs on CPU even when the conv methods use CUDA.
 
+        Keypoint detection is always on luminance (ORB/AKAZE/SIFT are grayscale),
+        but ``channel_mode="rgb"`` makes the *appearance verification* color-aware:
+        we reconstruct a host ``(H,W,3)`` RGB array once from the staged per-channel
+        planes (cached in ``self._rgb_u8``) and hand it to the backend, which then
+        verifies each proposal with a per-channel-summed NCC (mirroring the conv
+        path's rgb rule). For a grayscale source there is no color, so rgb mode
+        transparently falls back to luminance.
+
         Raises:
             RuntimeError: if OpenCV is not importable (surfaced from the backend).
         """
@@ -1988,10 +2150,27 @@ class Matcher:
             # treating the current staged luminance as the active image.
             self._feature_matcher.invalidate_image()
 
+        # rgb/ycbcr verification needs a host (H,W,3) RGB array (the feature path
+        # converts it to YCbCr itself). Reconstruct it once from the staged
+        # per-channel planes (works whether they live on CPU or CUDA) and cache it;
+        # only built when a colour mode is actually requested on a colour image.
+        channel_mode = params.channel_mode or self._channel_mode
+        image_rgb = None
+        if channel_mode in ("rgb", "ycbcr") and self._rgb is not None:
+            if self._rgb_u8 is None:
+                self._rgb_u8 = np.ascontiguousarray(
+                    np.stack(
+                        [p[0, 0].detach().to("cpu").numpy() for p in self._rgb],
+                        axis=-1,
+                    )
+                )
+            image_rgb = self._rgb_u8
+
         return self._feature_matcher.match(
             template,
             self._lum_u8,
             params,
+            image_rgb=image_rgb,
             exclude_box=exclude_box,
             cancel=cancel,
             progress=progress,

@@ -147,6 +147,49 @@ METHOD_LABELS: dict[str, str] = {
 CONV_METHODS: frozenset[str] = frozenset({"ncc", "ssd", "ccorr"})
 
 
+# --- Channel modes (colour space the matcher scores in) ---------------------
+# Every method matches on one or more channels of the selected colour space; the
+# per-channel score contributions are combined with user weights that sum to 1.
+#   * luminance -> a single BT.601 luma plane (the fast default; no weights).
+#   * rgb       -> the three R,G,B channels, weighted by ``rgb_weights``.
+#   * ycbcr     -> the three Y,Cb,Cr channels (BT.601), weighted by ``ycbcr_weights``.
+# Multi-channel modes are genuinely multi-channel (each channel correlated
+# separately, contributions summed) — NOT a single projected plane — so colour
+# differences are discriminative. Equal weights reproduce the unweighted multi-
+# channel behaviour exactly.
+CHANNEL_MODES: tuple[str, ...] = ("luminance", "rgb", "ycbcr")
+
+CHANNEL_MODE_LABELS: dict[str, str] = {
+    "luminance": "luminance (single BT.601 luma plane)",
+    "rgb": "rgb (weighted R, G, B channels)",
+    "ycbcr": "ycbcr (weighted Y, Cb, Cr channels)",
+}
+
+#: Per-mode channel names, in order, for the weight sliders / UI labels.
+CHANNEL_NAMES: dict[str, tuple[str, ...]] = {
+    "luminance": ("Y",),
+    "rgb": ("R", "G", "B"),
+    "ycbcr": ("Y", "Cb", "Cr"),
+}
+
+
+def normalize_weights(weights, n: int = 3) -> tuple[float, ...]:
+    """Clamp to non-negative and rescale ``weights`` so they sum to 1.0.
+
+    Pads/truncates to ``n`` entries. An all-zero (or empty) input falls back to
+    equal weights so a mode is never silently disabled. The matcher always
+    normalizes, so the UI's sum-to-1 constraint is a convenience, not a contract
+    the engine depends on.
+    """
+    w = [max(0.0, float(x)) for x in (weights or ())][:n]
+    while len(w) < n:
+        w.append(0.0)
+    s = sum(w)
+    if s <= 1e-9:
+        return tuple(1.0 / n for _ in range(n))
+    return tuple(x / s for x in w)
+
+
 @dataclass(frozen=True)
 class Match:
     """A single detected instance, in full-resolution image pixels.
@@ -194,7 +237,16 @@ class MatchParams:
     exclude_iou: float = 0.30        # drop hits overlapping the source box by more than this
     device: str = "auto"            # "auto" | "cuda" | "cpu"
     compute_dtype: str = "float32"  # "float32" | "float16" (accumulators always fp32)
-    channel_mode: str = "luminance"  # "luminance" | "rgb"
+    channel_mode: str = "luminance"  # "luminance" | "rgb" | "ycbcr" (see CHANNEL_MODES)
+
+    # --- Per-channel weights for the multi-channel modes (see CHANNEL_MODES) ----
+    # Used only when channel_mode is "rgb" / "ycbcr". The matcher normalizes them
+    # to sum to 1 (normalize_weights), so equal weights == the unweighted multi-
+    # channel behaviour. They weight each channel's contribution to the combined
+    # score (all methods, conv + features), letting the user emphasise, e.g.,
+    # chroma (Cb/Cr) to match by colour or a single RGB channel.
+    rgb_weights: tuple[float, float, float] = (1.0 / 3, 1.0 / 3, 1.0 / 3)
+    ycbcr_weights: tuple[float, float, float] = (1.0 / 3, 1.0 / 3, 1.0 / 3)
 
     # --- Matching method selection (see METHODS / METHOD_LABELS) ---------------
     # "ncc"/"ssd"/"ccorr" use the GPU tiled-convolution machinery (scales/NMS apply).
