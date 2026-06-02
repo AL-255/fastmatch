@@ -42,6 +42,7 @@ from .device import resolve_device
 from .types import (
     CONV_METHODS,
     METHODS,
+    SHAZAM_METHOD,
     Match,
     MatchParams,
     active_orientations,
@@ -398,6 +399,10 @@ class Matcher:
         # set_image() invalidates it. Kept as Any-typed to avoid importing the
         # feature module (and thus cv2) unless the feature path is exercised.
         self._feature_matcher = None  # type: ignore[var-annotated]
+        # Lazily-built experimental Shazam matcher (only when method=="shazam",
+        # which is disabled by default / not in the UI). It reuses the feature
+        # backend's dense ORB detection + cache, so it owns no per-image state.
+        self._shazam_matcher = None  # type: ignore[var-annotated]
 
     # -- public properties ---------------------------------------------------
 
@@ -574,6 +579,13 @@ class Matcher:
         method = params.method or "ncc"
         if method == "features":
             return self._match_features(
+                template, params, exclude_box=exclude_box, cancel=cancel, progress=progress
+            )
+        if method == SHAZAM_METHOD:
+            # Experimental, DISABLED-by-default landmark-pair-hash matcher: it is
+            # not in METHODS (never offered in the UI), but reachable when set
+            # explicitly so the approach stays kept + tested (see shazam_matcher.py).
+            return self._match_shazam(
                 template, params, exclude_box=exclude_box, cancel=cancel, progress=progress
             )
         if method not in CONV_METHODS:
@@ -2171,6 +2183,52 @@ class Matcher:
             self._lum_u8,
             params,
             image_rgb=image_rgb,
+            exclude_box=exclude_box,
+            cancel=cancel,
+            progress=progress,
+            scale_back=1,
+        )
+
+    def _match_shazam(
+        self,
+        template: np.ndarray,
+        params: MatchParams,
+        *,
+        exclude_box: tuple[int, int, int, int] | None,
+        cancel: Callable[[], bool] | None,
+        progress: Callable[[int], None] | None,
+    ) -> list[Match]:
+        """Delegate the experimental ``method="shazam"`` to the pair-hash backend.
+
+        DISABLED by default (``"shazam"`` is not in METHODS, so the UI never selects
+        it); reachable only when set explicitly. Reuses the feature backend's dense
+        ORB detection + per-image cache for the image keypoints, then runs the
+        landmark-pair-hash voting in :class:`~fastmatch.shazam_matcher.ShazamMatcher`.
+        Feature detection runs on CPU (OpenCV) even when the conv methods use CUDA.
+        """
+        if self._lum_u8 is None:
+            raise RuntimeError("Matcher.set_image() must be called before match()")
+        if self._feature_matcher is None:
+            from .feature_matcher import FeatureMatcher
+
+            self._feature_matcher = FeatureMatcher()
+            self._feature_matcher.invalidate_image()
+        if self._shazam_matcher is None:
+            from .shazam_matcher import ShazamMatcher
+
+            self._shazam_matcher = ShazamMatcher()
+
+        detector_name = getattr(params, "feature_detector", "orb") or "orb"
+        img_kps, img_desc = self._feature_matcher._ensure_image_features(
+            self._lum_u8, detector_name, 0, cancel
+        )
+        return self._shazam_matcher.match(
+            template,
+            self._lum_u8,
+            params,
+            feature_matcher=self._feature_matcher,
+            img_kps=img_kps,
+            img_desc=img_desc,
             exclude_box=exclude_box,
             cancel=cancel,
             progress=progress,

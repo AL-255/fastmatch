@@ -146,6 +146,14 @@ METHOD_LABELS: dict[str, str] = {
 # Methods whose score map is computed by the shared tiled-convolution machinery.
 CONV_METHODS: frozenset[str] = frozenset({"ncc", "ssd", "ccorr"})
 
+# Experimental "Shazam-style" landmark-pair-hash matcher. Intentionally NOT in
+# METHODS, so it never appears in the UI dropdown — it is DISABLED by default. The
+# engine still dispatches it when ``method == SHAZAM_METHOD`` is set explicitly,
+# so the approach is kept, importable and unit-tested. It underperforms feature
+# matching badly on this workload (see fastmatch/shazam_matcher.py); to surface it
+# in the UI, add it to METHODS/METHOD_LABELS and the params panel.
+SHAZAM_METHOD: str = "shazam"
+
 
 # --- Channel modes (colour space the matcher scores in) ---------------------
 # Every method matches on one or more channels of the selected colour space; the
