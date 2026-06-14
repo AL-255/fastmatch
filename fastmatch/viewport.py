@@ -4,8 +4,9 @@
 image pixels. It composites the image from a lazy mip pyramid (one
 ``PyramidItem`` painting only the visible tiles at a level chosen from the zoom),
 overlays match boxes (one batched :class:`MatchOverlayItem`), and handles hybrid
-input: SELECT-mode left-drag rubber-band selection, Space / middle-mouse pan,
-and zoom-under-cursor wheel.
+input: SELECT-mode left-drag rubber-band selection, middle-mouse (or Pan-tool)
+pan, Space to toggle focus mode (dim outside the boxes), and zoom-under-cursor
+wheel.
 
 Tile pixels are decoded off the GUI thread on a ``QThreadPool``; the worker
 returns a plain ndarray and the ``QImage``/``QPixmap`` are created on the GUI
@@ -35,7 +36,7 @@ from PySide6.QtCore import (
     QThreadPool,
     Signal,
 )
-from PySide6.QtGui import QColor, QImage, QPixmap
+from PySide6.QtGui import QColor, QImage, QPainterPath, QPixmap
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QGraphicsItem,
@@ -57,6 +58,10 @@ _LOD_HYSTERESIS = 0.25
 
 # Background behind tiles (and any region with no decoded tile yet).
 _BG_COLOR = QColor(30, 30, 30)
+
+# Focus mode: opacity (0-255) of the dark veil laid over the image OUTSIDE the
+# boxes. ~60% keeps dimmed context faintly visible while the boxes pop.
+_FOCUS_DIM_ALPHA = 150
 
 # BT.601 luminance weights (R, G, B), matching the engine's convention (§D.1)
 # so the grayscale display mode shows exactly what the matcher "sees" in
@@ -240,6 +245,7 @@ class ImageViewport(QGraphicsView):
     measurePicked = Signal(QPointF, QPointF)      # two image-px points to measure
     zoomChanged = Signal(float, int)      # (view_scale, current_pyramid_level)
     viewChanged = Signal(QRect)           # visible image-px rect (prefetch hint)
+    focusModeChanged = Signal(bool)       # focus/spotlight mode toggled (Space)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -303,7 +309,7 @@ class ImageViewport(QGraphicsView):
         self._pending_tiles: set[tuple[int, int, int]] = set()
 
         # --- input state ---
-        self._space_held = False
+        self._focus_mode = False   # Space toggles the spotlight (dim outside boxes)
         self._panning = False
         self._pan_last: QPoint | None = None
         self._selecting = False
@@ -714,14 +720,14 @@ class ImageViewport(QGraphicsView):
         """Set the cursor to reflect mode / pan state."""
         if self._panning:
             self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
-        elif self._space_held or self._mode is ImageViewport.Mode.PAN:
+        elif self._mode is ImageViewport.Mode.PAN:
             self.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
         else:
             self.viewport().setCursor(Qt.CursorShape.CrossCursor)
 
     def _is_pan_active(self) -> bool:
         """True if the current state means a left-drag should pan, not select."""
-        return self._space_held or self._mode is ImageViewport.Mode.PAN
+        return self._mode is ImageViewport.Mode.PAN
 
     # ------------------------------------------------------------- wheel zoom
     def wheelEvent(self, e) -> None:
@@ -759,23 +765,61 @@ class ImageViewport(QGraphicsView):
 
     # ------------------------------------------------------------- key events
     def keyPressEvent(self, e) -> None:
-        """Track Space-to-pan (guarded against auto-repeat)."""
+        """Space toggles focus mode (spotlight the boxes); guarded vs auto-repeat."""
         if e.key() == Qt.Key.Key_Space and not e.isAutoRepeat():
-            self._space_held = True
-            self._apply_cursor()
+            self.set_focus_mode(not self._focus_mode)
             e.accept()
             return
         super().keyPressEvent(e)
 
-    def keyReleaseEvent(self, e) -> None:
-        """Release Space-to-pan."""
-        if e.key() == Qt.Key.Key_Space and not e.isAutoRepeat():
-            self._space_held = False
-            if not self._panning:
-                self._apply_cursor()
-            e.accept()
+    # ----------------------------------------------------------- focus mode
+    def is_focus_mode(self) -> bool:
+        """Whether the focus/spotlight mode is currently on."""
+        return self._focus_mode
+
+    def set_focus_mode(self, on: bool) -> None:
+        """Turn the focus spotlight on/off (dims the image outside the boxes)."""
+        on = bool(on)
+        if on == self._focus_mode:
             return
-        super().keyReleaseEvent(e)
+        self._focus_mode = on
+        self.viewport().update()       # repaint so drawForeground re-runs
+        self.focusModeChanged.emit(on)
+
+    def _focus_boxes(self) -> "list[QRectF]":
+        """Scene-coord rects kept bright in focus mode: the visible match boxes
+        plus the active template selection (if any)."""
+        boxes: list[QRectF] = []
+        if self._overlay is not None:
+            boxes.extend(self._overlay.visible_boxes())
+        if self._template_rect is not None:
+            boxes.append(QRectF(self._template_rect))
+        return boxes
+
+    def drawForeground(self, painter, rect) -> None:
+        """In focus mode, lay a dark veil over the image everywhere EXCEPT inside
+        the boxes — so matches / the selection stand out and the rest is dimmed."""
+        super().drawForeground(painter, rect)
+        if not self._focus_mode or self._doc is None:
+            return
+        boxes = self._focus_boxes()
+        if not boxes:
+            return  # nothing to spotlight -> don't pointlessly dim the whole image
+        # Only dim over the image itself, never the surrounding canvas.
+        image = QRectF(0.0, 0.0, float(self._doc.width), float(self._doc.height))
+        area = rect.intersected(image)
+        if area.isEmpty():
+            return
+        veil = QPainterPath()
+        veil.addRect(area)
+        holes = QPainterPath()
+        for b in boxes:
+            holes.addRect(b.intersected(image))
+        veil = veil.subtracted(holes)
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.fillPath(veil, QColor(0, 0, 0, _FOCUS_DIM_ALPHA))
+        painter.restore()
 
     # ----------------------------------------------------------- mouse events
     def mousePressEvent(self, e) -> None:

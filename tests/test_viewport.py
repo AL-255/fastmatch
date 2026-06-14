@@ -104,3 +104,69 @@ def test_scene_rect_padded_for_infinite_canvas(qapp) -> None:
         qapp.processEvents()
         s = vp.mapToScene(ctr)
         assert abs(s.x() - px) < 2 and abs(s.y() - py) < 2
+
+
+# --------------------------------------------------------------- focus mode
+def test_focus_mode_toggle_via_space_and_signal(qapp) -> None:
+    """Space toggles focus mode and emits focusModeChanged (no auto-repeat)."""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    vp = _viewport(qapp)
+    seen: list[bool] = []
+    vp.focusModeChanged.connect(seen.append)
+    assert vp.is_focus_mode() is False
+
+    def _space() -> None:
+        vp.keyPressEvent(
+            QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier)
+        )
+
+    _space()
+    assert vp.is_focus_mode() is True
+    _space()
+    assert vp.is_focus_mode() is False
+    assert seen == [True, False]
+
+
+def test_focus_mode_dims_outside_boxes(qapp) -> None:
+    """drawForeground veils the image OUTSIDE the boxes and leaves boxes bright."""
+    from PySide6.QtCore import QRectF
+    from PySide6.QtGui import QImage, QPainter
+
+    from fastmatch.types import Match
+
+    vp = _viewport(qapp)
+    vp.set_matches([Match(100, 100, 200, 200, 0.95, 1.0)])  # covers (100..300)
+    vp.set_match_threshold(0.5)
+    vp.set_focus_mode(True)
+
+    img = QImage(400, 400, QImage.Format.Format_RGB32)
+    img.fill(Qt.GlobalColor.white)
+    p = QPainter(img)
+    vp.drawForeground(p, QRectF(0, 0, 400, 400))  # identity transform: scene == px
+    p.end()
+
+    inside = img.pixelColor(200, 200)   # inside the box -> a hole, untouched
+    outside = img.pixelColor(20, 20)    # outside the box -> dimmed by the veil
+    assert inside.red() == 255
+    assert outside.red() < 255
+    assert outside.red() < inside.red()
+
+
+def test_focus_mode_no_dim_without_boxes(qapp) -> None:
+    """With nothing to spotlight, focus mode must not dim the whole image."""
+    from PySide6.QtCore import QRectF
+    from PySide6.QtGui import QImage, QPainter
+
+    vp = _viewport(qapp)
+    vp.clear_matches()
+    vp.clear_template()
+    vp.set_focus_mode(True)
+
+    img = QImage(64, 64, QImage.Format.Format_RGB32)
+    img.fill(Qt.GlobalColor.white)
+    p = QPainter(img)
+    vp.drawForeground(p, QRectF(0, 0, 64, 64))
+    p.end()
+    assert img.pixelColor(32, 32).red() == 255  # untouched

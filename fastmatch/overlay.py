@@ -140,6 +140,15 @@ class MatchOverlayItem(QGraphicsItem):
         """Number of match boxes currently at/above threshold."""
         return int(self._mask.sum()) if self._mask.size else 0
 
+    def visible_boxes(self) -> "list[QRectF]":
+        """Post-threshold match boxes as scene-coord rects (for the focus spotlight)."""
+        if not (self._boxes.shape[0] and self._mask.any()):
+            return []
+        return [
+            QRectF(float(x), float(y), float(w), float(h))
+            for x, y, w, h in self._boxes[self._mask]
+        ]
+
     def clear(self) -> None:
         """Remove all matches and the source box."""
         self._boxes = np.empty((0, 4), dtype=np.int32)

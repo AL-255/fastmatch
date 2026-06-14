@@ -79,3 +79,25 @@ def test_xor_mode_skips_the_plain_casing(qapp) -> None:
     normal = _render(xor=False)
     xored = _render(xor=True)
     assert _rgb(xored, 10, 10) != _rgb(normal, 10, 10)
+
+
+def test_visible_boxes_respects_threshold(qapp) -> None:
+    """visible_boxes() returns exactly the post-threshold match boxes (focus mode)."""
+    ov = MatchOverlayItem(400, 300)
+    boxes = np.array([[40, 40, 70, 70], [250, 170, 80, 80]], np.int32)
+    scores = np.array([0.95, 0.60], np.float32)
+    ov.set_matches(boxes, scores)
+
+    ov.set_threshold(0.5)
+    vb = ov.visible_boxes()
+    assert [(r.x(), r.y(), r.width(), r.height()) for r in vb] == [
+        (40.0, 40.0, 70.0, 70.0),
+        (250.0, 170.0, 80.0, 80.0),
+    ]
+
+    ov.set_threshold(0.8)  # only the 0.95 box survives
+    vb = ov.visible_boxes()
+    assert len(vb) == 1 and (vb[0].x(), vb[0].y()) == (40.0, 40.0)
+
+    ov.clear()
+    assert ov.visible_boxes() == []

@@ -196,8 +196,12 @@ class MainWindow(QMainWindow):
         self._progress.setRange(0, 100)
         self._progress.setMaximumWidth(180)
         self._progress.setVisible(False)
+        # Left-aligned focus-mode hint (shown only while focus mode is active).
+        self._focus_label = QLabel("", self)
+        self._focus_label.setVisible(False)
         sb = self.statusBar()
-        sb.addPermanentWidget(self._cursor_label)
+        sb.addWidget(self._focus_label)            # left side
+        sb.addPermanentWidget(self._cursor_label)  # right side
         sb.addPermanentWidget(self._area_label)
         sb.addPermanentWidget(self._count_label)
         sb.addPermanentWidget(self._progress)
@@ -529,6 +533,8 @@ class MainWindow(QMainWindow):
         # Measurement tools: two-point picks for calibration and the ruler.
         self._viewport.calibrationPicked.connect(self._on_calibration_picked)
         self._viewport.measurePicked.connect(self._on_measure_picked)
+        # Focus mode (Space): show a left-aligned status-bar hint while active.
+        self._viewport.focusModeChanged.connect(self._on_focus_mode_changed)
 
         # Controller results / state. With no image at startup there is no
         # controller yet; _install_new_controller wires these when one is opened.
@@ -1005,6 +1011,12 @@ class MainWindow(QMainWindow):
         self._auto_run = bool(on)
         if self._auto_run and self._last_rect is not None:
             self._controller.request(self._last_rect, self._params)
+
+    def _on_focus_mode_changed(self, on: bool) -> None:
+        """Show/hide the left-aligned focus-mode hint in the status bar."""
+        if on:
+            self._focus_label.setText("Focus mode — Space to exit")
+        self._focus_label.setVisible(on)
 
     def _on_cursor_pos(self, x: int, y: int) -> None:
         """Update the status-bar cursor readout (-1,-1 == outside image).
