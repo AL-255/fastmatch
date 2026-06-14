@@ -117,3 +117,10 @@ consistency/copy items remained, applied here:
 **Converged.** After 5 iterations the multi-lens critique surfaces only
 subjective/sub-nitpick items; the substantive hierarchy, theming, structure,
 affordance, and consistency issues are resolved. 153 tests pass throughout.
+
+## Iteration 6 — toolbar tooltip completeness
+
+Convergence review: 3 lenses empty; affordance found one real gap — every toolbar
+action had a tooltip except "Open" and "Clear matches", and "Clear matches" silently
+also clears the selection + disables Run (more than its label implies). Added both
+tooltips (`app.py`). 153 tests pass.

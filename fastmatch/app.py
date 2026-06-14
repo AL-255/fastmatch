@@ -222,6 +222,7 @@ class MainWindow(QMainWindow):
         self.addToolBar(tb)
 
         self._act_open = QAction("Open", self)
+        self._act_open.setToolTip("Open an image to search (PNG / JPEG / TIFF / BMP).")
         self._act_open.triggered.connect(self._on_open)
         tb.addAction(self._act_open)
 
@@ -243,6 +244,10 @@ class MainWindow(QMainWindow):
         tb.addSeparator()  # view group | results group
 
         self._act_clear = QAction("Clear matches", self)
+        self._act_clear.setToolTip(
+            "Clear the result boxes and the current selection (draw a new region to "
+            "search again)."
+        )
         self._act_clear.triggered.connect(self._on_clear_matches)
         tb.addAction(self._act_clear)
         # "Add to Memory" lives only on the Memory dock now (was duplicated here).
