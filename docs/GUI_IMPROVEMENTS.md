@@ -173,3 +173,9 @@ disabled CPU scale checkbox instead of an unexplained dead control (`params_pane
 were enabled even with no entries (dead controls). Added `_sync_button_state()`
 (enable Rename/Remove only when entries exist; Add stays enabled), called from all
 entry-count paths. `memory_panel.py`. 153 tests pass.
+
+## Iteration 13 — Memory dialog-title casing
+
+3 of 4 lenses empty. Copy lens: the Open/Save file-dialog titles were lowercase
+("Open memory" / "Save memory as") while the menu items + rest of the chrome treat
+"Memory" as a proper noun. Title-cased both to match. `memory_panel.py`. 153 pass.

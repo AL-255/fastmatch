@@ -342,7 +342,7 @@ class MemoryPanel(QWidget):
         store, remembers the path, and re-emits it via ``store_loaded``.
         Returns whether a store was loaded.
         """
-        path, _ = QFileDialog.getOpenFileName(self, "Open memory", "", _JSON_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, "Open Memory", "", _JSON_FILTER)
         if not path:
             return False  # user cancelled
         try:
@@ -364,7 +364,7 @@ class MemoryPanel(QWidget):
     def save_memory_as(self) -> bool:
         """Prompt for a path and write the current store as JSON; remember it."""
         start = self._current_path or ""
-        path, _ = QFileDialog.getSaveFileName(self, "Save memory as", start, _JSON_FILTER)
+        path, _ = QFileDialog.getSaveFileName(self, "Save Memory As", start, _JSON_FILTER)
         if not path:
             return False  # user cancelled
         path = _ensure_json_suffix(path)  # write "name" as "name.json"
