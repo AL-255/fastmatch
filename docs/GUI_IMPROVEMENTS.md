@@ -80,3 +80,23 @@ Copy / consistency (`params_panel.py`):
 
 Verification: 153 tests pass (test traps avoided — Tools-menu list, Theme/Engine
 titles, status-bar count label all untouched); confirmed in re-screenshots.
+
+## Iteration 4 — convergence-review fixes (usability + parity)
+
+A holistic convergence review found these still worth doing (not nitpicks):
+- **Reopen closed docks** (`app.py`): the Search/Memory docks have a close (X)
+  button but there was NO way to restore them — a stray click was unrecoverable
+  without restart. Added their `toggleViewAction()` to the **View** menu
+  ("Search panel" / "Memory panel"), and (from iter 3) "Self-test" now lives in a
+  Help menu.
+- **Channel-mode combo casing** (`types.py`): labels were the only lowercase combo
+  entries and clashed with the "RGB/YCbCr channel weights" titles below — now
+  "RGB …" / "YCbCr …" / "Luminance …" (display-only; emitted key unchanged).
+- **Memory recall discoverability** (`memory_panel.py`): double-click-to-revisit
+  (the headline feature) had no cue — added a muted "Double-click an entry to
+  revisit it." hint + a table tooltip.
+- Polish: banner now shares the params panel's 8px left inset (one dock-column
+  edge); light-theme disabled text 140→120 for parity with dark.
+
+Verification: 153 tests pass; View menu shows the two dock toggles + a Help menu
+(verified programmatically); confirmed in re-screenshots (04 combo casing, 07 hint).

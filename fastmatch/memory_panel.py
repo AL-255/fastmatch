@@ -115,6 +115,12 @@ class MemoryPanel(QWidget):
         self._header_label = QLabel(self)
         self._header_label.setTextFormat(Qt.TextFormat.PlainText)
         root.addWidget(self._header_label)
+        # Surface the otherwise-invisible recall gesture (double-click). Muted via
+        # the shared "matchCount" secondary-text style hook (themed in theme.py).
+        self._hint_label = QLabel("Double-click an entry to revisit it.", self)
+        self._hint_label.setObjectName("matchCount")
+        self._hint_label.setTextFormat(Qt.TextFormat.PlainText)
+        root.addWidget(self._hint_label)
 
         # --- Entry table (read-only, full-row, multi-row selection) --------
         self._table = QTableWidget(0, len(_COLUMNS), self)
@@ -132,6 +138,7 @@ class MemoryPanel(QWidget):
         for col in range(1, len(_COLUMNS)):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         # Double-click a row -> revisit that entry.
+        self._table.setToolTip("Double-click an entry to restore its boxes and selection.")
         self._table.itemDoubleClicked.connect(self._on_item_double_clicked)
         root.addWidget(self._table, 1)
 

@@ -168,9 +168,9 @@ SHAZAM_METHOD: str = "shazam"
 CHANNEL_MODES: tuple[str, ...] = ("luminance", "rgb", "ycbcr")
 
 CHANNEL_MODE_LABELS: dict[str, str] = {
-    "luminance": "luminance (single BT.601 luma plane)",
-    "rgb": "rgb (weighted R, G, B channels)",
-    "ycbcr": "ycbcr (weighted Y, Cb, Cr channels)",
+    "luminance": "Luminance (single BT.601 luma plane)",
+    "rgb": "RGB (weighted R, G, B channels)",
+    "ycbcr": "YCbCr (weighted Y, Cb, Cr channels)",
 }
 
 #: Per-mode channel names, in order, for the weight sliders / UI labels.

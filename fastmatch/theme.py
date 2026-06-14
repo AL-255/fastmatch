@@ -126,7 +126,9 @@ def _light_palette() -> QPalette:
     pal = QStyleFactory.create("Fusion").standardPalette()
     Role = QPalette.ColorRole
     for role in (Role.WindowText, Role.Text, Role.ButtonText):
-        pal.setColor(QPalette.ColorGroup.Disabled, role, QColor(140, 140, 140))
+        # ~3.8:1 on the light window — legible-but-dimmed, matching the dark theme's
+        # disabled parity (Fusion's stock #bebebe was a near-invisible ~1.6:1).
+        pal.setColor(QPalette.ColorGroup.Disabled, role, QColor(120, 120, 120))
     pal.setColor(Role.Highlight, QColor(23, 105, 170))
     pal.setColor(Role.Link, QColor(11, 95, 176))
     return pal

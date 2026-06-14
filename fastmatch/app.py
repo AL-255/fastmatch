@@ -148,6 +148,10 @@ class MainWindow(QMainWindow):
         self._banner = QLabel(device_banner_text(self._resolved_device), dock_body)
         self._banner.setWordWrap(True)
         self._banner.setObjectName("deviceBanner")
+        # Share the params panel's 8px horizontal inset so the dock column has one
+        # left edge (the panel uses setContentsMargins(8,...); the banner is a
+        # sibling in the dock layout and would otherwise sit 8px further left).
+        self._banner.setContentsMargins(8, 0, 8, 0)
         dock_layout.addWidget(self._params_panel)
         dock_layout.addWidget(self._banner)
         dock_layout.addStretch(1)
@@ -329,6 +333,17 @@ class MainWindow(QMainWindow):
         )
         self._act_box_xor.toggled.connect(self._viewport.set_box_xor)
         boxes_menu.addAction(self._act_box_xor)
+
+        # Dock visibility toggles — a closed Search/Memory dock (the X on its title
+        # bar) would otherwise be unrecoverable without restarting. Qt's built-in
+        # toggleViewAction is a checkable show/hide that stays in sync automatically.
+        view_menu.addSeparator()
+        act_dock_search = self._dock.toggleViewAction()
+        act_dock_search.setText("&Search panel")
+        view_menu.addAction(act_dock_search)
+        act_dock_memory = self._memory_dock.toggleViewAction()
+        act_dock_memory.setText("&Memory panel")
+        view_menu.addAction(act_dock_memory)
 
         self._build_tools_menu()
         self._build_theme_menu()

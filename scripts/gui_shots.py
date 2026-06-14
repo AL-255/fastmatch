@@ -110,6 +110,7 @@ def main():
                            orientation="R0")] * (i + 1),
         ))
     mp = MemoryPanel()
+    mp.setStyleSheet(theme.theme_qss("light"))  # muted hint/secondary text
     if hasattr(mp, "set_store"):
         mp.set_store(store)
     elif hasattr(mp, "refresh"):
