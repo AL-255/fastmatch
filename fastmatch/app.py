@@ -228,8 +228,10 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        # Mode toggle: checkable; unchecked == Select, checked == Pan.
-        self._act_mode = QAction("Pan mode", self)
+        # Mode toggle: checkable; unchecked == Select, checked == Pan. The label
+        # names the CURRENT mode (see _on_mode_toggled), so it starts "Select mode"
+        # to match the unchecked/Select startup state.
+        self._act_mode = QAction("Select mode", self)
         self._act_mode.setCheckable(True)
         self._act_mode.setToolTip("Toggle between Select (draw region) and Pan (drag to move).")
         self._act_mode.toggled.connect(self._on_mode_toggled)

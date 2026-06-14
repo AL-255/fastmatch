@@ -132,3 +132,10 @@ scales" checkbox so it pins under its title (the stacked widget sizes to the tal
 feature page); gave CCORR the "when to use" parenthetical the other methods have;
 "Fit" tooltip terminal period; unified the memory double-click wording ("restore
 its boxes and selection") across hint + tooltip. 153 tests pass.
+
+## Iteration 8 — mode-toggle startup label
+
+Three lenses empty. Affordance found one real clarity bug: the toolbar mode toggle
+read "Pan mode" at startup while the app launches in Select mode (the handler labels
+the current state, so only the initial text was wrong). Fixed the initial label to
+"Select mode". `app.py`. 153 tests pass.
