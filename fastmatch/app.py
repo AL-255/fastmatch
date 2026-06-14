@@ -49,6 +49,7 @@ from .calibration import Calibration
 from .device import device_banner_text, resolve_device
 from .document import ImageDocument
 from .memory import MemoryEntry
+from .about import AboutDialog
 from .memory_panel import MemoryPanel
 from .params_panel import _HIST_BIN_PRESETS, _HIST_BINS, ParamsPanel
 from .types import CONV_METHODS, MatchParams
@@ -196,9 +197,8 @@ class MainWindow(QMainWindow):
         self._progress.setRange(0, 100)
         self._progress.setMaximumWidth(180)
         self._progress.setVisible(False)
-        # Left-aligned focus-mode hint (shown only while focus mode is active).
-        self._focus_label = QLabel("", self)
-        self._focus_label.setVisible(False)
+        # Left-aligned focus-mode hint (always shown; text reflects on/off state).
+        self._focus_label = QLabel("Press Space to enter focus mode", self)
         sb = self.statusBar()
         sb.addWidget(self._focus_label)            # left side
         sb.addPermanentWidget(self._cursor_label)  # right side
@@ -399,6 +399,11 @@ class MainWindow(QMainWindow):
         # was demoted off the primary toolbar.
         self._help_menu = self.menuBar().addMenu("&Help")
         self._help_menu.addAction(self._act_selftest)
+        self._help_menu.addSeparator()
+        self._act_about = QAction("&About FastMatch", self)
+        self._act_about.setMenuRole(QAction.MenuRole.AboutRole)  # -> app menu on macOS
+        self._act_about.triggered.connect(self._on_about)
+        self._help_menu.addAction(self._act_about)
 
     def _build_tools_menu(self) -> None:
         """&Tools menu — physical-scale calibration and the measuring ruler.
@@ -1012,11 +1017,15 @@ class MainWindow(QMainWindow):
         if self._auto_run and self._last_rect is not None:
             self._controller.request(self._last_rect, self._params)
 
+    def _on_about(self) -> None:
+        """Show the modal About dialog (author, build ID, full license)."""
+        AboutDialog(self).exec()
+
     def _on_focus_mode_changed(self, on: bool) -> None:
-        """Show/hide the left-aligned focus-mode hint in the status bar."""
-        if on:
-            self._focus_label.setText("Focus mode — Space to exit")
-        self._focus_label.setVisible(on)
+        """Update the left-aligned focus-mode hint in the status bar."""
+        self._focus_label.setText(
+            "Focus mode — Space to exit" if on else "Press Space to enter focus mode"
+        )
 
     def _on_cursor_pos(self, x: int, y: int) -> None:
         """Update the status-bar cursor readout (-1,-1 == outside image).
