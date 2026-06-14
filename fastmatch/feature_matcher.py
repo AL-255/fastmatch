@@ -3,9 +3,9 @@
 This module implements :class:`FeatureMatcher`, the warp-tolerant alternative to
 the GPU convolution methods (§J.3 of ``docs/DESIGN.md``). Where NCC/SSD/CCORR
 need the instances to be roughly aligned and the same scale, feature matching
-detects ORB/AKAZE/SIFT keypoints, matches descriptors with a Lowe ratio test,
-and fits a RANSAC homography per instance — so it recovers copies that are
-**rotated, scaled, or perspective-warped**, which the template methods miss.
+detects ORB/AKAZE/SIFT keypoints, matches descriptors, and recovers the instance
+geometry — so it finds copies that are **rotated, scaled, or perspective-warped**
+which the fixed-window template methods miss.
 
 OpenCV (``cv2``) is required **only** for this method. It is imported lazily (at
 :class:`FeatureMatcher` construction, not at module import) so importing
@@ -16,40 +16,51 @@ constructor raises the documented :class:`RuntimeError` and the UI disables the
 Coordinate convention matches the rest of FastMatch: integer **image pixels**,
 origin top-left, +x right / +y down, half-open boxes ``(x, y, w, h)`` (§F.3).
 
-Pipeline (see §J.3):
+Pipeline — feature-PROPOSE + appearance-VERIFY
+----------------------------------------------
+The matcher's job here is to **reproduce the matches NCC/SSD would find** even on
+feature-poor, highly repetitive content. Two facts drive the design:
 
-1. **Full-resolution tiled detection** — image (and template) keypoints are
-   detected at native scale, because down-sampling drops keypoints and realistic
-   templates (the demo's flat colour-block motif; any feature-poor pattern) have
-   few to spare. Cost/memory is bounded by TILING (overlapping tiles, each with
-   its own keypoint budget so features stay spatially dense); the result is cached
-   per detector so the cost is one-time. (A coarsest-safe-level down-sampling
-   pyramid is plumbed via ``_MAX_FEATURE_LEVEL`` but defaults OFF — it traded too
-   much recall on feature-poor templates; see that constant's note.)
-2. **Detector** — ORB (default), AKAZE, or SIFT on the grayscale image. Image
-   keypoints/descriptors are computed **once per (image, detector)** and cached
-   on this matcher; :meth:`invalidate_image` clears the cache when the engine
-   stages a new image.
-3. **Multi-instance descriptor matching** — for each template feature keep ALL
-   image matches within an absolute "good descriptor" distance (``radiusMatch``),
-   NOT just the best. The classic Lowe ratio test rejects a match whose 2nd
-   neighbour is equally close — i.e. EVERY repeated/identical instance (each
-   template feature recurs once per copy) — so it finds nothing on the demo's many
-   copies. Keeping all good matches (one per copy) is what makes multi-instance
-   detection work; the geometry step below rejects the spurious ones.
-4. **Generalized-Hough vote + per-cluster homography** — each correspondence votes
-   for an instance centre using the matched keypoints' scale and orientation (a
-   similarity transform, à la Lowe 2004), so the correct correspondences for each
-   copy form a sharp peak well above the diffuse noise. Each peak's
-   correspondences are verified/refined with one homography (degeneracy-guarded),
-   yielding the instance's axis-aligned bbox; the votes are consumed and the next
-   peak is taken, up to ``feature_max_instances``. (Voting replaced a plain
-   sequential RANSAC, which drowned in the large ambiguous correspondence set and
-   recovered ~0-2 of many identical copies.)
-5. **Score** — ``min(1.0, inliers / (2 * feature_min_inliers))`` (richly supported
-   instances saturate near 1.0; ambiguous ones score lower).
-6. **Exclude source** — same rule as the conv path (IoU > ``exclude_iou`` or
-   center inside ``exclude_box``); overlapping detections merged by IoU-NMS.
+* The dominant historical failure was **feature-density starvation** — too few
+  keypoints per small repeated motif, so most true copies matched nothing. The
+  fix is a *dense* detector (a high per-tile keypoint budget and lowered ORB
+  edge/fast thresholds), which alone takes per-copy keypoint support on the
+  benchmark PCB from ~0 to dozens at negligible extra cost (detection is tiled,
+  one-time, and cached).
+* Fitting a per-instance **homography to a spatially-gathered correspondence
+  cluster** is fragile on repetitive images: the cluster mixes correspondences
+  from several adjacent copies, so RANSAC latches onto spurious cross-copy
+  transforms. Instead we **propose** candidate poses cheaply and then **verify by
+  appearance**, which is exactly the criterion (normalized cross-correlation)
+  that produced the NCC/SSD ground truth.
+
+Steps (see §J.3):
+
+1. **Dense tiled detection** — image keypoints/descriptors are detected once per
+   ``(image, detector, level)`` over overlapping full-resolution tiles (each tile
+   with its own budget so features stay spatially dense) and cached on this
+   matcher; :meth:`invalidate_image` clears the cache when a new image is staged.
+2. **Propose** — for each active D4 orientation the template is transformed
+   (:func:`apply_orientation`), detected, and its descriptors multi-matched to the
+   image (keep ALL good matches, one per copy — NOT the Lowe ratio test, which
+   rejects exactly the repeated instances). Each correspondence votes for an
+   instance centre under a *similarity* transform (carrying the matched keypoints'
+   scale and angle), so an arbitrary rotated/scaled copy still forms a peak. Every
+   centre-histogram bin above a low vote floor becomes a candidate pose
+   ``(cx, cy, scale, angle)`` — permissive: high proposal recall, precision comes
+   from the verify step.
+3. **Verify by appearance (ZNCC)** — proposals near a D4 orientation at scale ≈ 1
+   (every aligned/mirrored PCB instance) take a pixel-exact **axis** path: the
+   net-oriented template is zero-mean normalized-cross-correlated against the
+   image with a small ±-px alignment search. Genuinely off-axis proposals
+   (arbitrary rotation/scale — the generality case) take an **inverse-warp** path:
+   the image window is warped back into the template frame and ZNCC'd, refined
+   over a small (angle, scale) grid. A proposal is accepted iff its ZNCC clears
+   the acceptance floor; the floor *is* the NCC/SSD appearance criterion, so this
+   reproduces their matches with near-zero false positives.
+4. **Finalize** — honour the orientation checkboxes (keep an instance only if its
+   classified D4 orientation is active), source-exclude, drop lattice phantoms,
+   IoU-NMS, cap at ``feature_max_instances``. The ZNCC is the match score.
 """
 
 from __future__ import annotations
@@ -63,6 +74,7 @@ from .types import (
     _ORIENT_LINEAR,
     active_orientations,
     apply_orientation,
+    normalize_weights,
     orientation_from_matrix,
 )
 
@@ -80,102 +92,108 @@ _DETECT_OVERLAP = 96       # tiles overlap on every side so a keypoint's descrip
                            # patch and near-seam features have full context; a
                            # keypoint is assigned to exactly one tile's core, so
                            # there are no duplicate descriptors at seams (which
-                           # would defeat the Lowe ratio test there).
-_FEATURES_PER_TILE = 1500  # ORB/SIFT keypoint budget per detection tile
-_TEMPLATE_FEATURES = 5000  # denser budget for the (small) template crop
-_MIN_TEMPLATE_SIDE = 12    # below this a template cannot anchor a homography
+                           # would defeat per-seam descriptor matching).
+
+# DENSE detection budgets (the load-bearing density fix). The benchmark PCB's
+# small repeated motifs (~116 px) carry very few distinctive corners; at the old
+# 1500/tile budget many true copies matched ZERO keypoints, capping recall far
+# below what NCC/SSD (which correlate raw pixels) achieve. Raising the per-tile
+# budget ~8x and lowering ORB's edge/fast thresholds lifts per-copy keypoint
+# support from ~0 to dozens at negligible extra cost (detection is one-time/cached:
+# ~1s for ~131k keypoints over a 42 MP image), and is what makes the propose step
+# see every copy.
+_FEATURES_PER_TILE = 12000  # ORB/SIFT keypoint budget per detection tile
+_TEMPLATE_FEATURES = 8000   # denser budget for the (small) template crop
+_ORB_EDGE_THRESHOLD = 8     # ORB default 31 discards keypoints within 31 px of any
+                            # border (zero keypoints on a small template); 8 keeps
+                            # near-edge keypoints. Identical for image AND template
+                            # so descriptors stay comparable.
+_ORB_FAST_THRESHOLD = 5     # lowered so faint low-contrast texture still fires.
+_MIN_TEMPLATE_SIDE = 12     # below this a template cannot anchor an instance
 
 # Coarsest-safe-level detection pyramid (§K.2). Detecting features over a
-# gigapixel image at full resolution is the dominant cost of the feature path AND
-# floods the matcher with distractor descriptors (which hurt the Lowe ratio test
-# → missed warped instances). Instead we detect at the COARSEST pyramid level
-# where the downsampled template still keeps enough texture to fire ORB. The
-# level is chosen FROM THE TEMPLATE so the template never decimates below
-# ``MIN_TPL_FEATURE`` px on its shorter side — that exact over-decimation is the
-# bug that made feature matching return nothing on large images, so this bound is
-# load-bearing, NOT a tunable.
+# gigapixel image at full resolution is the dominant cost of the feature path.
+# We *can* detect at the COARSEST pyramid level where the downsampled template
+# still keeps enough texture to fire ORB. The level is chosen FROM THE TEMPLATE so
+# the template never decimates below ``MIN_TPL_FEATURE`` px on its shorter side —
+# that exact over-decimation is the bug that made feature matching return nothing
+# on large images, so this bound is load-bearing, NOT a tunable.
 #
 #   L = clamp(floor(log2(min(th, tw) / MIN_TPL_FEATURE)), 0, MAX_FEATURE_LEVEL)
 #
-# L == 0 reproduces today's full-resolution tiled detection exactly (small
-# templates / small images are unchanged), so the small-image behaviour and the
-# existing tests are preserved.
+# L == 0 reproduces full-resolution tiled detection exactly (small templates /
+# small images are unchanged), so the small-image behaviour and the existing
+# tests are preserved.
 _MIN_TPL_FEATURE = 96      # coarsest level keeps the template's short side ≥ ~96 px
-# Downsampling the image/template for feature detection is a SPEED optimization,
-# but it silently drops keypoints — and realistic templates (the demo's flat
-# colour-block motif; any feature-poor pattern) have few to begin with, so even a
-# 2× shrink halves recall on repeated instances. Full-resolution detection is
-# already tiled (memory-bounded) and cached (the cost is one-time, amortized
-# across queries), so it is fast enough in practice. We therefore default the
-# feature path to L=0 (full res) for reliability; set this > 0 only to trade
-# recall for first-query detection speed on very large, feature-rich templates.
+# Downsampling for detection is a SPEED optimization but silently drops keypoints,
+# so we default the feature path to L=0 (full res) for reliability; set this > 0
+# only to trade recall for first-query detection speed on very large templates.
 _MAX_FEATURE_LEVEL = 0     # 0 -> always full resolution (see note above)
-
-#: RANSAC reprojection threshold (px, at detection scale). Inliers must lie
-#: within this distance of the projected model — a few px tolerates the
-#: sub-pixel keypoint and homography noise without admitting outliers.
-_REPROJ_THRESH = 5.0
-
-#: RANSAC iterations for the per-instance homography fit. The vote clusters fed
-#: to findHomography are already mostly-consistent (one instance), so a moderate
-#: budget converges; kept a touch above the cv2 default for the residual noise.
-_RANSAC_ITERS = 3000
-
-#: Early-stop for the vote loop: after this many consecutive peaks fail to yield a
-#: verified instance, stop. Real instances are the strongest peaks (found first);
-#: on a highly-repetitive image the long tail of medium peaks is noise that the
-#: homography rejects anyway, so bounding the wasted findHomography calls keeps
-#: the per-query time down without dropping real instances.
-_MAX_CONSEC_FAIL = 25
-
-#: Max correspondences fed to a single per-cluster findHomography. A highly
-#: repetitive image (a chip die, a brick wall) makes a vote cluster huge; RANSAC
-#: needs only a few hundred points to lock the model, so we subsample larger
-#: clusters — bounding per-instance cost without affecting the fit.
-_MAX_CLUSTER_PTS = 600
 
 #: Multi-instance descriptor matching. The classic Lowe ratio test rejects a
 #: match whose 2nd-nearest neighbour is (nearly) as close — which is EXACTLY what
-#: happens for repeated/identical instances: each template feature recurs once
-#: per copy, so its nearest neighbours (the copies) are all equally close and the
-#: ratio test discards them, finding nothing. The demo image (and the common
-#: "find every copy" use case) is precisely this. So instead of the ratio test we
-#: keep ALL image matches within an absolute "good descriptor" distance of each
-#: template feature (one correspondence per copy) and let the geometric RANSAC
-#: verification below reject the spurious ones. ``_GOOD_DIST`` is the per-detector
-#: max descriptor distance for a "good" match (random ORB Hamming ≈ 128; an exact
-#: copy ≈ 0); ``_MAX_MATCHES_PER_FEATURE`` caps the fan-out on repetitive texture.
+#: happens for repeated/identical instances: each template feature recurs once per
+#: copy, so its nearest neighbours (the copies) are all equally close and the ratio
+#: test discards them, finding nothing. So instead of the ratio test we keep ALL
+#: image matches within an absolute "good descriptor" distance of each template
+#: feature (one correspondence per copy) and let the appearance verify reject the
+#: spurious ones. ``_GOOD_DIST`` is the per-detector max descriptor distance for a
+#: "good" match (random ORB Hamming ≈ 128; an exact copy ≈ 0); ``_KNN_K`` caps the
+#: nearest-neighbour fan-out on repetitive texture (covers up to this many copies).
 _GOOD_DIST = {
     "orb": 64.0,    # Hamming on the 256-bit ORB descriptor
     "akaze": 90.0,  # Hamming on AKAZE's (longer) binary descriptor
-    "sift": 300.0,  # L2 on 128-float SIFT (RANSAC filters the looser slack)
+    "sift": 300.0,  # L2 on 128-float SIFT
 }
-#: Nearest neighbours considered per template feature. Bounds the correspondence
-#: set (one per copy, plus a little noise) so a highly-repetitive image can't
-#: explode it — covers up to this many copies of the boxed region.
 _KNN_K = 96
 
-#: Reject a homography whose affine-part determinant is below this magnitude
-#: (near-singular / folded mapping) — a degenerate fit that does not correspond
-#: to a real, orientation-preserving instance (§J.3 step 4).
-_MIN_AFFINE_DET = 1e-6
+#: Proposal vote floor: minimum correspondences in a centre-histogram bin for it
+#: to become a candidate pose. Deliberately LOW — precision comes from the ZNCC
+#: appearance gate, not the vote count, so faint copies (few keypoints) still get
+#: a chance to be verified. ``feature_min_inliers`` caps this (default 12 -> 4).
+_PROPOSAL_VOTE_FLOOR = 4
 
-#: Sane-scale guard: reject homographies that blow the template up or shrink it
-#: past these absolute **linear scale** ratios (a runaway projective fit, not a
-#: real copy). Compared against ``sqrt(det)`` so the bound is a per-axis length
-#: ratio, not an area ratio (§J.3 step 4).
-_MAX_SCALE = 1000.0
-_MIN_SCALE = 1.0 / 1000.0
+#: Global cap on proposals verified per query (after dedup). The cheap axis
+#: centre-prefilter makes a generous cap affordable; some true copies are low-vote
+#: so the cap stays high. Bounds worst-case verify cost on a pathological image.
+_MAX_PROPOSALS = 3000
+
+#: Appearance acceptance (zero-mean normalized cross-correlation). This floor IS
+#: the NCC/SSD criterion that produced the ground truth, so it is what makes the
+#: feature path reproduce their matches with near-zero false positives.
+_NCC_ACCEPT = 0.70          # axis (D4 / scale~1) path acceptance
+_NCC_ACCEPT_WARP = 0.70     # off-axis (arbitrary rotation/scale) path acceptance
+#: Off-axis support gate: a genuinely warped instance must have at least this much
+#: vote consensus before we pay for its (lossy, FP-prone) inverse-warp refine. The
+#: PCB ground truth is all D4 and never takes this path, so it does not affect PCB
+#: false positives. Reinterprets ``feature_min_inliers``.
+_WARP_MIN_VOTES = 12
+#: Skip the off-axis refine grid if the vote-median pose's centre ZNCC is this far
+#: below the floor (cheap rejection of spurious warps).
+_WARP_PREFILTER = 0.40
+#: A residual rotation within this many degrees of a 90° multiple is treated as an
+#: exact D4 turn (verified pixel-exactly via the axis path), NOT an arbitrary
+#: rotation — keeps PCB D4 copies out of the resampling-lossy warp path.
+_D4_ANGLE_TOL_DEG = 12.0
+#: ± integer-px local alignment search on the axis path (the vote-median centre is
+#: a few px noisy). ±2 -> 25 evals (was ±3 -> 49); the centre-prefilter below makes
+#: the search cost only matter for promising proposals.
+_NCC_SEARCH = 2
+#: Axis centre-prefilter margin: reject a proposal in a single ZNCC if its centre
+#: correlation is below ``_NCC_ACCEPT - this`` (a true copy within ±_NCC_SEARCH px
+#: cannot recover from so low a centre, while spurious proposals sit near 0 and are
+#: rejected cheaply). The dominant runtime win on large templates.
+_AXIS_PREFILTER_MARGIN = 0.30
 
 
 class FeatureMatcher:
-    """ORB/AKAZE/SIFT + RANSAC-homography multi-instance matcher (§J.3).
+    """Dense-feature propose + appearance-verify multi-instance matcher (§J.3).
 
     One instance is reused across queries by the engine's :class:`Matcher`. It
-    caches the downsampled-image keypoints/descriptors keyed by detector name so
-    repeated queries on the same staged image only re-detect the (small)
-    template. :meth:`invalidate_image` is called by ``Matcher.set_image`` when a
-    new image is staged.
+    caches the image keypoints/descriptors keyed by ``(detector, level)`` so
+    repeated queries on the same staged image only re-detect the (small) template.
+    :meth:`invalidate_image` is called by ``Matcher.set_image`` when a new image
+    is staged.
 
     OpenCV is imported in :meth:`__init__`; if it is missing the documented
     :class:`RuntimeError` is raised there.
@@ -199,26 +217,26 @@ class FeatureMatcher:
         # Cache of {(detector_name, level): (kps, desc)} for the staged image —
         # FULL-RES keypoint coordinates (absolute image coords, already ×2^level)
         # and their descriptors, detected on the image downsampled by 2^level
-        # (§K.2). Keying on the level lets two queries with different templates
-        # (hence different safe levels) each reuse their own cached detection.
-        # Cleared by invalidate_image().
+        # (§K.2). Cleared by invalidate_image().
         self._image_cache: dict[
             tuple[str, int], tuple[list[Any], np.ndarray | None]
         ] = {}
         self._image_shape: tuple[int, int] | None = None  # (H, W) at full res
         # Cheap fingerprint of the image the cache was built against. Defense in
         # depth: the engine calls invalidate_image() in set_image, but if a caller
-        # reuses this matcher on a *different* array of the same detector without
-        # invalidating, a stale fingerprint mismatch forces a re-detect (§U2).
+        # reuses this matcher on a *different* array without invalidating, a stale
+        # fingerprint mismatch forces a re-detect (§U2).
         self._image_fingerprint: tuple[Any, ...] | None = None
         # Test/diagnostic toggle: force the full-resolution path (L=0) regardless
-        # of the template-selected level. The full path stays the recall reference
-        # so a test can assert pyramid-vs-full parity (§K.2/§K.3). Off by default.
+        # of the template-selected level. Off by default.
         self._force_full_level: bool = False
-        # The level chosen for the most recent query (read by tests/benchmarks to
-        # report the selected L per template/image size). ``None`` before any
-        # query runs.
+        # The level chosen for the most recent query (read by tests/benchmarks).
         self._last_level: int | None = None
+        # Cached host YCbCr image (uint8 H,W,3) for ycbcr-mode verification, plus
+        # the id() of the rgb array it was derived from (so a new staged image's
+        # rgb forces a rebuild). Cleared by invalidate_image().
+        self._ycbcr_host_cache: np.ndarray | None = None
+        self._ycbcr_host_src_id: int | None = None
 
     # -- cache management ----------------------------------------------------
 
@@ -231,6 +249,37 @@ class FeatureMatcher:
         self._image_cache.clear()
         self._image_shape = None
         self._image_fingerprint = None
+        self._ycbcr_host_cache = None
+        self._ycbcr_host_src_id = None
+
+    # -- colour-space helpers ------------------------------------------------
+
+    @staticmethod
+    def _rgb_to_ycbcr(rgb: np.ndarray) -> np.ndarray:
+        """RGB ``(H, W, 3)`` uint8 -> BT.601 full-range Y,Cb,Cr ``(H, W, 3)`` uint8.
+
+        Matches the desktop engine's ycbcr staging so the feature path's appearance
+        verification scores in the same colour space the conv methods do.
+        """
+        a = rgb.astype(np.float32)
+        r, g, b = a[:, :, 0], a[:, :, 1], a[:, :, 2]
+        y = 0.299 * r + 0.587 * g + 0.114 * b
+        cb = -0.168736 * r - 0.331264 * g + 0.5 * b + 128.0
+        cr = 0.5 * r - 0.418688 * g - 0.081312 * b + 128.0
+        out = np.stack([y, cb, cr], axis=-1)
+        return np.clip(np.rint(out), 0, 255).astype(np.uint8)
+
+    def _ycbcr_host(self, image_rgb: np.ndarray) -> np.ndarray:
+        """Cached host YCbCr conversion of the full RGB image (for ycbcr verify).
+
+        Reuses the result across queries on the same staged image; rebuilds when a
+        different rgb array is passed (id mismatch) or after :meth:`invalidate_image`.
+        """
+        if self._ycbcr_host_cache is not None and self._ycbcr_host_src_id == id(image_rgb):
+            return self._ycbcr_host_cache
+        self._ycbcr_host_cache = self._rgb_to_ycbcr(image_rgb)
+        self._ycbcr_host_src_id = id(image_rgb)
+        return self._ycbcr_host_cache
 
     # -- detector factory ----------------------------------------------------
 
@@ -241,9 +290,8 @@ class FeatureMatcher:
         that descriptor type: HAMMING for the binary ORB/AKAZE descriptors, L2
         for SIFT's float descriptors (§J.3 step 3).
 
-        ``nfeatures`` caps the keypoint budget: per-tile for image detection
-        (spatially dense) and higher for the small template crop. ``None`` uses
-        the per-tile default.
+        ``nfeatures`` caps the keypoint budget: per-tile for image detection and
+        higher for the small template crop. ``None`` uses the per-tile default.
 
         Raises:
             ValueError: on an unknown detector name.
@@ -252,14 +300,17 @@ class FeatureMatcher:
         n = (name or "orb").lower()
         nf = _FEATURES_PER_TILE if nfeatures is None else int(nfeatures)
         if n == "orb":
-            # Reduced ``edgeThreshold``: ORB's default (31 px) discards every
-            # keypoint within 31 px of any border, which on a modest template
-            # (e.g. a 56 px crop) leaves *zero* keypoints. Shrinking it keeps
-            # keypoints near small-template edges while staying identical between
-            # image and template detection so descriptors are comparable.
-            # ``fastThreshold`` is lowered so faint synthetic texture still fires.
+            # Dense, low-threshold ORB: a high feature budget plus a reduced
+            # ``edgeThreshold`` (default 31 discards every keypoint within 31 px of
+            # a border — zero on a small template) and ``fastThreshold`` (so faint
+            # texture still fires). IDENTICAL for image and template so descriptors
+            # are comparable.
             return (
-                cv2.ORB_create(nfeatures=nf, edgeThreshold=15, fastThreshold=10),
+                cv2.ORB_create(
+                    nfeatures=nf,
+                    edgeThreshold=_ORB_EDGE_THRESHOLD,
+                    fastThreshold=_ORB_FAST_THRESHOLD,
+                ),
                 cv2.NORM_HAMMING,
             )
         if n == "akaze":
@@ -274,23 +325,13 @@ class FeatureMatcher:
         """Coarsest pyramid level that keeps the template usable (§K.2).
 
         ``L = clamp(floor(log2(min(th, tw) / MIN_TPL_FEATURE)), 0,
-        MAX_FEATURE_LEVEL)`` — the deepest level at which the template's shorter
-        side, after downsampling by ``2^L``, is still ≥ ~``MIN_TPL_FEATURE`` px
-        (enough texture for ORB). ``L == 0`` for any template whose short side is
-        below ``2 * MIN_TPL_FEATURE``, reproducing today's full-resolution
-        behaviour exactly on small templates/images.
-
-        The cap is deliberately conservative: the template is NEVER decimated
-        below ``MIN_TPL_FEATURE`` (the regression that made feature matching find
-        nothing on large images, §J.3/§K.2), since ``2^L ≤ min(th,tw)/MIN_TPL``
-        implies ``min(th,tw)/2^L ≥ MIN_TPL_FEATURE``.
+        MAX_FEATURE_LEVEL)``. ``L == 0`` for any template whose short side is
+        below ``2 * MIN_TPL_FEATURE``, reproducing full-resolution behaviour on
+        small templates/images. With ``_MAX_FEATURE_LEVEL == 0`` this is always 0.
         """
         short = max(1, min(int(th), int(tw)))
         if short < 2 * _MIN_TPL_FEATURE:
-            # log2(ratio) < 1 → floor is 0; short-circuit (avoids a log of <1).
             return 0
-        # floor(log2(short / MIN_TPL_FEATURE)): the largest L with
-        # short / 2^L >= MIN_TPL_FEATURE, i.e. 2^L <= short / MIN_TPL_FEATURE.
         level = int(np.floor(np.log2(short / _MIN_TPL_FEATURE)))
         return max(0, min(level, _MAX_FEATURE_LEVEL))
 
@@ -308,7 +349,6 @@ class FeatureMatcher:
         if n == 0:
             sample: tuple[int, ...] = ()
         else:
-            # Up to 16 evenly-spaced samples; cheap and stable across calls.
             idx = np.linspace(0, n - 1, num=min(16, n), dtype=np.intp)
             sample = tuple(int(v) for v in flat[idx])
         return (image_gray.shape, str(image_gray.dtype), sample)
@@ -323,29 +363,21 @@ class FeatureMatcher:
         """Detect features over a (possibly downsampled) image in overlapping tiles.
 
         When ``level > 0`` the image is first downsampled by ``2^level`` with
-        ``cv2.INTER_AREA`` (the area-average resampler — anti-aliases, so coarse
-        keypoints stay repeatable) and detection runs on that smaller image; every
-        kept keypoint's coordinate is then multiplied by ``2^level`` so the cache
-        always stores **full-resolution** keypoint coordinates (§K.2). ``level==0``
-        is the original full-resolution tiled detection, bit-for-bit unchanged.
+        ``cv2.INTER_AREA`` and detection runs on that smaller image; every kept
+        keypoint's coordinate is then multiplied by ``2^level`` so the cache always
+        stores **full-resolution** keypoint coordinates (§K.2). ``level==0`` is
+        full-resolution tiled detection.
 
         Each tile is detected with its own keypoint budget so features stay
-        spatially uniform across a gigapixel image (a single global cap would
-        starve small instances). Tiles overlap by ``_DETECT_OVERLAP`` on every
-        side so a keypoint near a seam is detected with its full descriptor
-        patch; each keypoint is then assigned to exactly one tile's *core*, so no
-        duplicate descriptors land at seams (duplicates would defeat the Lowe
-        ratio test there). Keypoint coordinates are offset to absolute image px.
-
-        Returns ``(kps, desc)``, or ``(None, None)`` if ``cancel()`` fired
-        mid-detection (so the caller does not cache a partial result).
+        spatially uniform across a gigapixel image. Tiles overlap by
+        ``_DETECT_OVERLAP``; each keypoint is assigned to exactly one tile's core,
+        so no duplicate descriptors land at seams. Returns ``(kps, desc)``, or
+        ``(None, None)`` if ``cancel()`` fired mid-detection.
         """
         cv2 = self._cv2
         factor = 1 << int(level)  # 2^level
         if factor > 1:
             fh, fw = gray.shape[:2]
-            # INTER_AREA downsample by 2^level (§K.2). Detection then runs on the
-            # smaller image; keypoints are scaled back to full-res coords below.
             dw = max(1, fw // factor)
             dh = max(1, fh // factor)
             det_img = cv2.resize(gray, (dw, dh), interpolation=cv2.INTER_AREA)
@@ -361,21 +393,17 @@ class FeatureMatcher:
             for tx in range(0, w, step):
                 if cancel is not None and cancel():
                     return None, None
-                # Detection window = core + overlap on every side (clamped).
                 ox0, oy0 = max(0, tx - ov), max(0, ty - ov)
                 ox1, oy1 = min(w, tx + step + ov), min(h, ty + step + ov)
                 sub = np.ascontiguousarray(det_img[oy0:oy1, ox0:ox1])
                 kp, desc = detector.detectAndCompute(sub, None)
                 if desc is None or kp is None or len(kp) == 0:
                     continue
-                # Core bounds (half-open) this tile owns.
                 cx1, cy1 = min(w, tx + step), min(h, ty + step)
                 keep: list[int] = []
                 for i, k in enumerate(kp):
                     ax, ay = k.pt[0] + ox0, k.pt[1] + oy0
                     if tx <= ax < cx1 and ty <= ay < cy1:
-                        # Scale the detection-level coordinate back to full-res so
-                        # the cache always speaks full-resolution image px (§K.2).
                         k.pt = (ax * factor, ay * factor)
                         keep.append(i)
                 if not keep:
@@ -397,19 +425,15 @@ class FeatureMatcher:
     ) -> tuple[list[Any], np.ndarray | None]:
         """Detect+cache the image's keypoints/descriptors per ``(detector, level)``.
 
-        Runs the tiled detector once per ``(image, detector, level)`` on the image
-        downsampled by ``2^level`` (§K.2) and caches the result so subsequent
-        queries with the same detector AND level reuse it. Keypoints are stored in
-        absolute **full-resolution** image coordinates regardless of the detection
-        level, so all downstream geometry (RANSAC, bbox clamp) is full-res.
+        Runs the tiled detector once per ``(image, detector, level)`` and caches
+        the result so subsequent queries with the same detector AND level reuse it.
+        Keypoints are stored in absolute **full-resolution** image coordinates.
 
         Returns ``(image_kps, image_desc)``.
         """
         key = ((detector_name or "orb").lower(), int(level))
         # Defense-in-depth (§U2): if the image array differs from the one the cache
-        # was built against (caller reused the matcher without invalidate_image),
-        # drop every cached detector/level so we re-detect against the current
-        # image rather than returning stale keypoints/descriptors.
+        # was built against, drop every cached detector/level and re-detect.
         fingerprint = self._fingerprint(image_gray)
         if self._image_fingerprint is not None and fingerprint != self._image_fingerprint:
             self._image_cache.clear()
@@ -418,6 +442,7 @@ class FeatureMatcher:
 
         cached = self._image_cache.get(key)
         if cached is not None:
+            self._image_shape = image_gray.shape[:2]
             return cached
 
         h, w = image_gray.shape[:2]
@@ -439,246 +464,283 @@ class FeatureMatcher:
         image_gray: np.ndarray,
         params: "Any",
         *,
+        image_rgb: np.ndarray | None = None,
         exclude_box: tuple[int, int, int, int] | None = None,
         cancel: Callable[[], bool] | None = None,
         progress: Callable[[int], None] | None = None,
         scale_back: int = 1,
     ) -> list[Match]:
-        """Find every (possibly warped) instance of ``template`` in ``image_gray``.
+        """Find every (possibly warped) instance of ``template`` in the image.
+
+        Keypoint **detection** is always on luminance (ORB/AKAZE/SIFT are
+        grayscale); ``channel_mode`` only affects the **appearance verification**.
+        With ``channel_mode == "rgb"`` and an ``image_rgb`` provided (and an RGB
+        template), each proposal is verified with a per-channel-summed NCC over the
+        three colour channels (mirroring the conv path's rgb rule); otherwise
+        verification is single-channel luminance.
 
         Args:
             template: ``(th, tw, 3)`` uint8 RGB or ``(th, tw)`` uint8 grayscale
-                template crop (color is collapsed to grayscale — feature matching
-                ignores ``channel_mode``, §J.3).
+                template crop. Detection uses its luminance; rgb-mode verification
+                uses its colour channels.
             image_gray: The staged full-image grayscale ``(H, W)`` uint8 the engine
-                passes (its BT.601 luminance). Detection runs on a downsampled
-                copy; boxes are mapped back to this frame.
-            params: A ``MatchParams`` (``feature_detector``/``feature_ratio``/
-                ``feature_min_inliers``/``feature_max_instances``/``exclude_iou``
-                are read; ``scales``/``channel_mode`` are ignored, §J.3).
+                passes (its BT.601 luminance). Detection is cached on it; luminance
+                verification reads it directly.
+            params: A ``MatchParams``. Read: ``feature_detector``, ``feature_ratio``,
+                ``feature_min_inliers`` (now the proposal/off-axis vote gate),
+                ``feature_max_instances``, ``exclude_iou``, ``nms_iou``,
+                ``channel_mode``, ``enable_rotation``/``enable_flipping``.
+                ``scales`` is ignored (§J.3).
+            image_rgb: Optional staged full-image RGB ``(H, W, 3)`` uint8 (same
+                pixel frame as ``image_gray``); used only for rgb-mode appearance
+                verification. ``None`` -> luminance verification.
             exclude_box: ``(x, y, w, h)`` source region (full-res) to exclude.
-            cancel: Polled during detection and between RANSAC iterations.
-            progress: Called with ``0..100`` (~0-50 detection, ~50-100 instance
-                loop) per §J.3 step 7.
-            scale_back: Extra integer factor mapping ``image_gray`` coordinates to
-                the caller's full-resolution frame (1 when the engine passes the
-                full-res luminance directly). Combined with the internal
-                detection-scale factor when emitting boxes.
+            cancel: Polled during detection and the verify loop.
+            progress: Called with ``0..100`` (~0-40 detection, ~55-100 verify).
+            scale_back: Extra integer factor mapping image coordinates to the
+                caller's full-resolution frame (1 when the engine passes full-res).
 
         Returns:
             ``list[Match]`` sorted by score descending, source region excluded, in
-            the caller's full-resolution image px. ``scale`` is approximated as
-            ``sqrt(bbox_area / template_area)`` (§J.3 step 7).
+            the caller's full-resolution image px. ``score`` is the verified ZNCC
+            (a confidence in ``[0, 1]``); ``scale`` ≈ ``sqrt(bbox_area /
+            template_area)``.
 
         Raises:
             RuntimeError: if OpenCV was unavailable (raised at construction).
         """
-        detector_name = getattr(params, "feature_detector", "orb")
+        cv2 = self._cv2
+        detector_name = (getattr(params, "feature_detector", "orb") or "orb")
         ratio = float(getattr(params, "feature_ratio", 0.75))
-        # cv2.findHomography needs >= 4 correspondences; clamp once here so the
-        # loop guard and the n_inliers test both honour the hard >= 4 floor and
-        # a tiny feature_min_inliers (e.g. 2) cannot drive RANSAC into a crash.
-        min_inliers = max(4, int(getattr(params, "feature_min_inliers", 12)))
+        min_inliers = int(getattr(params, "feature_min_inliers", 12))
+        # Proposal floor is deliberately LOW (precision is the ZNCC gate, not the
+        # vote count); feature_min_inliers only caps it down from its default.
+        vote_floor = max(2, min(min_inliers, _PROPOSAL_VOTE_FLOOR))
+        # The off-axis (arbitrary-warp) path needs real vote consensus; that is
+        # what feature_min_inliers now governs (default 12 == _WARP_MIN_VOTES).
+        warp_min_votes = max(4, min_inliers)
         max_instances = int(getattr(params, "feature_max_instances", 100))
         exclude_iou = float(getattr(params, "exclude_iou", 0.30))
         nms_iou = float(getattr(params, "nms_iou", 0.30))
+        channel_mode = getattr(params, "channel_mode", "luminance") or "luminance"
+        rgb_weights = getattr(params, "rgb_weights", (1.0 / 3, 1.0 / 3, 1.0 / 3))
+        ycbcr_weights = getattr(params, "ycbcr_weights", (1.0 / 3, 1.0 / 3, 1.0 / 3))
 
-        # Orientation search (dihedral D4, §J / active_orientations). ORB/AKAZE/
-        # SIFT are rotation+scale invariant but NOT reflection invariant, so we do
-        # NOT run rotated template variants — instead the feature path runs the
-        # template under at most TWO variants: R0 always, and ONE flip ("MY") only
-        # when any reflection is in the active set (enable_flipping). Each found
-        # instance's recovered transform is then classified to its nearest D4
-        # orientation and kept only if that orientation is active; this is what
-        # makes the feature path respect the checkboxes (rotation OFF filters out
-        # instances ORB found rotated; flip OFF skips the flip variant entirely and
-        # rejects reflections). With both off this is the single R0 variant tagging
-        # every Match "R0" — otherwise unchanged.
+        # Orientation search (dihedral D4, §J): the template is proposed under each
+        # ACTIVE orientation, and each verified instance is kept only if its
+        # classified net orientation is active — so rotation OFF rejects rotated
+        # fits and flip OFF rejects reflections. With both off this is R0 only.
         active = set(
             active_orientations(
                 getattr(params, "enable_rotation", False),
                 getattr(params, "enable_flipping", False),
             )
         )
-        variants: list[tuple[np.ndarray, np.ndarray]] = [
-            (template, np.eye(2, dtype=np.float64))  # R0: identity linear part
-        ]
-        if getattr(params, "enable_flipping", False):
-            # One mirror variant: ORB cannot match a reflected copy against the
-            # upright template (descriptors are not reflection invariant), so run
-            # the template pre-flipped by MY. Its linear part composes with the
-            # recovered homography to classify the net orientation.
-            variants.append(
-                (apply_orientation(template, "MY"), np.asarray(_ORIENT_LINEAR["MY"], np.float64))
-            )
 
         if progress is not None:
             progress(0)
         if cancel is not None and cancel():
             return []
 
-        # --- 0. select the coarsest-safe detection level from the (R0) template
-        # The template (NOT the image) picks the level: L is the deepest pyramid
-        # level at which the downsampled template's short side stays ≥
-        # MIN_TPL_FEATURE px, so the template is never decimated into oblivion
-        # (the regression that made features find nothing on large images, §K.2).
-        # The MY variant has the same short side, so the level is shared.
+        # --- 0. select the coarsest-safe detection level from the template ---
         tmpl_gray_full = self._to_gray(template)
         th_full, tw_full = tmpl_gray_full.shape[:2]
         if min(th_full, tw_full) < _MIN_TEMPLATE_SIDE:
-            return []  # too small to anchor a homography
+            return []  # too small to anchor an instance
         level = 0 if self._force_full_level else self._select_level(th_full, tw_full)
         self._last_level = level
 
-        # --- 1-2. image features at level L (cached per (detector, level)) ---
-        # Detected ONCE regardless of how many template variants run (the cache is
-        # keyed on (detector, level); both variants share it). Image keypoints come
-        # back in FULL-RES coordinates (the detector scaled them ×2^level), so all
-        # geometry below is full-resolution regardless of the detection level.
+        # Verification colour space (detection always stays on luminance below).
+        # rgb/ycbcr need a colour template AND a matching colour image (same pixel
+        # frame); otherwise fall back to single-channel luminance. The verify step
+        # is colour-blind: it takes the verify image + template in the chosen space
+        # plus per-channel weights, and _zncc handles 1- or 3-channel weighted NCC.
+        colour_ok = (
+            image_rgb is not None
+            and template.ndim == 3
+            and image_rgb.ndim == 3
+            and image_rgb.shape[:2] == image_gray.shape[:2]
+        )
+        verify_weights: list[float] = [1.0]
+        is_multi = False
+        if channel_mode == "rgb" and colour_ok:
+            tmpl_verify_full = np.ascontiguousarray(template)
+            verify_image = image_rgb
+            verify_weights = list(normalize_weights(rgb_weights, 3))
+            is_multi = True
+        elif channel_mode == "ycbcr" and colour_ok:
+            # BT.601 full-range conversion of both the image (cached) and template.
+            verify_image = self._ycbcr_host(image_rgb)
+            tmpl_verify_full = self._rgb_to_ycbcr(np.ascontiguousarray(template))
+            verify_weights = list(normalize_weights(ycbcr_weights, 3))
+            is_multi = True
+        else:
+            tmpl_verify_full = tmpl_gray_full
+            verify_image = image_gray
+
+        # --- 1. image features at level L (cached per (detector, level)) -----
         img_kps, img_desc = self._ensure_image_features(
             image_gray, detector_name, level, cancel
         )
         if progress is not None:
-            progress(50)
+            progress(40)
         if cancel is not None and cancel():
             return []
-        if img_desc is None or len(img_kps) < min_inliers:
+        if img_desc is None or len(img_kps) < vote_floor:
             return []  # nothing detectable in the image for this detector
 
-        # Run each template variant against the (shared) image features, pooling
-        # every variant's verified, orientation-classified instances.
-        results: list[Match] = []
-        for v_arr, v_linear in variants:
+        full_h, full_w = self._image_shape  # type: ignore[misc]
+        # Vectorized image keypoint geometry (built once; reused by every variant).
+        ik_xy = np.array([k.pt for k in img_kps], np.float32).reshape(-1, 2)
+        ik_sz = np.array([k.size for k in img_kps], np.float32)
+        ik_ang = np.array([k.angle for k in img_kps], np.float32)
+
+        # Oriented templates, built once per active orientation and reused. The
+        # GRAY set drives keypoint detection (proposals); the VERIFY set is the
+        # same arrays in luminance mode, or the colour template in rgb mode. The
+        # verify step lazily adds any net-D4 code a proposal snaps to.
+        tmpl_gray_oriented: dict[str, np.ndarray] = {"R0": tmpl_gray_full}
+        for o in active:
+            if o not in tmpl_gray_oriented:
+                tmpl_gray_oriented[o] = np.ascontiguousarray(
+                    apply_orientation(tmpl_gray_full, o)
+                )
+        if is_multi:
+            tmpl_verify_oriented: dict[str, np.ndarray] = {"R0": tmpl_verify_full}
+            for o in active:
+                if o not in tmpl_verify_oriented:
+                    tmpl_verify_oriented[o] = np.ascontiguousarray(
+                        apply_orientation(tmpl_verify_full, o)
+                    )
+        else:
+            tmpl_verify_oriented = tmpl_gray_oriented
+
+        # "good descriptor" distance, widened/narrowed by feature_ratio.
+        maxd = _GOOD_DIST.get(detector_name.lower(), 64.0) * max(0.25, ratio / 0.75)
+        _det_unused, norm = self._make_detector(detector_name)
+
+        # --- 2. PROPOSE across active orientations ---------------------------
+        proposals: list[tuple] = []
+        for orient in active:
             if cancel is not None and cancel():
-                break
-            results.extend(
-                self._match_variant(
-                    v_arr,
-                    v_linear,
-                    active,
-                    img_kps,
-                    img_desc,
-                    level,
-                    detector_name,
-                    ratio,
-                    min_inliers,
-                    max_instances,
-                    scale_back,
-                    cancel,
-                    progress,
+                return []
+            proposals.extend(
+                self._propose_for_variant(
+                    tmpl_gray_oriented[orient], orient, level, detector_name, norm, maxd,
+                    ik_xy, ik_sz, ik_ang, img_desc, full_h, full_w, vote_floor,
                 )
             )
+        if progress is not None:
+            progress(55)
+        # Dedupe across variants (a true copy can split votes across adjacent bins
+        # / orientations) and cap so the verify set — and its cost — stays bounded.
+        cell = max(8, int(min(tw_full, th_full) // 4))
+        proposals = self._dedupe_proposals(proposals, cell)
+        proposals.sort(key=lambda p: -p[4])  # highest-vote first
+        if len(proposals) > _MAX_PROPOSALS:
+            proposals = proposals[:_MAX_PROPOSALS]
+
+        # --- 3. VERIFY by appearance (ZNCC) ----------------------------------
+        total_f = max(1, int(scale_back))
+        tmpl_area = float(th_full * tw_full)
+        results: list[Match] = []
+        n = max(1, len(proposals))
+        for i, p in enumerate(proposals):
+            if cancel is not None and (i & 63) == 0 and cancel():
+                break
+            r = self._verify(
+                p, tmpl_verify_oriented, verify_image, full_h, full_w, warp_min_votes,
+                verify_weights,
+            )
+            if r is None:
+                continue
+            box, score, code = r
+            # Checkbox filter: keep only instances whose net orientation is active.
+            if code not in active:
+                continue
+            bx_s, by_s, bw_s, bh_s = box
+            rx = max(0, min(int(round(bx_s * total_f)), full_w * total_f))
+            ry = max(0, min(int(round(by_s * total_f)), full_h * total_f))
+            rw = max(1, int(round(bw_s * total_f)))
+            rh = max(1, int(round(bh_s * total_f)))
+            area = float(rw * rh)
+            scale = float(np.sqrt(area / tmpl_area)) if tmpl_area > 0 else 1.0
+            results.append(
+                Match(x=rx, y=ry, w=rw, h=rh, score=float(score), scale=scale,
+                      orientation=code)
+            )
+            if progress is not None and (i & 63) == 0:
+                progress(min(99, 55 + int(44.0 * i / n)))
 
         if progress is not None:
             progress(100)
 
-        # --- 6. source exclusion (IoU > exclude_iou or center inside) -------
+        # --- 4. finalize: source exclusion / phantom-drop / NMS / cap --------
         if exclude_box is not None:
             results = [
-                r
-                for r in results
-                if not self._excluded(r, exclude_box, exclude_iou)
+                r for r in results if not self._excluded(r, exclude_box, exclude_iou)
             ]
-
-        # Drop lattice phantoms (an oversized box engulfing several real copies)
-        # before NMS, so a phantom can't suppress the true instances it spans.
         results = self._drop_lattice_phantoms(results)
-        # Sort by score descending to match the conv path's contract (§C.5).
         results.sort(key=lambda r: r.score, reverse=True)
-        # Global IoU-NMS: voting can emit two overlapping boxes for one physical
-        # instance (and the two variants can each fit the same copy). The conv
-        # path's score map gets per-pixel NMS; the feature path bypasses it, so
-        # suppress overlaps here using the box IoU (not centre distance, which
-        # would wrongly merge two distinct touching instances). The highest-scoring
-        # box wins per location, carrying its orientation tag.
         results = self._nms(results, nms_iou)
+        if len(results) > max_instances:
+            results = results[:max_instances]
         return results
 
-    def _match_variant(
+    # -- proposal generation -------------------------------------------------
+
+    def _propose_for_variant(
         self,
-        template: np.ndarray,
-        variant_linear: np.ndarray,
-        active: set,
-        img_kps: list,
-        img_desc: np.ndarray,
+        tmpl_oriented: np.ndarray,
+        orient: str,
         level: int,
         detector_name: str,
-        ratio: float,
-        min_inliers: int,
-        max_instances: int,
-        scale_back: int,
-        cancel: Callable[[], bool] | None,
-        progress: Callable[[int], None] | None,
-    ) -> list[Match]:
-        """Detect + verify one template variant against the shared image features.
+        norm: int,
+        maxd: float,
+        ik_xy: np.ndarray,
+        ik_sz: np.ndarray,
+        ik_ang: np.ndarray,
+        img_desc: np.ndarray,
+        full_h: int,
+        full_w: int,
+        vote_floor: int,
+    ) -> list[tuple]:
+        """Similarity-transform centre vote -> candidate poses for one variant.
 
-        Runs the template-feature detection, multi-instance descriptor matching,
-        generalized-Hough voting, and per-cluster homography (§J.3 steps 3-5) for
-        a single oriented template variant (R0 or the MY flip). For every verified
-        instance the net recovered orientation is classified as
-        ``orientation_from_matrix(H[:2,:2] @ variant_linear)`` and the instance is
-        kept ONLY if that orientation is in ``active`` — tagging the surviving
-        Match with it. This is what makes the feature path honour the checkboxes:
-        rotation OFF rejects instances ORB found rotated; the flip variant only
-        runs when flipping is active, and a reflection it recovers is kept only if
-        its classified orientation is active. Source exclusion / phantom-drop / NMS
-        are applied once by the caller over the pooled variants.
+        Detects the oriented template (at level L, scaled back to full-res coords),
+        multi-matches its descriptors to the image (keep ALL good matches, one per
+        copy), and votes for an instance centre under a similarity transform that
+        carries each matched keypoint's scale and angle (so an arbitrary
+        rotated/scaled copy still forms a peak — generality). Returns a list of
+        ``(cx, cy, scale, angle_rad, votes, orient, th, tw)`` proposals (the bin
+        members' MEDIAN pose, robust to contaminating neighbour votes); precision
+        is left to the appearance verify.
         """
         cv2 = self._cv2
-        factor = 1 << int(level)  # 2^level
-        empty: list[Match] = []
+        factor = 1 << int(level)
+        th, tw = tmpl_oriented.shape[:2]
+        if min(th, tw) < _MIN_TEMPLATE_SIDE:
+            return []
 
-        tmpl_gray_full = self._to_gray(template)
-        th_full, tw_full = tmpl_gray_full.shape[:2]
-        if min(th_full, tw_full) < _MIN_TEMPLATE_SIDE:
-            return empty
-
-        # --- 3. template features at level L ---------------------------------
-        # Detect the template downsampled by 2^level (INTER_AREA) so its
-        # descriptors are scale-consistent with the level-L image detection, then
-        # scale the keypoints back to full-res template coords (×2^level). At
-        # level 0 this is identical to the original full-resolution detection, so
-        # small templates/images are unchanged (§K.2). The level bound guarantees
-        # the downsampled template's short side stays ≥ MIN_TPL_FEATURE px, so it
-        # still carries enough texture for ORB — never the decimation bug.
+        # Detect the template downsampled by 2^level (INTER_AREA) so its descriptors
+        # are scale-consistent with the level-L image detection, then scale the
+        # keypoints back to full-res coords. At level 0 this is full-res detection.
         if factor > 1:
-            tdw = max(1, tw_full // factor)
-            tdh = max(1, th_full // factor)
-            tmpl_det = cv2.resize(
-                tmpl_gray_full, (tdw, tdh), interpolation=cv2.INTER_AREA
-            )
+            tdw, tdh = max(1, tw // factor), max(1, th // factor)
+            tmpl_det = cv2.resize(tmpl_oriented, (tdw, tdh), interpolation=cv2.INTER_AREA)
         else:
-            tmpl_det = tmpl_gray_full
-
-        detector, norm = self._make_detector(detector_name, nfeatures=_TEMPLATE_FEATURES)
-        tmpl_kps, tmpl_desc = detector.detectAndCompute(tmpl_det, None)
-        tmpl_kps = list(tmpl_kps) if tmpl_kps is not None else []
-        if tmpl_desc is None or len(tmpl_kps) < min_inliers:
+            tmpl_det = tmpl_oriented
+        detector, _ = self._make_detector(detector_name, nfeatures=_TEMPLATE_FEATURES)
+        tk, td = detector.detectAndCompute(np.ascontiguousarray(tmpl_det), None)
+        tk = list(tk) if tk is not None else []
+        if td is None or len(tk) < vote_floor:
             return []
         if factor > 1:
-            # Map template keypoints back to full-res template coords so the
-            # homography is fit in a single full-resolution frame (template and
-            # image both full-res), and the projected box is already full-res.
-            for k in tmpl_kps:
+            for k in tk:
                 k.pt = (k.pt[0] * factor, k.pt[1] * factor)
 
-        # --- multi-instance descriptor matching (NOT the Lowe ratio test) ----
-        # Keep EVERY image match within an absolute "good" descriptor distance of
-        # each template feature — one correspondence per copy — so repeated /
-        # identical instances survive (the ratio test would reject them; see the
-        # _GOOD_DIST note). RANSAC below provides the geometric verification.
         bf = cv2.BFMatcher(norm)
-        maxd = _GOOD_DIST.get((detector_name or "orb").lower(), 64.0)
-        # feature_ratio (UI, default 0.75) widens/narrows acceptance: at 0.75 it
-        # keeps the nominal threshold; higher = more permissive.
-        maxd *= max(0.25, ratio / 0.75)
-        # Bounded multi-match: the k nearest image features per template feature
-        # (knnMatch is sorted), then keep those within the absolute "good" distance
-        # — one correspondence per copy. Bounding k (vs. radiusMatch's unbounded
-        # fan-out) keeps a highly-repetitive image (a chip die) from exploding the
-        # correspondence set into a multi-second match.
-        k = min(len(img_desc), _KNN_K)
-        knn = bf.knnMatch(tmpl_desc, img_desc, k=k)
+        knn = bf.knnMatch(td, img_desc, k=min(len(img_desc), _KNN_K))
         good = []
         for ms in knn:
             for m in ms:
@@ -686,163 +748,265 @@ class FeatureMatcher:
                     good.append(m)
                 else:
                     break  # knnMatch results are sorted by distance
-        if len(good) < min_inliers:
+        if len(good) < vote_floor:
             return []
 
-        # Template corners (full-res) for projection -> bbox.
-        tmpl_corners = np.array(
-            [[0, 0], [tw_full, 0], [tw_full, th_full], [0, th_full]],
-            dtype=np.float32,
-        ).reshape(-1, 1, 2)
-        tmpl_area_full = float(th_full * tw_full)
+        tk_xy = np.array([k.pt for k in tk], np.float32).reshape(-1, 2)
+        tk_sz = np.array([k.size for k in tk], np.float32)
+        tk_ang = np.array([k.angle for k in tk], np.float32)
+        qi = np.fromiter((m.queryIdx for m in good), np.int64, len(good))
+        ti = np.fromiter((m.trainIdx for m in good), np.int64, len(good))
 
-        # Image extent (full res) for clamping projected corners.
-        full_h, full_w = self._image_shape  # type: ignore[misc]
-
-        # --- 4. generalized-Hough instance voting + per-cluster homography ---
-        # Without the ratio test the correspondence set is large and ambiguous
-        # (each template feature matches one keypoint per copy, plus noise), so a
-        # plain sequential RANSAC over the whole set drowns and finds almost
-        # nothing on repeated instances. Instead, each correspondence VOTES for an
-        # instance centre using the matched keypoints' scale and orientation (a
-        # similarity transform, à la Lowe 2004): the correct correspondences for a
-        # given copy all vote for the same centre, producing a sharp peak per
-        # instance that stands well above the diffuse noise. We then verify/refine
-        # each peak's correspondences with a single homography.
-        total_f = max(1, int(scale_back))
-        results: list[Match] = []
-
-        n = len(good)
-        # Vectorized correspondence arrays (a Python loop over `good` would be a
-        # bottleneck on a repetitive image's large correspondence set). Build the
-        # per-keypoint arrays once, then gather by the match query/train indices.
-        qi = np.fromiter((m.queryIdx for m in good), np.int64, n)
-        ti = np.fromiter((m.trainIdx for m in good), np.int64, n)
-        tk_xy = np.array([k.pt for k in tmpl_kps], np.float32).reshape(-1, 2)
-        tk_sz = np.array([k.size for k in tmpl_kps], np.float32)
-        tk_ang = np.array([k.angle for k in tmpl_kps], np.float32)
-        ik_xy = np.array([k.pt for k in img_kps], np.float32).reshape(-1, 2)
-        ik_sz = np.array([k.size for k in img_kps], np.float32)
-        ik_ang = np.array([k.angle for k in img_kps], np.float32)
-        tpx = tk_xy[qi, 0]; tpy = tk_xy[qi, 1]
-        ipx = ik_xy[ti, 0]; ipy = ik_xy[ti, 1]
+        tpx, tpy = tk_xy[qi, 0], tk_xy[qi, 1]
+        ipx, ipy = ik_xy[ti, 0], ik_xy[ti, 1]
         ts = np.where(tk_sz[qi] > 1e-3, tk_sz[qi], 1.0)
         rel_s = ik_sz[ti] / ts
-        # ORB/SIFT keypoint angle is degrees in [0,360); -1 means unset.
-        ta = tk_ang[qi]; ia = ik_ang[ti]
+        ta, ia = tk_ang[qi], ik_ang[ti]
         rel_a = np.deg2rad(np.where((ia >= 0) & (ta >= 0), ia - ta, 0.0))
-        # Predicted instance centre = img_kp + s*R(dθ)*(template_centre - tmpl_kp).
-        vx = (0.5 * tw_full) - tpx
-        vy = (0.5 * th_full) - tpy
-        cos = np.cos(rel_a); sin = np.sin(rel_a)
+        # Predicted instance centre = img_kp + s*R(da)*(tmpl_centre - tmpl_kp).
+        vx = (0.5 * tw) - tpx
+        vy = (0.5 * th) - tpy
+        cos, sin = np.cos(rel_a), np.sin(rel_a)
         pcx = ipx + rel_s * (cos * vx - sin * vy)
         pcy = ipy + rel_s * (sin * vx + cos * vy)
 
-        # Vote into a coarse 2-D histogram (bin ≈ a quarter of the template's
-        # short side, so one instance's votes land in one bin / its neighbours).
-        binsz = max(8, int(min(tw_full, th_full) // 4))
-        nbx = int(full_w // binsz) + 2
-        nby = int(full_h // binsz) + 2
         valid = (pcx >= 0) & (pcx < full_w) & (pcy >= 0) & (pcy < full_h)
-        bx = np.clip((pcx / binsz).astype(np.int64), 0, nbx - 1)
-        by = np.clip((pcy / binsz).astype(np.int64), 0, nby - 1)
-        hist = np.zeros((nby, nbx), np.int32)
-        np.add.at(hist, (by[valid], bx[valid]), 1)
+        pcx, pcy, rel_s, rel_a = pcx[valid], pcy[valid], rel_s[valid], rel_a[valid]
+        if pcx.size < vote_floor:
+            return []
 
-        if int(hist.max()) >= min_inliers:
-            # Stop once peaks fall to the diffuse-noise floor; the homography
-            # verification below rejects any noise cluster that slips through.
-            vote_floor = max(min_inliers, int(0.10 * int(hist.max())))
-            used = np.zeros(n, bool)
-            it = 0
-            it_cap = 4 * max_instances + 8
-            last_progress = 0  # iteration index of the last recorded instance
-            while len(results) < max_instances and it < it_cap:
-                it += 1
-                if it - last_progress > _MAX_CONSEC_FAIL:
-                    break  # only noise peaks left (see _MAX_CONSEC_FAIL)
-                if cancel is not None and cancel():
-                    break
-                py, px = np.unravel_index(int(np.argmax(hist)), hist.shape)
-                peak = int(hist[py, px])
-                if peak < vote_floor:
-                    break
-                # Gather this peak's correspondences (its bin + 8 neighbours) and
-                # consume them whether or not they yield an instance (so the loop
-                # always makes progress and cannot spin on the same peak).
-                cl = (
-                    (~used)
-                    & valid
-                    & (np.abs(bx - px) <= 1)
-                    & (np.abs(by - py) <= 1)
-                )
-                idx = np.nonzero(cl)[0]
-                used[cl] = True
-                if idx.size:
-                    np.add.at(hist, (by[idx], bx[idx]), -1)
-                if idx.size < min_inliers:
-                    continue
-                # Subsample a huge cluster (repetitive image) — RANSAC locks the
-                # model from a few hundred points; evenly-spaced keeps it cheap and
-                # deterministic.
-                if idx.size > _MAX_CLUSTER_PTS:
-                    sel = np.linspace(0, idx.size - 1, _MAX_CLUSTER_PTS).astype(np.int64)
-                    idx = idx[sel]
-                src_pts = np.stack([tpx[idx], tpy[idx]], 1).reshape(-1, 1, 2)
-                dst_pts = np.stack([ipx[idx], ipy[idx]], 1).reshape(-1, 1, 2)
-                try:
-                    H, mask = cv2.findHomography(
-                        src_pts, dst_pts, cv2.RANSAC, _REPROJ_THRESH,
-                        maxIters=_RANSAC_ITERS, confidence=0.999,
-                    )
-                except cv2.error:
-                    continue
-                if H is None or mask is None:
-                    continue
-                n_inliers = int(mask.ravel().sum())
-                if n_inliers < min_inliers:
-                    continue
-                # --- orientation classification + checkbox filter (§J) -------
-                # Net recovered orientation = the homography's linear part composed
-                # with this variant's own linear part (identity for R0, the MY
-                # matrix for the flip variant), classified to its nearest D4 code.
-                # This is rotation+reflection aware: ORB found a rotated/mirrored
-                # copy iff H's linear part is a rotation/reflection. Keep the
-                # instance ONLY if that orientation is in the active set — so
-                # rotation OFF drops rotated fits and flip OFF rejects reflections.
-                net_linear = np.asarray(H, np.float64)[:2, :2] @ variant_linear
-                code = orientation_from_matrix(net_linear)
-                if code not in active:
-                    continue
-                box = self._project_to_box(cv2, H, tmpl_corners, full_w, full_h)
-                if box is None:
-                    continue
-                bx_s, by_s, bw_s, bh_s = box
-                rx = max(0, min(int(round(bx_s * total_f)), full_w))
-                ry = max(0, min(int(round(by_s * total_f)), full_h))
-                rw = max(1, min(int(round(bw_s * total_f)), full_w - rx))
-                rh = max(1, min(int(round(bh_s * total_f)), full_h - ry))
-                # 5. score saturates toward 1.0 for richly-supported instances.
-                score = min(1.0, n_inliers / (2.0 * max(1, min_inliers)))
-                # 7. scale ~= sqrt(bbox_area / template_area).
-                area = float(rw * rh)
-                scale = (
-                    float(np.sqrt(area / tmpl_area_full)) if tmpl_area_full > 0 else 1.0
-                )
-                results.append(
-                    Match(
-                        x=rx,
-                        y=ry,
-                        w=rw,
-                        h=rh,
-                        score=float(score),
-                        scale=scale,
-                        orientation=code,
-                    )
-                )
-                last_progress = it
+        # Coarse 2-D centre histogram (bin ≈ a quarter of the template short side).
+        binsz = max(8, int(min(tw, th) // 4))
+        bx = (pcx / binsz).astype(np.int64)
+        by = (pcy / binsz).astype(np.int64)
+        keys = bx * 1_000_000 + by
+        order = np.argsort(keys, kind="stable")
+        keys_s = keys[order]
+        _uniq, starts, counts = np.unique(keys_s, return_index=True, return_counts=True)
 
-        return results
+        proposals: list[tuple] = []
+        for st, ct in zip(starts, counts):
+            if ct < vote_floor:
+                continue
+            members = order[st:st + ct]
+            proposals.append((
+                float(np.median(pcx[members])),
+                float(np.median(pcy[members])),
+                float(np.median(rel_s[members])),
+                float(np.median(rel_a[members])),
+                int(ct),
+                orient,
+                th,
+                tw,
+            ))
+        return proposals
+
+    @staticmethod
+    def _dedupe_proposals(proposals: list[tuple], cell: int) -> list[tuple]:
+        """Collapse proposals in the same ``(orientation, grid-cell)`` to the
+        highest-vote one. Bins are quarter-template, so a true copy can split its
+        votes across adjacent bins/orientations into several near-identical
+        proposals; deduping on a coarser cell (~half the template short side) keeps
+        the verify set small without dropping distinct instances."""
+        best: dict[tuple, tuple] = {}
+        for p in proposals:
+            cx, cy, orient = p[0], p[1], p[5]
+            key = (orient, int(cx // cell), int(cy // cell))
+            cur = best.get(key)
+            if cur is None or p[4] > cur[4]:
+                best[key] = p
+        return list(best.values())
+
+    # -- appearance verification ---------------------------------------------
+
+    @staticmethod
+    def _zncc(a: np.ndarray, b: np.ndarray, weights: "list[float] | None" = None) -> float:
+        """(Weighted) zero-mean normalized cross-correlation of two patches.
+
+        Works on single-channel ``(H, W)`` (luminance) and multi-channel
+        ``(H, W, C)`` (rgb / ycbcr) inputs. For colour, each channel is zero-meaned
+        independently and the per-channel numerators and per-channel denominators
+        are summed *before* the single division, each scaled by its weight — the
+        same weighted multi-channel rule the conv NCC uses
+        (``Σ_c w_c <a_c,b_c> / Σ_c w_c ‖a_c‖·‖b_c‖``). Equal weights == the
+        unweighted multi-channel NCC. A flat channel (no variance in either patch)
+        contributes nothing rather than zeroing the whole score, so a copy that is
+        textured in only some channels still verifies.
+        """
+        a = a.astype(np.float32)
+        b = b.astype(np.float32)
+        if a.ndim == 2:
+            a = a[:, :, None]
+            b = b[:, :, None]
+        c_n = a.shape[2]
+        if weights is None or len(weights) != c_n:
+            weights = [1.0] * c_n
+        num = 0.0
+        den = 0.0
+        for c in range(c_n):
+            w = float(weights[c])
+            if w <= 0.0:
+                continue
+            ac = a[:, :, c]
+            bc = b[:, :, c]
+            ac = ac - ac.mean()
+            bc = bc - bc.mean()
+            na = np.sqrt(float((ac * ac).sum()))
+            nb = np.sqrt(float((bc * bc).sum()))
+            if na < 1e-6 or nb < 1e-6:
+                continue  # flat in this channel: contributes no correlation signal
+            num += w * float((ac * bc).sum())
+            den += w * na * nb
+        return num / den if den > 1e-6 else 0.0
+
+    @staticmethod
+    def _net_d4(orient: str, an: float) -> str | None:
+        """Net D4 code if residual angle ``an`` ≈ a 90° multiple, else ``None``.
+
+        Lets a copy whose keypoints recovered a ±90/180° rotation be verified by
+        the pixel-exact axis path under its true D4 orientation (this variant's D4
+        map composed with the k·90° turn), instead of leaking into the
+        resampling-lossy, FP-prone warp path.
+        """
+        deg = float(np.rad2deg(an))
+        k = int(round(deg / 90.0))
+        if abs(deg - 90.0 * k) > _D4_ANGLE_TOL_DEG:
+            return None
+        turn = ("R0", "R90", "R180", "R270")[k % 4]
+        net = (
+            np.asarray(_ORIENT_LINEAR[turn], np.float64)
+            @ np.asarray(_ORIENT_LINEAR[orient], np.float64)
+        )
+        return orientation_from_matrix(net)
+
+    def _verify(
+        self,
+        proposal: tuple,
+        tmpl_oriented_cache: dict[str, np.ndarray],
+        verify_image: np.ndarray,
+        full_h: int,
+        full_w: int,
+        warp_min_votes: int,
+        weights: "list[float] | None" = None,
+    ) -> tuple[tuple[int, int, int, int], float, str] | None:
+        """Verify a proposal by appearance. Returns ``(box, zncc, orient)`` or None.
+
+        ``verify_image`` and ``tmpl_oriented_cache`` are in the verification colour
+        space — single-channel luminance, or 3-channel rgb / ycbcr — and ``weights``
+        are the per-channel ZNCC weights; :meth:`_zncc` handles either, so this
+        routine is colour-blind.
+
+        Routing:
+          * Near-D4 (residual angle ≈ a 90° multiple, scale ≈ 1) -> pixel-exact
+            AXIS path: ZNCC the net-oriented template with a small local alignment
+            search (a cheap centre-prefilter rejects clear non-matches in one ZNCC).
+            This covers every aligned/mirrored PCB instance.
+          * Genuinely off-axis (arbitrary rotation/scale) -> INVERSE-WARP path:
+            warp the image window back into the upright-template frame and ZNCC,
+            refined over a small (angle, scale) grid, gated on strong vote support.
+            This is what the rotated-instance generality test exercises.
+        """
+        cv2 = self._cv2
+        cx, cy, sc, an, votes, orient, th0, tw0 = proposal
+
+        net_code = self._net_d4(orient, an) if 0.7 <= sc <= 1.4 else None
+        if net_code is not None:
+            tmpl = tmpl_oriented_cache.get(net_code)
+            if tmpl is None:
+                tmpl = np.ascontiguousarray(
+                    apply_orientation(tmpl_oriented_cache["R0"], net_code)
+                )
+                tmpl_oriented_cache[net_code] = tmpl
+            th, tw = tmpl.shape[:2]
+            sw = max(1, int(round(tw * sc)))
+            sh = max(1, int(round(th * sc)))
+            tw_img = (
+                cv2.resize(tmpl, (sw, sh), interpolation=cv2.INTER_AREA)
+                if sc != 1.0 else tmpl
+            )
+            bx0 = int(round(cx - sw / 2.0))
+            by0 = int(round(cy - sh / 2.0))
+            # Centre-prefilter: one ZNCC at the vote centre; a true copy within
+            # ±_NCC_SEARCH px cannot recover from a centre this far below the floor,
+            # so reject cheaply (the dominant runtime win on large templates).
+            if 0 <= bx0 <= full_w - sw and 0 <= by0 <= full_h - sh:
+                c = self._zncc(verify_image[by0:by0 + sh, bx0:bx0 + sw], tw_img, weights)
+                if c < _NCC_ACCEPT - _AXIS_PREFILTER_MARGIN:
+                    return None
+            # Local ±-px alignment search (the vote-median centre is a few px noisy
+            # — exactly what NCC/SSD slides over); keep the best alignment.
+            best_s, best_xy = -2.0, None
+            for dy in range(-_NCC_SEARCH, _NCC_SEARCH + 1):
+                for dx in range(-_NCC_SEARCH, _NCC_SEARCH + 1):
+                    x0, y0 = bx0 + dx, by0 + dy
+                    if x0 < 0 or y0 < 0 or x0 + sw > full_w or y0 + sh > full_h:
+                        continue
+                    win = verify_image[y0:y0 + sh, x0:x0 + sw]
+                    if win.shape != tw_img.shape:
+                        continue
+                    s = self._zncc(win, tw_img, weights)
+                    if s > best_s:
+                        best_s, best_xy = s, (x0, y0)
+            if best_xy is None or best_s < _NCC_ACCEPT:
+                return None
+            # Clamp the ZNCC confidence to [0, 1] (float rounding can nudge an
+            # exact-copy correlation a hair above 1.0).
+            return (best_xy[0], best_xy[1], sw, sh), min(1.0, max(0.0, best_s)), net_code
+
+        # General (off-axis) path — arbitrary rotation+scale, the generality test.
+        # Inverse-warp the IMAGE window back into the upright-template frame and
+        # ZNCC against the template (the smooth image is resampled once, so a
+        # genuine copy keeps high correlation), refined over a small (angle, scale)
+        # grid. Gated on strong vote support so the lenient floor cannot admit a
+        # spurious cross-copy warp.
+        if votes < warp_min_votes:
+            return None
+        tmpl = tmpl_oriented_cache[orient]
+        th_o, tw_o = tmpl.shape[:2]
+        corners = np.array([[0, 0], [tw_o, 0], [tw_o, th_o], [0, th_o]], np.float32)
+
+        def _inv_warp_zncc(angle, scale):
+            cos, sin = np.cos(angle), np.sin(angle)
+            # Forward affine: oriented-template coords -> image coords.
+            M = np.array([
+                [scale * cos, -scale * sin,
+                 cx - scale * (cos * (tw_o / 2.0) - sin * (th_o / 2.0))],
+                [scale * sin, scale * cos,
+                 cy - scale * (sin * (tw_o / 2.0) + cos * (th_o / 2.0))],
+            ], np.float32)
+            proj = (M[:, :2] @ corners.T).T + M[:, 2]
+            x0 = int(np.floor(proj[:, 0].min())); y0 = int(np.floor(proj[:, 1].min()))
+            x1 = int(np.ceil(proj[:, 0].max())); y1 = int(np.ceil(proj[:, 1].max()))
+            if x0 < 0 or y0 < 0 or x1 > full_w or y1 > full_h or x1 <= x0 or y1 <= y0:
+                return None
+            Minv = cv2.invertAffineTransform(M)
+            back = cv2.warpAffine(verify_image, Minv, (tw_o, th_o), flags=cv2.INTER_LINEAR)
+            return self._zncc(back, tmpl, weights), (x0, y0, x1 - x0, y1 - y0)
+
+        r0 = _inv_warp_zncc(an, sc)
+        if r0 is None or r0[0] < _NCC_ACCEPT_WARP - _WARP_PREFILTER:
+            return None
+        best_s, best_box = r0
+        best_a, best_sc = an, sc
+        for da in (-4.0, -2.0, 0.0, 2.0, 4.0):
+            for ds in (0.88, 0.94, 1.0, 1.06, 1.12):
+                if da == 0.0 and ds == 1.0:
+                    continue
+                a, s = an + np.deg2rad(da), sc * ds
+                r = _inv_warp_zncc(a, s)
+                if r is not None and r[0] > best_s:
+                    best_s, best_box, best_a, best_sc = r[0], r[1], a, s
+        for da in (-1.5, -0.75, 0.0, 0.75, 1.5):
+            for ds in (0.97, 0.985, 1.0, 1.015, 1.03):
+                if da == 0.0 and ds == 1.0:
+                    continue
+                a, s = best_a + np.deg2rad(da), best_sc * ds
+                r = _inv_warp_zncc(a, s)
+                if r is not None and r[0] > best_s:
+                    best_s, best_box = r[0], r[1]
+        if best_box is None or best_s < _NCC_ACCEPT_WARP:
+            return None
+        return best_box, min(1.0, max(0.0, best_s)), orient
 
     # -- helpers -------------------------------------------------------------
 
@@ -850,12 +1014,10 @@ class FeatureMatcher:
     def _drop_lattice_phantoms(results: list[Match]) -> list[Match]:
         """Remove lattice phantoms: a box engulfing several real detections.
 
-        On a repetitive pattern, RANSAC can fit a self-consistent homography over
-        features drawn from DIFFERENT copies, yielding one oversized box that spans
-        several true instances (e.g. a 2.3× box covering a row of copies). Such a
-        phantom is identified geometrically — its box contains the CENTRES of ≥ 2
-        other (smaller) detections — which is scale-agnostic, so it never drops a
-        legitimate larger-scale copy (that one does not engulf two others).
+        On a repetitive pattern an oversized box can span several true instances;
+        such a phantom is identified geometrically — its box contains the CENTRES
+        of ≥ 2 other (smaller) detections — which is scale-agnostic, so it never
+        drops a legitimate larger-scale copy.
         """
         n = len(results)
         if n < 3:
@@ -889,106 +1051,18 @@ class FeatureMatcher:
             return np.ascontiguousarray(arr.astype(np.uint8, copy=False))
         if arr.ndim == 3 and arr.shape[2] == 3:
             rgb = arr.astype(np.float32)
-            # BT.601 weights (R, G, B) — same convention as the engine's _BT601.
             lum = rgb[:, :, 0] * 0.299 + rgb[:, :, 1] * 0.587 + rgb[:, :, 2] * 0.114
             return np.ascontiguousarray(np.clip(np.rint(lum), 0, 255).astype(np.uint8))
         raise ValueError(f"template must be (th,tw,3) or (th,tw), got shape {arr.shape}")
-
-    def _project_to_box(
-        self,
-        cv2,
-        H: np.ndarray,
-        tmpl_corners: np.ndarray,
-        iw: int,
-        ih: int,
-    ) -> tuple[float, float, float, float] | None:
-        """Project the template corners through ``H`` and return an AABB.
-
-        Applies the degeneracy guards (§J.3 step 4): the affine part of ``H`` must
-        be well-conditioned (det not near-zero/negative — preserves orientation),
-        the projected corner quad must be convex with a positive, sane-scale area.
-        Returns ``(x, y, w, h)`` (detection-scale, clamped to the image) or
-        ``None`` if any guard fails.
-        """
-        # Affine-part determinant: reject near-singular / orientation-flipping
-        # (folded) maps. A negative det means the quad is mirrored — not a real
-        # same-handedness instance.
-        a, b, c, d = float(H[0, 0]), float(H[0, 1]), float(H[1, 0]), float(H[1, 1])
-        det = a * d - b * c
-        if det <= _MIN_AFFINE_DET:
-            return None
-        # Sane absolute scale: reject runaway blow-ups / collapses (§J.3 step 4).
-        # ``det`` is the *area* scale of the affine part; convert to a *linear*
-        # (per-axis) scale before comparing against the linear _MIN/_MAX bounds,
-        # otherwise a real 5x copy (det=25) would trip the threshold far too early.
-        lin = det ** 0.5
-        if lin > _MAX_SCALE or lin < _MIN_SCALE:
-            return None
-
-        proj = cv2.perspectiveTransform(tmpl_corners, H)
-        if proj is None:
-            return None
-        quad = proj.reshape(-1, 2)
-        if not np.all(np.isfinite(quad)):
-            return None
-
-        # Convex + positive area via the shoelace formula on the (ordered) quad.
-        area2 = self._signed_area2(quad)
-        if area2 <= 0:  # zero/negative -> degenerate or flipped
-            return None
-        if not self._is_convex(quad):
-            return None
-
-        xs = quad[:, 0]
-        ys = quad[:, 1]
-        x0 = float(np.clip(xs.min(), 0, iw))
-        y0 = float(np.clip(ys.min(), 0, ih))
-        x1 = float(np.clip(xs.max(), 0, iw))
-        y1 = float(np.clip(ys.max(), 0, ih))
-        w = x1 - x0
-        h = y1 - y0
-        if w < 1 or h < 1:
-            return None
-        return x0, y0, w, h
-
-    @staticmethod
-    def _signed_area2(quad: np.ndarray) -> float:
-        """Twice the signed area of a polygon (shoelace); >0 for CCW ordering."""
-        x = quad[:, 0]
-        y = quad[:, 1]
-        return float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
-
-    @staticmethod
-    def _is_convex(quad: np.ndarray) -> bool:
-        """True if the ordered quad is convex (all cross products same sign)."""
-        n = len(quad)
-        if n < 4:
-            return False
-        signs = []
-        for i in range(n):
-            p0 = quad[i]
-            p1 = quad[(i + 1) % n]
-            p2 = quad[(i + 2) % n]
-            e0 = p1 - p0
-            e1 = p2 - p1
-            cross = e0[0] * e1[1] - e0[1] * e1[0]
-            signs.append(cross)
-        signs = np.array(signs)
-        # Convex iff every turn goes the same way (ignore ~0 collinear edges).
-        pos = np.all(signs >= -1e-6)
-        neg = np.all(signs <= 1e-6)
-        return bool(pos or neg)
 
     @classmethod
     def _nms(cls, results: list[Match], nms_iou: float) -> list[Match]:
         """Greedy box-IoU non-max suppression over a score-sorted match list.
 
         Walks the (already score-descending) ``results`` keeping each box unless
-        its IoU with a higher-scored, already-kept box exceeds ``nms_iou`` — the
-        feature path's stand-in for the conv path's per-pixel NMS so one physical
-        instance fit twice by sequential RANSAC collapses to a single box. Uses
-        the box IoU (area overlap), so two genuinely distinct instances that merely
-        sit close are kept (their IoU stays low). Pure numpy/python (§U1).
+        its IoU with a higher-scored, already-kept box exceeds ``nms_iou`` — so one
+        physical instance proposed twice collapses to a single box, while two
+        genuinely distinct instances that merely sit close are kept.
         """
         kept: list[Match] = []
         for m in results:
@@ -1015,7 +1089,6 @@ class FeatureMatcher:
     ) -> bool:
         """True if ``m`` overlaps the source box past ``exclude_iou`` or is centered in it."""
         ex, ey, ew, eh = exclude_box
-        # IoU of the two half-open boxes.
         ix0 = max(m.x, ex)
         iy0 = max(m.y, ey)
         ix1 = min(m.x + m.w, ex + ew)
@@ -1027,7 +1100,6 @@ class FeatureMatcher:
         iou = inter / union if union > 0 else 0.0
         if iou > exclude_iou:
             return True
-        # Center-inside test.
         cx = m.x + m.w / 2.0
         cy = m.y + m.h / 2.0
         return (ex <= cx < ex + ew) and (ey <= cy < ey + eh)

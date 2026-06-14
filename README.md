@@ -153,7 +153,7 @@ exits; load that file separately to search it.
 | **Hold Space + drag**, or **middle-mouse drag** | Pan the view. |
 | **Left-drag** | Draw the selection box (the search template). |
 | **Run** button / **Auto Run** checkbox | With *Auto Run* on (default) the search runs whenever you draw a selection or change a setting. Turn it off to stage the selection + parameters and trigger a single search with **Run** (handy when each run is expensive). |
-| **Channel dropdown** | `luminance` renders the image (and matches) in **grayscale** — what the matcher sees in luminance mode; `rgb` shows it in colour. |
+| **Channel dropdown** | The colour space the matcher scores in: `luminance` (a single BT.601 luma plane), `rgb`, or `ycbcr`. The two colour modes are **multi-channel** (each channel correlated separately) and expose **per-channel weight sliders** (R,G,B or Y,Cb,Cr) — see [Channel modes & weights](#channel-modes--weights). |
 | Release a new selection | Runs the search (if Auto Run is on); any in-flight search is **auto-cancelled** (latest-wins). |
 | **Method dropdown** | Pick the matching method (NCC / SSD / CCORR / Feature matching). Changing it **re-runs** the search on the current selection. See [Matching methods](#matching-methods). |
 | **Rotation / Flipping checkboxes** | Also search the template under quarter-turn rotations and/or mirror reflections. Changing either **re-runs** the search. See [Orientation search](#orientation-search). |
@@ -205,7 +205,7 @@ slider stays a live, no-re-run client-side filter for every method.
 | **NCC** (default) | Normalized cross-correlation (CCOEFF). Subtracts the mean and divides by per-window variance, so it is **illumination-robust**. | **Textured, aligned, same-scale** instances — the general default. Needs some internal texture to normalize against. | **GPU** (CPU fallback) |
 | **SSD** | Normalized squared difference: `1 − RMSE` of the pixel-wise difference. | **Flat / low-texture / exact-appearance** regions, where NCC's variance normalization is unstable (or rejects the template outright). **Not** illumination-invariant — use it when brightness is consistent. | **GPU** (CPU fallback) |
 | **CCORR** | Cosine cross-correlation (CCORR_NORMED) — an alternate correlation measure that does not subtract the mean. | A correlation alternative to NCC; useful as a cross-check when NCC behaves oddly. | **GPU** (CPU fallback) |
-| **Feature matching** | ORB keypoints + Lowe ratio test + sequential RANSAC **homography**, returning multiple instances. | **Rotated / scaled / perspective-warped** instances that the template (window-based) methods miss — they only score a single fixed orientation and scale. | **CPU**, via OpenCV |
+| **Feature matching** | Dense ORB/AKAZE/SIFT keypoints **propose** a candidate at every repeated copy (one correspondence per copy — not the Lowe ratio test), and each candidate is **verified by appearance** (normalized cross-correlation). | **Rotated / scaled / perspective-warped** instances that the template (window-based) methods miss — and a feature-driven way to **reproduce the correlation methods' matches** on repetitive content. | **CPU**, via OpenCV |
 
 Notes:
 
@@ -217,14 +217,50 @@ Notes:
   variance normalization is ill-defined there. **SSD does not** — that is exactly
   its use case, so switch to SSD for solid-colour or very-low-texture targets.
 - **Feature matching runs on the CPU via OpenCV**, even when the correlation
-  methods are using CUDA. It detects features on a downsampled copy of the image
-  for speed and maps results back to full resolution. It ignores the scale grid
-  and channel-mode controls (it is inherently scale/rotation-tolerant and works
-  in grayscale); its detector (ORB / AKAZE / SIFT) and minimum-inlier count are
-  exposed in the panel instead.
+  methods are using CUDA. It detects keypoints **densely at full resolution**
+  (tiled so memory stays bounded; the per-image detection is cached and reused
+  across queries), proposes a candidate instance at every repeated copy, and
+  **verifies each by appearance** (zero-mean normalized cross-correlation) so its
+  hits line up with what the correlation methods would find — with very few false
+  positives. It ignores the scale grid (it is inherently scale/rotation-tolerant),
+  but it **honours the channel mode**: keypoint *detection* is always grayscale
+  (ORB/AKAZE/SIFT are), while in **rgb / ycbcr** mode the appearance verification
+  is colour-aware (a weighted per-channel NCC over the three channels) — useful
+  when copies match in luminance but differ in colour. Its detector (ORB / AKAZE /
+  SIFT) and match-count controls are exposed in the panel.
 - Feature matching requires **OpenCV** (`opencv-python-headless`, installed by
   the quickstart). If OpenCV is missing the dropdown greys that option out with a
   tooltip and the other three methods keep working.
+
+---
+
+## Channel modes & weights
+
+The **Channel mode** dropdown chooses the colour space every method scores in,
+and applies to **all four methods**:
+
+| Mode | What it matches on |
+|---|---|
+| **luminance** (default) | A single BT.601 luma plane — fastest, least memory. |
+| **rgb** | The three **R, G, B** channels, each correlated separately and combined with the **RGB weight sliders**. |
+| **ycbcr** | The three **Y, Cb, Cr** channels (BT.601), combined with the **YCbCr weight sliders**. |
+
+The colour modes are genuinely **multi-channel** — each channel is correlated on
+its own and the per-channel scores are summed (not flattened into one projected
+grey plane), so colour differences stay discriminative. When **rgb** or **ycbcr**
+is selected, three **weight sliders** appear (R/G/B or Y/Cb/Cr); they are
+**normalized to sum to 1.0** (the readout shows the normalized values) and weight
+each channel's contribution to the combined score. This works the same way for
+the GPU correlation methods (NCC/SSD/CCORR) and for feature matching's appearance
+verification. Some useful points in the space:
+
+- **Equal weights** reproduce the unweighted multi-channel behaviour.
+- A single **Y weight (1, 0, 0)** in ycbcr is exactly luminance matching.
+- **Chroma-weighted** ycbcr (weight on Cb/Cr, little or no Y) matches by *colour*:
+  it accepts only same-coloured copies and rejects ones that merely share the same
+  brightness — and conversely, weighting Y ignores colour and matches by shape.
+- Luminance stays the cheapest default; the colour modes stage extra per-channel
+  planes (ycbcr is derived lazily, only when first used).
 
 ---
 
@@ -248,8 +284,9 @@ orientation only. Two checkboxes in the params panel widen the search to the
 
 **All four methods honor these checkboxes.** The correlation methods
 (NCC / SSD / CCORR) re-run their score-map search once per active orientation
-and keep the best one per location; feature matching solves for the transform
-directly and classifies it. Each result records the orientation it was found
+and keep the best one per location; feature matching proposes the template under
+each active orientation, appearance-verifies each instance, and classifies the
+orientation it was found under. Each result records the orientation it was found
 under, so a hit can be a rotated or mirrored copy of your selection. With both
 boxes off, behaviour is exactly the upright-only search described above (no
 extra cost). Changing either checkbox re-runs the search on your current

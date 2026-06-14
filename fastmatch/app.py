@@ -135,14 +135,30 @@ class MainWindow(QMainWindow):
         # separately because it is not a Qt palette role.
         self._theme = theme.load_theme()
         self._viewport.set_background_color(theme.viewport_background(self._theme))
+        # Window-level QSS (muted secondary text + primary Run accent). Applied to
+        # the window, not the QApplication, so the global Fusion style stays intact
+        # while the QSS still cascades to the dock's banner/match-count/Run.
+        self.setStyleSheet(theme.theme_qss(self._theme))
 
         dock_body = QWidget(self)
         dock_layout = QVBoxLayout(dock_body)
+        # Zero the wrapper margins so the ParamsPanel's own 8px inset is the sole
+        # one — matching the Memory dock (whose panel is the dock widget) so both
+        # docks share one left edge.
+        dock_layout.setContentsMargins(0, 0, 0, 0)
+        dock_layout.setSpacing(0)
+        # The primary controls (Run / Method / Match parameters) lead the dock; the
+        # device/engine banner is a low-priority diagnostic, so it sits at the
+        # bottom (and the same hint is in the status bar).
         self._banner = QLabel(device_banner_text(self._resolved_device), dock_body)
         self._banner.setWordWrap(True)
         self._banner.setObjectName("deviceBanner")
-        dock_layout.addWidget(self._banner)
+        # Share the params panel's 8px horizontal inset so the dock column has one
+        # left edge (the panel uses setContentsMargins(8,...); the banner is a
+        # sibling in the dock layout and would otherwise sit 8px further left).
+        self._banner.setContentsMargins(8, 0, 8, 0)
         dock_layout.addWidget(self._params_panel)
+        dock_layout.addWidget(self._banner)
         dock_layout.addStretch(1)
 
         self._dock = QDockWidget("Search", self)
@@ -169,7 +185,7 @@ class MainWindow(QMainWindow):
         self._build_menus()
 
         # --- Status bar ----------------------------------------------------
-        self._cursor_label = QLabel("(-, -)", self)
+        self._cursor_label = QLabel("Cursor: (-, -)", self)
         self._area_label = QLabel("", self)        # physical area of the selection
         self._count_label = QLabel("0 matches", self)
         self._progress = QProgressBar(self)
@@ -210,14 +226,20 @@ class MainWindow(QMainWindow):
         tb.setObjectName("mainToolbar")
         self.addToolBar(tb)
 
-        self._act_open = QAction("Open", self)
+        # Toolbar uses sentence case ("Open image…") to match its siblings (Select
+        # mode / Clear matches); the File menu gets its own Title-Case "Open Image…"
+        # action below (menu convention: Close Image, Open Memory…).
+        self._act_open = QAction("Open image…", self)
+        self._act_open.setToolTip("Open an image to search (PNG / JPEG / TIFF / BMP).")
         self._act_open.triggered.connect(self._on_open)
         tb.addAction(self._act_open)
 
         tb.addSeparator()
 
-        # Mode toggle: checkable; unchecked == Select, checked == Pan.
-        self._act_mode = QAction("Pan mode", self)
+        # Mode toggle: checkable; unchecked == Select, checked == Pan. The label
+        # names the CURRENT mode (see _on_mode_toggled), so it starts "Select mode"
+        # to match the unchecked/Select startup state.
+        self._act_mode = QAction("Select mode", self)
         self._act_mode.setCheckable(True)
         self._act_mode.setToolTip("Toggle between Select (draw region) and Pan (drag to move).")
         self._act_mode.toggled.connect(self._on_mode_toggled)
@@ -225,20 +247,20 @@ class MainWindow(QMainWindow):
 
         self._act_fit = QAction("Fit", self)
         self._act_fit.setShortcut(QKeySequence("F"))  # F = zoom-to-fit
-        self._act_fit.setToolTip("Zoom to fit the whole image (F)")
+        self._act_fit.setToolTip("Zoom to fit the whole image (F).")
         self._act_fit.triggered.connect(self._viewport.fit_in_view)
         tb.addAction(self._act_fit)
 
+        tb.addSeparator()  # view group | results group
+
         self._act_clear = QAction("Clear matches", self)
+        self._act_clear.setToolTip(
+            "Clear the result boxes and the current selection (draw a new region to "
+            "search again)."
+        )
         self._act_clear.triggered.connect(self._on_clear_matches)
         tb.addAction(self._act_clear)
-
-        self._act_add_memory = QAction("Add to Memory", self)
-        self._act_add_memory.setToolTip(
-            "Save the current selection and its matches as a Memory entry."
-        )
-        self._act_add_memory.triggered.connect(self._on_add_to_memory)
-        tb.addAction(self._act_add_memory)
+        # "Add to Memory" lives only on the Memory dock now (was duplicated here).
 
         tb.addSeparator()
 
@@ -257,23 +279,25 @@ class MainWindow(QMainWindow):
         self._act_measure.triggered.connect(self._on_measure_tool)
         tb.addAction(self._act_measure)
 
-        tb.addSeparator()
-
+        # Self-test is a diagnostic, not a primary tool — the action is created here
+        # (toolbar build runs before the menus) but lives in the Help menu, not the
+        # toolbar (see _build_help_menu).
         self._act_selftest = QAction("Self-test", self)
         self._act_selftest.setToolTip(
             "Generate a labelled sample, search one motif, and report recall."
         )
         self._act_selftest.triggered.connect(self._on_self_test)
-        tb.addAction(self._act_selftest)
 
     def _build_menus(self) -> None:
         """Menu bar — File (image + memory ops) and View (box appearance)."""
         # Keep references on self: a menu held only by a local can have its C++
         # object GC-deleted by shiboken (-> "QMenu already deleted" on access).
         file_menu = self._file_menu = self.menuBar().addMenu("&File")
-        # Image operations.
-        self._act_open.setText("Open Image…")  # reuse the toolbar action
-        file_menu.addAction(self._act_open)
+        # Image operations. A dedicated Title-Case menu action (the toolbar keeps
+        # its own sentence-case "Open image…"); both trigger _on_open.
+        self._act_open_menu = QAction("Open Image…", self)
+        self._act_open_menu.triggered.connect(self._on_open)
+        file_menu.addAction(self._act_open_menu)
         self._act_close_image = QAction("Close Image", self)
         self._act_close_image.setToolTip("Close the current image and clear the view.")
         self._act_close_image.triggered.connect(self._on_close_image)
@@ -327,9 +351,25 @@ class MainWindow(QMainWindow):
         self._act_box_xor.toggled.connect(self._viewport.set_box_xor)
         boxes_menu.addAction(self._act_box_xor)
 
+        # Dock visibility toggles — a closed Search/Memory dock (the X on its title
+        # bar) would otherwise be unrecoverable without restarting. Qt's built-in
+        # toggleViewAction is a checkable show/hide that stays in sync automatically.
+        view_menu.addSeparator()
+        act_dock_search = self._dock.toggleViewAction()
+        act_dock_search.setText("&Search panel")
+        view_menu.addAction(act_dock_search)
+        act_dock_memory = self._memory_dock.toggleViewAction()
+        act_dock_memory.setText("&Memory panel")
+        view_menu.addAction(act_dock_memory)
+
         self._build_tools_menu()
         self._build_theme_menu()
         self._build_engine_menu()
+
+        # Help menu (last, by convention) — home of the Self-test diagnostic, which
+        # was demoted off the primary toolbar.
+        self._help_menu = self.menuBar().addMenu("&Help")
+        self._help_menu.addAction(self._act_selftest)
 
     def _build_tools_menu(self) -> None:
         """&Tools menu — physical-scale calibration and the measuring ruler.
@@ -378,6 +418,7 @@ class MainWindow(QMainWindow):
         self._theme = theme.apply_theme(app, key)  # palette + style + persist
         self._theme_actions[self._theme].setChecked(True)  # keep the radio honest
         self._viewport.set_background_color(theme.viewport_background(self._theme))
+        self.setStyleSheet(theme.theme_qss(self._theme))  # secondary text + Run accent
 
     def _build_engine_menu(self) -> None:
         """&Engine menu — pick the compute backend (CPU / CUDA / Auto) at runtime.
@@ -628,7 +669,7 @@ class MainWindow(QMainWindow):
         is no completed search to save.
         """
         if self._last_rect is None or not self._all_matches:
-            self.statusBar().showMessage("Run a match first to add to memory.", 6000)
+            self.statusBar().showMessage("Run a match first to add to Memory.", 6000)
             return
         visible = [m for m in self._all_matches if m.score >= self._params.threshold]
         rect = self._last_rect
@@ -637,7 +678,7 @@ class MainWindow(QMainWindow):
         # NMS/feature params, ...) via the full MatchParams snapshot.
         entry = MemoryEntry(selection=sel, params=self._params, matches=list(visible))
         self._memory.add_entry(entry)
-        self.statusBar().showMessage(f"Added {len(visible)} matches to memory.", 6000)
+        self.statusBar().showMessage(f"Added {len(visible)} matches to Memory.", 6000)
 
     def _on_revisit_entry(self, entry: object) -> None:
         """Recall a saved entry: restore its reference box and matches (revisit).
@@ -865,9 +906,9 @@ class MainWindow(QMainWindow):
         """
         self._last_cursor = None if (x < 0 or y < 0) else (x, y)
         if self._last_cursor is None:
-            self._cursor_label.setText("(-, -)")
+            self._cursor_label.setText("Cursor: (-, -)")
             return
-        text = f"({x}, {y}) px"
+        text = f"Cursor: ({x}, {y}) px"
         if self._calibration is not None:
             text += "   " + self._calibration.format_point(x, y)
         self._cursor_label.setText(text)

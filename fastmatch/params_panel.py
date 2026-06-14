@@ -9,13 +9,17 @@ matching ``DESIGN.md`` §H — CUDA scales ``(0.8, 0.9, 1.0, 1.1, 1.25)``, CPU
 ``(1.0,)``.
 
 A **Method** selector sits at the top (``DESIGN.md`` §J.5). The convolution
-methods (``ncc``/``ssd``/``ccorr``) share the GPU tiled machinery and expose the
-scale + channel controls; ``features`` (ORB/AKAZE/SIFT + RANSAC homography) is
-inherently scale/rotation tolerant and grayscale, so it instead exposes a
-detector + minimum-inliers control. The two control sets are swapped with a
-``QStackedWidget`` so only the relevant knobs are visible. The ``features``
-option is disabled (greyed, with an install hint) when OpenCV is not importable;
-we probe ``import cv2`` once at construction and *never* hard-depend on it.
+methods (``ncc``/``ssd``/``ccorr``) share the GPU tiled machinery and expose a
+scale-search control; ``features`` (ORB/AKAZE/SIFT, propose + appearance-verify)
+is inherently scale/rotation tolerant, so it instead exposes a detector +
+match-count control. Those method-specific sets are swapped with a
+``QStackedWidget`` so only the relevant knobs are visible. The **channel mode**
+(luminance/rgb) is common to all methods — it lives in the always-visible params
+box (conv methods combine the channels before normalizing; the feature method's
+appearance verification becomes colour-aware while detection stays grayscale).
+The ``features`` option is disabled (greyed, with an install hint) when OpenCV is
+not importable; we probe ``import cv2`` once at construction and *never*
+hard-depend on it.
 
 Threshold is special: it is a *live UI filter* (the engine returns everything at
 or above ``threshold_floor`` and the overlay filters up to ``threshold`` with no
@@ -30,6 +34,7 @@ we only nudge the default on a method switch and otherwise respect manual edits.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -46,12 +51,29 @@ from PySide6.QtWidgets import (
 )
 
 from .types import (
+    CHANNEL_MODE_LABELS,
+    CHANNEL_MODES,
+    CHANNEL_NAMES,
     CONV_METHODS,
     METHOD_LABELS,
     METHODS,
+    ORIENTATION_LABELS,
     MatchParams,
     active_orientations,
+    normalize_weights,
 )
+
+#: Channel-weight slider resolution (ticks per slider; value/100 == the weight).
+_WEIGHT_TICKS = 100
+
+#: Labels in the parent "Match parameters" form. Their widest text sets that
+#: form's label-column width; nested sub-forms (the weight groups, the feature
+#: form) pin their own labels to the same width so every field in the panel
+#: shares one left edge instead of stepping left at each sub-form.
+_PARENT_FORM_LABELS = ("Threshold", "Max results", "Channel mode")
+
+#: Display casing for a multi-channel mode's weight-group title (mode key -> label).
+_MODE_DISPLAY = {"rgb": "RGB", "ycbcr": "YCbCr"}
 
 # Default multi-scale grids (DESIGN.md §H). CPU stays single-scale to avoid the
 # len(scales)x cost on a backend that is already minutes-slow.
@@ -134,7 +156,15 @@ class ParamsPanel(QWidget):
         # re-emit while we are mid-construction or mid-sync.
         self._emitting = False
 
+        # Width of the parent "Match parameters" form's label column (the widest
+        # of its labels). Nested sub-forms pin their labels to this so all fields
+        # share one left edge. Computed from the panel font so it tracks the theme.
+        fm = QFontMetrics(self.font())
+        self._label_col_width = max(fm.horizontalAdvance(t) for t in _PARENT_FORM_LABELS)
+
         root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)  # even outer breathing room
+        root.setSpacing(8)                    # consistent gap between sibling groups
 
         # --- Run controls (top) --------------------------------------------
         # A manual "Run" button plus an "Auto Run" toggle. Auto Run defaults ON
@@ -144,11 +174,15 @@ class ParamsPanel(QWidget):
         # run is expensive, e.g. CPU multi-scale).
         run_row = QHBoxLayout()
         self._run_button = QPushButton("Run", self)
+        # objectName + default flag mark Run as the primary action; theme._theme_qss
+        # gives it an accent on :enabled (the disabled state keeps the palette grey).
+        self._run_button.setObjectName("runButton")
+        self._run_button.setDefault(True)
         self._run_button.setToolTip("Run the search on the current selection.")
         self._run_button.setEnabled(False)  # enabled once a region is selected
         self._run_button.clicked.connect(lambda *_: self.run_clicked.emit())
         run_row.addWidget(self._run_button, 1)
-        self._auto_run = QCheckBox("Auto Run", self)
+        self._auto_run = QCheckBox("Auto run", self)
         self._auto_run.setChecked(True)
         self._auto_run.setToolTip(
             "When on, the search runs automatically as you draw a selection or "
@@ -161,6 +195,8 @@ class ParamsPanel(QWidget):
         # --- Method selector (top, DESIGN.md §J.5) -------------------------
         method_box = QGroupBox("Method", self)
         method_layout = QVBoxLayout(method_box)
+        method_layout.setContentsMargins(8, 4, 8, 8)
+        method_layout.setSpacing(6)
         self._method = QComboBox(self)
         for key in METHODS:
             # Store the method key as item data; show the human-readable label.
@@ -185,8 +221,14 @@ class ParamsPanel(QWidget):
         # --- Match parameters group ----------------------------------------
         params_box = QGroupBox("Match parameters", self)
         form = QFormLayout(params_box)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setContentsMargins(8, 4, 8, 8)
+        form.setVerticalSpacing(8)
+        form.setHorizontalSpacing(8)
 
-        # Threshold: live [0, 1] filter, default tracks the selected method.
+        # Threshold: live [0, 1] filter, default tracks the selected method. The
+        # numeric value sits right-aligned on the slider's own row (no orphan row).
         self._threshold = QSlider(Qt.Orientation.Horizontal, self)
         self._threshold.setRange(0, _THRESH_TICKS)
         self._threshold.setValue(int(round(self._default_threshold() * _THRESH_TICKS)))
@@ -194,27 +236,56 @@ class ParamsPanel(QWidget):
             "Minimum match score to display. This filters live (no re-run)."
         )
         self._threshold_label = QLabel(self)
+        self._threshold_label.setMinimumWidth(44)
+        self._threshold_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
         self._threshold.valueChanged.connect(self._on_threshold_changed)
-        form.addRow("Threshold", self._threshold)
-        form.addRow("", self._threshold_label)
+        thresh_row = QHBoxLayout()
+        thresh_row.addWidget(self._threshold, 1)
+        thresh_row.addWidget(self._threshold_label)
+        form.addRow(self._form_label("Threshold"), thresh_row)
 
         # Max results: cap after NMS, default 500.
         self._max_results = QSpinBox(self)
         self._max_results.setRange(1, 100_000)
         self._max_results.setValue(MatchParams.max_results)
-        self._max_results.setToolTip("Maximum number of matches returned (cap after NMS).")
-        self._max_results.valueChanged.connect(self._on_param_changed)
-        form.addRow("Max results", self._max_results)
-
-        # Channel mode combo: luminance (fast, default) or rgb. Conv-only; the
-        # feature path is grayscale, so this lives in the conv control page.
-        self._channel_mode = QComboBox(self)
-        self._channel_mode.addItems(["luminance", "rgb"])
-        self._channel_mode.setToolTip(
-            "luminance: single-channel NCC (3x less VRAM). rgb: combine all three "
-            "channels before normalizing."
+        self._max_results.setToolTip(
+            "Maximum number of matches returned (the cap applied after overlapping "
+            "detections are merged)."
         )
-        self._channel_mode.currentIndexChanged.connect(self._on_param_changed)
+        self._max_results.valueChanged.connect(self._on_param_changed)
+        form.addRow(self._form_label("Max results"), self._max_results)
+
+        # Channel mode combo: luminance (fast, default), rgb, or ycbcr. Applies to
+        # ALL methods — the conv methods combine the channels before normalizing,
+        # and the feature method's appearance verification becomes colour-aware
+        # (detection stays grayscale) — so it lives in the always-visible params box.
+        self._channel_mode = QComboBox(self)
+        # Descriptive labels (mirroring the Method combo), keyed by the mode key in
+        # userData so the emitted value stays "luminance"/"rgb"/"ycbcr".
+        for _key in CHANNEL_MODES:
+            self._channel_mode.addItem(CHANNEL_MODE_LABELS.get(_key, _key), userData=_key)
+        self._channel_mode.setToolTip(
+            "Luminance: single BT.601 luma plane (faster, less VRAM). RGB / YCbCr: "
+            "weighted multi-channel matching (per-channel weights below) — applies "
+            "to NCC/SSD/CCORR and feature matching's appearance verification."
+        )
+        self._channel_mode.currentIndexChanged.connect(self._on_channel_mode_changed)
+        form.addRow(self._form_label("Channel mode"), self._channel_mode)
+
+        # Per-channel weight sliders for the multi-channel modes (one group each;
+        # only the active mode's group is shown). The three sliders are relative
+        # weights; the matcher normalizes them to sum to 1.0 and the readout shows
+        # the normalized values. Default equal weights == unweighted multi-channel.
+        self._rgb_weight_box, self._rgb_weight_sliders, self._rgb_weight_readout = (
+            self._make_weight_group("rgb")
+        )
+        self._ycbcr_weight_box, self._ycbcr_weight_sliders, self._ycbcr_weight_readout = (
+            self._make_weight_group("ycbcr")
+        )
+        form.addRow(self._rgb_weight_box)
+        form.addRow(self._ycbcr_weight_box)
 
         root.addWidget(params_box)
 
@@ -224,24 +295,42 @@ class ParamsPanel(QWidget):
         # change so only the relevant knobs are visible (DESIGN.md §J.5).
         self._method_stack = QStackedWidget(self)
 
-        # Page 0: convolution-only controls.
+        # Page 0: convolution-only controls (scale search). Channel mode moved to
+        # the always-visible params box above (it now applies to features too).
         conv_box = QGroupBox("Scale search", self)
+        conv_box.setFlat(True)  # secondary group: title rule only, no full frame
         conv_layout = QVBoxLayout(conv_box)
-        conv_form = QFormLayout()
-        conv_form.addRow("Channel mode", self._channel_mode)
-        conv_layout.addLayout(conv_form)
+        conv_layout.setContentsMargins(8, 4, 8, 4)
+        conv_layout.setSpacing(6)
         self._multiscale = QCheckBox("Search multiple scales", self)
         # Always connect the signal (even though it starts disabled on CPU) so it
-        # works after a runtime CPU->CUDA engine switch; enable/checked/tooltip are
-        # set by _apply_device_to_multiscale, called here and on set_device().
+        # works after a runtime CPU->CUDA engine switch; enable/checked/tooltip and
+        # the hint below are set by _apply_device_to_multiscale (here + set_device).
         self._multiscale.toggled.connect(self._on_param_changed)
+        # Muted reason shown only when the control is disabled (CPU), so the greyed
+        # checkbox is not an unexplained dead control. Reuses the secondary-text QSS.
+        self._multiscale_hint = QLabel(self)
+        self._multiscale_hint.setObjectName("matchCount")
+        self._multiscale_hint.setWordWrap(True)
         self._apply_device_to_multiscale()
         conv_layout.addWidget(self._multiscale)
+        conv_layout.addWidget(self._multiscale_hint)
+        # The stacked widget sizes to the taller (feature) page; pin content to the
+        # top instead of letting it float centered in the slack.
+        conv_layout.addStretch(1)
         self._method_stack.addWidget(conv_box)  # index 0
 
         # Page 1: feature-matching controls.
         feature_box = QGroupBox("Feature matching", self)
+        feature_box.setFlat(True)  # secondary group, matching Scale search / Orientation
         feature_form = QFormLayout(feature_box)
+        feature_form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        feature_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        feature_form.setContentsMargins(8, 4, 8, 8)
+        feature_form.setVerticalSpacing(8)
+        feature_form.setHorizontalSpacing(8)
         self._feature_detector = QComboBox(self)
         for det in _FEATURE_DETECTORS:
             self._feature_detector.addItem(_FEATURE_DETECTOR_LABELS[det], userData=det)
@@ -251,17 +340,17 @@ class ParamsPanel(QWidget):
             "Feature matching runs on CPU via OpenCV."
         )
         self._feature_detector.currentIndexChanged.connect(self._on_param_changed)
-        feature_form.addRow("Detector", self._feature_detector)
+        feature_form.addRow(self._form_label("Detector"), self._feature_detector)
 
         self._feature_min_inliers = QSpinBox(self)
         self._feature_min_inliers.setRange(4, 10_000)
         self._feature_min_inliers.setValue(MatchParams.feature_min_inliers)
         self._feature_min_inliers.setToolTip(
-            "Minimum RANSAC inliers required to accept one instance. Lower finds "
-            "more (and weaker) instances; higher is stricter."
+            "Minimum number of verified feature matches required to accept one "
+            "instance. Lower finds more (and weaker) instances; higher is stricter."
         )
         self._feature_min_inliers.valueChanged.connect(self._on_param_changed)
-        feature_form.addRow("Min inliers", self._feature_min_inliers)
+        feature_form.addRow(self._form_label("Min matches"), self._feature_min_inliers)
         self._method_stack.addWidget(feature_box)  # index 1
 
         root.addWidget(self._method_stack)
@@ -274,8 +363,11 @@ class ParamsPanel(QWidget):
         # default off, so with neither checked the search is the upright "R0"
         # template only — byte-for-byte the prior behaviour.
         orient_box = QGroupBox("Orientation", self)
+        orient_box.setFlat(True)  # secondary group: title rule only, no full frame
         orient_layout = QVBoxLayout(orient_box)
-        self._enable_rotation = QCheckBox("Enable Rotation", self)
+        orient_layout.setContentsMargins(8, 4, 8, 4)
+        orient_layout.setSpacing(6)
+        self._enable_rotation = QCheckBox("Enable rotation", self)
         self._enable_rotation.setChecked(MatchParams.enable_rotation)
         self._enable_rotation.setToolTip(
             "Also search the template rotated 90°, 180°, and 270°."
@@ -283,7 +375,7 @@ class ParamsPanel(QWidget):
         self._enable_rotation.toggled.connect(self._on_orientation_changed)
         orient_layout.addWidget(self._enable_rotation)
 
-        self._enable_flipping = QCheckBox("Enable Flipping", self)
+        self._enable_flipping = QCheckBox("Enable flipping", self)
         self._enable_flipping.setChecked(MatchParams.enable_flipping)
         self._enable_flipping.setToolTip(
             "Also search mirrored templates. Combined with rotation this adds the "
@@ -300,6 +392,7 @@ class ParamsPanel(QWidget):
 
         # --- Match-count readout -------------------------------------------
         self._count_label = QLabel(self)
+        self._count_label.setObjectName("matchCount")  # muted secondary (theme QSS)
         self._count_label.setTextFormat(Qt.TextFormat.PlainText)
         root.addWidget(self._count_label)
 
@@ -309,6 +402,8 @@ class ParamsPanel(QWidget):
         self._sync_threshold_label()
         self._sync_orientation_label()
         self._sync_method_page()
+        self._sync_weight_readouts()
+        self._sync_weight_visibility()
         self.set_match_count(0)
 
     # ------------------------------------------------------------------ helpers
@@ -374,11 +469,97 @@ class ParamsPanel(QWidget):
         )
         n = len(active)
         plural = "orientation" if n == 1 else "orientations"
-        self._orientation_label.setText(f"{n} {plural}: {', '.join(active)}")
+        names = ", ".join(ORIENTATION_LABELS.get(o, o) for o in active)
+        self._orientation_label.setText(f"{n} {plural}: {names}")
 
     def _sync_method_page(self) -> None:
         """Show the control page (conv vs features) matching the current method."""
         self._method_stack.setCurrentIndex(0 if self._is_conv_method() else 1)
+
+    def _form_label(self, text: str) -> QLabel:
+        """A right-aligned form label pinned to the parent label-column width.
+
+        Used for the nested sub-forms (weight groups, feature form) so their
+        fields share the same left edge as the parent "Match parameters" form
+        instead of stepping left under their own (narrower) label column.
+        """
+        lbl = QLabel(text, self)
+        lbl.setMinimumWidth(self._label_col_width)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        return lbl
+
+    # ------------------------------------------------------- channel weights
+    def _make_weight_group(self, mode: str):
+        """Build a 3-slider weight group for ``mode`` ("rgb" / "ycbcr").
+
+        Returns ``(box, sliders, readout)``. The sliders are relative weights
+        (0..``_WEIGHT_TICKS``); the matcher normalizes them to sum to 1.0 and the
+        readout shows the normalized values. Defaults track ``MatchParams`` (equal
+        weights == unweighted multi-channel). Signals are connected AFTER the
+        initial ``setValue`` so construction never emits.
+        """
+        names = CHANNEL_NAMES[mode]
+        init = (
+            MatchParams().rgb_weights if mode == "rgb" else MatchParams().ycbcr_weights
+        )
+        box = QGroupBox(f"{_MODE_DISPLAY.get(mode, mode.upper())} channel weights", self)
+        box.setFlat(True)  # nested sub-section: avoid a frame-within-a-frame
+        lay = QFormLayout(box)
+        lay.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        lay.setContentsMargins(8, 4, 8, 6)
+        lay.setVerticalSpacing(6)
+        sliders: list[QSlider] = []
+        for i, nm in enumerate(names):
+            s = QSlider(Qt.Orientation.Horizontal, self)
+            s.setRange(0, _WEIGHT_TICKS)
+            s.setValue(int(round(float(init[i]) * _WEIGHT_TICKS)))
+            s.setToolTip(
+                f"Relative weight of the {nm} channel "
+                "(the three are normalized to sum to 1.0)."
+            )
+            s.valueChanged.connect(self._on_weight_changed)
+            # Pin the (single-letter) label to the parent form's label-column
+            # width so the slider lines up under the Channel-mode combo above
+            # instead of jutting left of every other field in the box.
+            lay.addRow(self._form_label(nm), s)
+            sliders.append(s)
+        readout = QLabel(self)
+        readout.setTextFormat(Qt.TextFormat.PlainText)
+        lay.addRow(readout)
+        return box, sliders, readout
+
+    def _weights_for(self, mode: str) -> tuple[float, float, float]:
+        """Normalized weights from the ``mode`` group's sliders (sum to 1.0)."""
+        sliders = self._rgb_weight_sliders if mode == "rgb" else self._ycbcr_weight_sliders
+        return normalize_weights([s.value() for s in sliders], 3)  # type: ignore[return-value]
+
+    def _sync_weight_readouts(self) -> None:
+        """Refresh both groups' normalized-weight readout labels."""
+        for mode, readout in (
+            ("rgb", self._rgb_weight_readout),
+            ("ycbcr", self._ycbcr_weight_readout),
+        ):
+            w = self._weights_for(mode)
+            names = CHANNEL_NAMES[mode]
+            readout.setText(
+                " ".join(f"{n} {v:.2f}" for n, v in zip(names, w)) + " (sum 1.00)"
+            )
+
+    def _sync_weight_visibility(self) -> None:
+        """Show only the active multi-channel mode's weight group (none for luma)."""
+        mode = self._channel_mode.currentData()
+        self._rgb_weight_box.setVisible(mode == "rgb")
+        self._ycbcr_weight_box.setVisible(mode == "ycbcr")
+
+    def _on_channel_mode_changed(self, *args: object) -> None:
+        """Channel mode switched: show the right weight group, then emit."""
+        self._sync_weight_visibility()
+        self._on_param_changed()
+
+    def _on_weight_changed(self, *args: object) -> None:
+        """A weight slider moved: refresh the readout, then emit (re-runs)."""
+        self._sync_weight_readouts()
+        self._on_param_changed()
 
     # ------------------------------------------------------------------- slots
     def _on_method_changed(self, *args: object) -> None:
@@ -454,7 +635,9 @@ class ParamsPanel(QWidget):
             exclude_iou=MatchParams.exclude_iou,
             device="auto",
             compute_dtype=MatchParams.compute_dtype,
-            channel_mode=self._channel_mode.currentText(),
+            channel_mode=self._channel_mode.currentData(),
+            rgb_weights=self._weights_for("rgb"),
+            ycbcr_weights=self._weights_for("ycbcr"),
             method=self._current_method(),
             enable_rotation=self._enable_rotation.isChecked(),
             enable_flipping=self._enable_flipping.isChecked(),
@@ -490,15 +673,18 @@ class ParamsPanel(QWidget):
                 self._multiscale.setChecked(True)
                 self._multiscale.setToolTip(
                     "Search the scale grid "
-                    f"{', '.join(f'{s:g}x' for s in _SCALES_CUDA)} (GPU only)."
+                    f"{', '.join(f'{s:g}×' for s in _SCALES_CUDA)} (GPU only)."
                 )
+                self._multiscale_hint.setVisible(False)
             else:
                 self._multiscale.setChecked(False)
                 self._multiscale.setEnabled(False)
                 self._multiscale.setToolTip(
-                    "Multi-scale search is GPU-only; CPU is locked to 1.0x to keep "
+                    "Multi-scale search is GPU-only; CPU is locked to 1.0× to keep "
                     "queries responsive."
                 )
+                self._multiscale_hint.setText("GPU only — CPU is locked to 1.0×.")
+                self._multiscale_hint.setVisible(True)
         finally:
             self._multiscale.blockSignals(blocked)
 

@@ -311,6 +311,8 @@ def _entry_with_full_params() -> MemoryEntry:
         device="cpu",
         compute_dtype="float16",
         channel_mode="rgb",
+        rgb_weights=(0.5, 0.3, 0.2),
+        ycbcr_weights=(0.6, 0.25, 0.15),
         method="features",
         enable_rotation=True,
         enable_flipping=True,
@@ -344,6 +346,9 @@ def test_params_dict_round_trip_preserves_all_fields() -> None:
     assert isinstance(back.scales, tuple) and back.scales == (0.9, 1.0, 1.1)
     assert back.rotations is None
     assert back.channel_mode == "rgb"
+    # Per-channel weights round-trip as tuples.
+    assert isinstance(back.rgb_weights, tuple) and back.rgb_weights == (0.5, 0.3, 0.2)
+    assert back.ycbcr_weights == (0.6, 0.25, 0.15)
 
 
 def test_full_params_survive_dict_and_file_round_trip(tmp_path) -> None:

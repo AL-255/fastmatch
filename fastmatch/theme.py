@@ -81,7 +81,7 @@ def _dark_palette() -> QPalette:
     window = C(53, 53, 53)
     base = C(35, 35, 35)
     text = C(220, 220, 220)
-    highlight = C(42, 130, 218)
+    highlight = C(58, 150, 235)
 
     pal.setColor(Role.Window, window)
     pal.setColor(Role.WindowText, text)
@@ -93,12 +93,22 @@ def _dark_palette() -> QPalette:
     pal.setColor(Role.Button, window)
     pal.setColor(Role.ButtonText, text)
     pal.setColor(Role.BrightText, C(255, 80, 80))
-    pal.setColor(Role.Link, highlight)
+    pal.setColor(Role.Link, C(80, 170, 235))  # lighter than the selection fill
     pal.setColor(Role.Highlight, highlight)
     pal.setColor(Role.HighlightedText, C(15, 15, 15))
     pal.setColor(Role.PlaceholderText, C(140, 140, 140))
 
-    disabled = C(120, 120, 120)
+    # 3D bevel roles. Fusion's standardPalette leaves these at LIGHT greys, which
+    # makes QGroupBox frames and the slider groove nearly invisible on a dark
+    # window. Place the lighter bevels just ABOVE Window (53) and the darker ones
+    # BELOW it so recessed edges read as real steps.
+    pal.setColor(Role.Light, C(75, 75, 75))
+    pal.setColor(Role.Midlight, C(64, 64, 64))
+    pal.setColor(Role.Mid, C(44, 44, 44))
+    pal.setColor(Role.Dark, C(25, 25, 25))
+    pal.setColor(Role.Shadow, C(15, 15, 15))
+
+    disabled = C(150, 150, 150)
     for role in (Role.WindowText, Role.Text, Role.ButtonText):
         pal.setColor(Group.Disabled, role, disabled)
     pal.setColor(Group.Disabled, Role.Highlight, C(70, 70, 70))
@@ -107,8 +117,21 @@ def _dark_palette() -> QPalette:
 
 
 def _light_palette() -> QPalette:
-    """Fusion's standard (light) palette — clean and canonical."""
-    return QStyleFactory.create("Fusion").standardPalette()
+    """Fusion's standard (light) palette, with disabled text and accent tuned.
+
+    Fusion's stock disabled foreground (#bebebe ~1.6:1 on Window) is barely
+    legible, so we darken it; the Highlight/Link are harmonized to the app accent
+    so white selected-row text clears AA contrast and links lose the harsh pure blue.
+    """
+    pal = QStyleFactory.create("Fusion").standardPalette()
+    Role = QPalette.ColorRole
+    for role in (Role.WindowText, Role.Text, Role.ButtonText):
+        # ~3.8:1 on the light window — legible-but-dimmed, matching the dark theme's
+        # disabled parity (Fusion's stock #bebebe was a near-invisible ~1.6:1).
+        pal.setColor(QPalette.ColorGroup.Disabled, role, QColor(120, 120, 120))
+    pal.setColor(Role.Highlight, QColor(23, 105, 170))
+    pal.setColor(Role.Link, QColor(11, 95, 176))
+    return pal
 
 
 def build_palette(key: str) -> QPalette | None:
@@ -118,6 +141,42 @@ def build_palette(key: str) -> QPalette | None:
     if key == "light":
         return _light_palette()
     return None  # system -> restore captured default
+
+
+def theme_qss(key: str) -> str:
+    """Narrow, objectName-scoped QSS to apply on the MAIN WINDOW for theme ``key``.
+
+    Two purposes only: mute the secondary diagnostic text (``deviceBanner`` and
+    the ``matchCount`` readout) and give the primary Run button (``runButton``) an
+    accent — scoped to ``:enabled`` so the disabled state still uses the palette's
+    Disabled group. Empty for ``"system"`` so nothing is overridden. Only these
+    three object names are targeted, so no other widget changes.
+
+    Applied at the *widget* level (``window.setStyleSheet(...)``), NOT on the
+    QApplication: an app-level stylesheet wraps the style in a QStyleSheetStyle
+    proxy (``app.style().objectName()`` becomes ""), whereas a widget stylesheet
+    leaves the global Fusion style intact while still cascading to these children.
+    """
+    if key == "dark":
+        secondary = "#9a9a9a"
+        run = (
+            "QPushButton#runButton:enabled{background:#3a96eb;color:#0f0f0f;"
+            "font-weight:600;border:none;padding:5px;}"
+            "QPushButton#runButton:enabled:hover{background:#52a6f2;}"
+        )
+    elif key == "light":
+        secondary = "#5f6b76"
+        run = (
+            "QPushButton#runButton:enabled{background:#1769aa;color:#ffffff;"
+            "border:1px solid #135a93;font-weight:600;padding:4px 12px;}"
+            "QPushButton#runButton:enabled:hover{background:#1f7bc0;}"
+        )
+    else:
+        return ""
+    return (
+        f"QLabel#deviceBanner{{color:{secondary};font-size:11px;}}"
+        f"QLabel#matchCount{{color:{secondary};}}" + run
+    )
 
 
 def viewport_background(key: str) -> QColor:

@@ -110,11 +110,19 @@ class MemoryPanel(QWidget):
         self._current_path: str | None = None
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)  # match the Search dock's tuned inset
+        root.setSpacing(8)                    # ...and rhythm, so both docks read as one
 
         # --- Header: source image basename + entry count -------------------
         self._header_label = QLabel(self)
         self._header_label.setTextFormat(Qt.TextFormat.PlainText)
         root.addWidget(self._header_label)
+        # Surface the otherwise-invisible recall gesture (double-click). Muted via
+        # the shared "matchCount" secondary-text style hook (themed in theme.py).
+        self._hint_label = QLabel("Double-click an entry to restore its boxes and selection.", self)
+        self._hint_label.setObjectName("matchCount")
+        self._hint_label.setTextFormat(Qt.TextFormat.PlainText)
+        root.addWidget(self._hint_label)
 
         # --- Entry table (read-only, full-row, multi-row selection) --------
         self._table = QTableWidget(0, len(_COLUMNS), self)
@@ -132,6 +140,7 @@ class MemoryPanel(QWidget):
         for col in range(1, len(_COLUMNS)):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         # Double-click a row -> revisit that entry.
+        self._table.setToolTip("Double-click an entry to restore its boxes and selection.")
         self._table.itemDoubleClicked.connect(self._on_item_double_clicked)
         root.addWidget(self._table, 1)
 
@@ -159,8 +168,21 @@ class MemoryPanel(QWidget):
         root.addLayout(buttons)
 
         self._sync_header()
+        self._sync_button_state()
 
     # ------------------------------------------------------------------ helpers
+    def _sync_button_state(self) -> None:
+        """Enable Rename/Remove only when there is at least one entry to act on.
+
+        "Add to Memory" stays enabled (it is the meaningful action on an empty
+        list); the two row-acting buttons are dead with no entries — Remove
+        no-ops and Rename only pops a "select an entry" prompt — so we grey them
+        out to keep the empty-state affordance honest.
+        """
+        has_entries = len(self._entries) > 0
+        self._rename_button.setEnabled(has_entries)
+        self._remove_button.setEnabled(has_entries)
+
     def _sync_header(self) -> None:
         """Refresh the header label from the current source + entry count."""
         n = len(self._entries)
@@ -241,6 +263,7 @@ class MemoryPanel(QWidget):
         for entry in self._entries:
             self._append_row(entry)
         self._sync_header()
+        self._sync_button_state()
 
     # ------------------------------------------------------------------- slots
     def _on_item_double_clicked(self, item: QTableWidgetItem) -> None:
@@ -303,6 +326,7 @@ class MemoryPanel(QWidget):
                 self._table.removeRow(row)
                 del self._entries[row]
         self._sync_header()
+        self._sync_button_state()
 
     # --------------------------------------------------------- file operations
     def current_memory_path(self) -> str | None:
@@ -318,7 +342,7 @@ class MemoryPanel(QWidget):
         store, remembers the path, and re-emits it via ``store_loaded``.
         Returns whether a store was loaded.
         """
-        path, _ = QFileDialog.getOpenFileName(self, "Open memory", "", _JSON_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, "Open Memory", "", _JSON_FILTER)
         if not path:
             return False  # user cancelled
         try:
@@ -340,7 +364,7 @@ class MemoryPanel(QWidget):
     def save_memory_as(self) -> bool:
         """Prompt for a path and write the current store as JSON; remember it."""
         start = self._current_path or ""
-        path, _ = QFileDialog.getSaveFileName(self, "Save memory as", start, _JSON_FILTER)
+        path, _ = QFileDialog.getSaveFileName(self, "Save Memory As", start, _JSON_FILTER)
         if not path:
             return False  # user cancelled
         path = _ensure_json_suffix(path)  # write "name" as "name.json"
@@ -369,6 +393,7 @@ class MemoryPanel(QWidget):
         self._entries.append(entry)
         row = self._append_row(entry)
         self._sync_header()
+        self._sync_button_state()
         self._select_row(row)
 
     def set_source(self, source_image: str, image_size: tuple[int, int]) -> None:
@@ -398,3 +423,4 @@ class MemoryPanel(QWidget):
         self._table.clearContents()
         self._table.setRowCount(0)
         self._sync_header()
+        self._sync_button_state()
