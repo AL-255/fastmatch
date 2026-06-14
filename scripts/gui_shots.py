@@ -58,21 +58,25 @@ def main():
     generate_sample(tmp, w=1400, h=1000, tile=120, n_targets=10, seed=1)
     doc = load_image(str(tmp))
 
-    theme.apply_theme(app, "light", persist=False)
     win = MainWindow(doc, device="cpu")
     win.resize(1320, 880)
+    win._on_select_theme("light")   # palette + window QSS + canvas
     win.show()
     _grab(win, "01_mainwindow_light")
 
-    theme.apply_theme(app, "dark", persist=False)
+    win._on_select_theme("dark")
     win.show()
     _grab(win, "02_mainwindow_dark")
 
-    # Params panel in isolation, light, across method/channel states.
+    # Params panel in isolation, light, across method/channel states. Standalone
+    # widgets need the theme QSS applied directly (no parent window to cascade it).
     theme.apply_theme(app, "light", persist=False)
     pp = ParamsPanel(effective_device=torch.device("cpu"))
+    pp.setStyleSheet(theme.theme_qss("light"))
     pp.resize(340, 760)
     pp.show()
+    pp._run_button.setEnabled(True)   # so the primary-action accent (:enabled) renders
+    pp.set_match_count(7)             # so the muted match-count readout renders
     _grab(pp, "03_params_ncc_luminance")
 
     pp._channel_mode.setCurrentIndex(pp._channel_mode.findData("rgb"))
@@ -84,6 +88,15 @@ def main():
     pp._select_method("features")
     pp._sync_method_page()
     _grab(pp, "06_params_features")
+
+    # Dark params panel: verify bevels, disabled-text legibility, muted readout,
+    # and the enabled primary-Run accent under the dark theme.
+    theme.apply_theme(app, "dark", persist=False)
+    pp.setStyleSheet(theme.theme_qss("dark"))
+    pp._select_method("ncc")
+    pp._sync_method_page()
+    pp._channel_mode.setCurrentIndex(pp._channel_mode.findData("luminance"))
+    _grab(pp, "08_params_dark")
 
     # Memory panel populated.
     theme.apply_theme(app, "light", persist=False)

@@ -31,3 +31,27 @@ Hierarchy / layout:
 
 Verification: 153 tests pass; changes confirmed in re-screenshots (01 main window,
 06 feature panel).
+
+## Iteration 2 — theming, contrast & primary-action emphasis
+
+Theme/contrast (`theme.py`):
+- DARK: set the 3D bevel roles (Light/Midlight/Mid/Dark/Shadow = 75/64/44/25/15)
+  — Fusion left them at LIGHT greys, so group-box frames and the slider groove
+  were nearly invisible on the dark window; now they read as recessed edges.
+- Disabled text raised for legibility: dark 120→150; light gains a darkened
+  disabled foreground (Fusion #bebebe→140) so greyed controls aren't ghosts.
+- Accent harmonized: dark Highlight 42,130,218→58,150,235 with a separate lighter
+  Link (80,170,235); light Highlight→#1769aa (AA white-on-blue) + Link→#0b5fb0.
+
+Emphasis / secondary text (`theme.py` + `app.py` + `params_panel.py`):
+- Run is now the primary action: objectName `runButton` + `setDefault(True)` + a
+  per-theme accent QSS scoped to `:enabled` (disabled state untouched).
+- `deviceBanner` + `matchCount` muted as secondary text via objectName QSS.
+- QSS is applied at the **window** level (`MainWindow.setStyleSheet(theme.theme_qss(key))`),
+  NOT the QApplication — an app stylesheet wraps the style in a proxy and blanks
+  `app.style().objectName()` (broke a theme test); a widget stylesheet keeps the
+  global Fusion style while still cascading to the dock children.
+
+Verification: 153 tests pass; verified in light+dark re-screenshots (02 dark main
+window frames/slider now visible; 08 dark panel + 03 light panel show the enabled
+Run accent, muted readout, legible disabled text).

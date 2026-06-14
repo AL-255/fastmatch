@@ -135,6 +135,10 @@ class MainWindow(QMainWindow):
         # separately because it is not a Qt palette role.
         self._theme = theme.load_theme()
         self._viewport.set_background_color(theme.viewport_background(self._theme))
+        # Window-level QSS (muted secondary text + primary Run accent). Applied to
+        # the window, not the QApplication, so the global Fusion style stays intact
+        # while the QSS still cascades to the dock's banner/match-count/Run.
+        self.setStyleSheet(theme.theme_qss(self._theme))
 
         dock_body = QWidget(self)
         dock_layout = QVBoxLayout(dock_body)
@@ -381,6 +385,7 @@ class MainWindow(QMainWindow):
         self._theme = theme.apply_theme(app, key)  # palette + style + persist
         self._theme_actions[self._theme].setChecked(True)  # keep the radio honest
         self._viewport.set_background_color(theme.viewport_background(self._theme))
+        self.setStyleSheet(theme.theme_qss(self._theme))  # secondary text + Run accent
 
     def _build_engine_menu(self) -> None:
         """&Engine menu — pick the compute backend (CPU / CUDA / Auto) at runtime.

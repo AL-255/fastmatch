@@ -158,6 +158,10 @@ class ParamsPanel(QWidget):
         # run is expensive, e.g. CPU multi-scale).
         run_row = QHBoxLayout()
         self._run_button = QPushButton("Run", self)
+        # objectName + default flag mark Run as the primary action; theme._theme_qss
+        # gives it an accent on :enabled (the disabled state keeps the palette grey).
+        self._run_button.setObjectName("runButton")
+        self._run_button.setDefault(True)
         self._run_button.setToolTip("Run the search on the current selection.")
         self._run_button.setEnabled(False)  # enabled once a region is selected
         self._run_button.clicked.connect(lambda *_: self.run_clicked.emit())
@@ -345,6 +349,7 @@ class ParamsPanel(QWidget):
 
         # --- Match-count readout -------------------------------------------
         self._count_label = QLabel(self)
+        self._count_label.setObjectName("matchCount")  # muted secondary (theme QSS)
         self._count_label.setTextFormat(Qt.TextFormat.PlainText)
         root.addWidget(self._count_label)
 
