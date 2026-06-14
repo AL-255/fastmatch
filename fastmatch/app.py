@@ -138,11 +138,14 @@ class MainWindow(QMainWindow):
 
         dock_body = QWidget(self)
         dock_layout = QVBoxLayout(dock_body)
+        # The primary controls (Run / Method / Match parameters) lead the dock; the
+        # device/engine banner is a low-priority diagnostic, so it sits at the
+        # bottom (and the same hint is in the status bar).
         self._banner = QLabel(device_banner_text(self._resolved_device), dock_body)
         self._banner.setWordWrap(True)
         self._banner.setObjectName("deviceBanner")
-        dock_layout.addWidget(self._banner)
         dock_layout.addWidget(self._params_panel)
+        dock_layout.addWidget(self._banner)
         dock_layout.addStretch(1)
 
         self._dock = QDockWidget("Search", self)

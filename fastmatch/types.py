@@ -140,7 +140,7 @@ METHOD_LABELS: dict[str, str] = {
     "ncc": "NCC — normalized cross-correlation (textured, illumination-robust)",
     "ssd": "SSD — squared difference (flat / low-texture / exact appearance)",
     "ccorr": "CCORR — cosine cross-correlation",
-    "features": "Feature matching — ORB + homography (rotated / scaled / warped)",
+    "features": "Feature matching — ORB keypoints + appearance verify (rotated / scaled)",
 }
 
 # Methods whose score map is computed by the shared tiled-convolution machinery.

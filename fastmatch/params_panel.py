@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
 )
 
 from .types import (
+    CHANNEL_MODE_LABELS,
     CHANNEL_MODES,
     CHANNEL_NAMES,
     CONV_METHODS,
@@ -62,6 +63,9 @@ from .types import (
 
 #: Channel-weight slider resolution (ticks per slider; value/100 == the weight).
 _WEIGHT_TICKS = 100
+
+#: Display casing for a multi-channel mode's weight-group title (mode key -> label).
+_MODE_DISPLAY = {"rgb": "RGB", "ycbcr": "YCbCr"}
 
 # Default multi-scale grids (DESIGN.md §H). CPU stays single-scale to avoid the
 # len(scales)x cost on a backend that is already minutes-slow.
@@ -195,8 +199,11 @@ class ParamsPanel(QWidget):
         # --- Match parameters group ----------------------------------------
         params_box = QGroupBox("Match parameters", self)
         form = QFormLayout(params_box)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
-        # Threshold: live [0, 1] filter, default tracks the selected method.
+        # Threshold: live [0, 1] filter, default tracks the selected method. The
+        # numeric value sits right-aligned on the slider's own row (no orphan row).
         self._threshold = QSlider(Qt.Orientation.Horizontal, self)
         self._threshold.setRange(0, _THRESH_TICKS)
         self._threshold.setValue(int(round(self._default_threshold() * _THRESH_TICKS)))
@@ -204,9 +211,15 @@ class ParamsPanel(QWidget):
             "Minimum match score to display. This filters live (no re-run)."
         )
         self._threshold_label = QLabel(self)
+        self._threshold_label.setMinimumWidth(44)
+        self._threshold_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
         self._threshold.valueChanged.connect(self._on_threshold_changed)
-        form.addRow("Threshold", self._threshold)
-        form.addRow("", self._threshold_label)
+        thresh_row = QHBoxLayout()
+        thresh_row.addWidget(self._threshold, 1)
+        thresh_row.addWidget(self._threshold_label)
+        form.addRow("Threshold", thresh_row)
 
         # Max results: cap after NMS, default 500.
         self._max_results = QSpinBox(self)
@@ -221,7 +234,10 @@ class ParamsPanel(QWidget):
         # and the feature method's appearance verification becomes colour-aware
         # (detection stays grayscale) — so it lives in the always-visible params box.
         self._channel_mode = QComboBox(self)
-        self._channel_mode.addItems(list(CHANNEL_MODES))
+        # Descriptive labels (mirroring the Method combo), keyed by the mode key in
+        # userData so the emitted value stays "luminance"/"rgb"/"ycbcr".
+        for _key in CHANNEL_MODES:
+            self._channel_mode.addItem(CHANNEL_MODE_LABELS.get(_key, _key), userData=_key)
         self._channel_mode.setToolTip(
             "luminance: single BT.601 luma plane (faster, less VRAM). rgb / ycbcr: "
             "weighted multi-channel matching (per-channel weights below) — applies "
@@ -267,6 +283,10 @@ class ParamsPanel(QWidget):
         # Page 1: feature-matching controls.
         feature_box = QGroupBox("Feature matching", self)
         feature_form = QFormLayout(feature_box)
+        feature_form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        feature_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self._feature_detector = QComboBox(self)
         for det in _FEATURE_DETECTORS:
             self._feature_detector.addItem(_FEATURE_DETECTOR_LABELS[det], userData=det)
@@ -282,11 +302,11 @@ class ParamsPanel(QWidget):
         self._feature_min_inliers.setRange(4, 10_000)
         self._feature_min_inliers.setValue(MatchParams.feature_min_inliers)
         self._feature_min_inliers.setToolTip(
-            "Minimum RANSAC inliers required to accept one instance. Lower finds "
-            "more (and weaker) instances; higher is stricter."
+            "Minimum number of verified feature matches required to accept one "
+            "instance. Lower finds more (and weaker) instances; higher is stricter."
         )
         self._feature_min_inliers.valueChanged.connect(self._on_param_changed)
-        feature_form.addRow("Min inliers", self._feature_min_inliers)
+        feature_form.addRow("Min matches", self._feature_min_inliers)
         self._method_stack.addWidget(feature_box)  # index 1
 
         root.addWidget(self._method_stack)
@@ -421,7 +441,7 @@ class ParamsPanel(QWidget):
         init = (
             MatchParams().rgb_weights if mode == "rgb" else MatchParams().ycbcr_weights
         )
-        box = QGroupBox(f"{mode.upper()} channel weights", self)
+        box = QGroupBox(f"{_MODE_DISPLAY.get(mode, mode.upper())} channel weights", self)
         lay = QFormLayout(box)
         sliders: list[QSlider] = []
         for i, nm in enumerate(names):
@@ -437,7 +457,7 @@ class ParamsPanel(QWidget):
             sliders.append(s)
         readout = QLabel(self)
         readout.setTextFormat(Qt.TextFormat.PlainText)
-        lay.addRow("", readout)
+        lay.addRow(readout)
         return box, sliders, readout
 
     def _weights_for(self, mode: str) -> tuple[float, float, float]:
@@ -454,12 +474,12 @@ class ParamsPanel(QWidget):
             w = self._weights_for(mode)
             names = CHANNEL_NAMES[mode]
             readout.setText(
-                "  ".join(f"{n} {v:.2f}" for n, v in zip(names, w)) + "   (sum 1.00)"
+                " ".join(f"{n} {v:.2f}" for n, v in zip(names, w)) + " (sum 1.00)"
             )
 
     def _sync_weight_visibility(self) -> None:
         """Show only the active multi-channel mode's weight group (none for luma)."""
-        mode = self._channel_mode.currentText()
+        mode = self._channel_mode.currentData()
         self._rgb_weight_box.setVisible(mode == "rgb")
         self._ycbcr_weight_box.setVisible(mode == "ycbcr")
 
@@ -547,7 +567,7 @@ class ParamsPanel(QWidget):
             exclude_iou=MatchParams.exclude_iou,
             device="auto",
             compute_dtype=MatchParams.compute_dtype,
-            channel_mode=self._channel_mode.currentText(),
+            channel_mode=self._channel_mode.currentData(),
             rgb_weights=self._weights_for("rgb"),
             ycbcr_weights=self._weights_for("ycbcr"),
             method=self._current_method(),
