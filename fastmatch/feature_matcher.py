@@ -185,6 +185,22 @@ _NCC_SEARCH = 2
 #: rejected cheaply). The dominant runtime win on large templates.
 _AXIS_PREFILTER_MARGIN = 0.30
 
+#: PERSPECTIVE fallback (the homography verify path). When a vote-rich proposal
+#: fails the cheaper similarity paths, a per-proposal RANSAC homography is fit to
+#: that proposal's OWN clean correspondence cluster and the image is warped back
+#: through it (cv2.warpPerspective) for the SAME ZNCC>=_NCC_ACCEPT_WARP gate. Only
+#: reachable for off-axis/failed-axis proposals with >= warp_min_votes support, so
+#: the D4/PCB cases (axis-success) never enter it; the ZNCC gate + the geometric
+#: guards below keep precision (~0 FP) and prevent repetitive-lattice phantoms.
+_REPROJ_THRESH = 5.0        # RANSAC reprojection tolerance (px)
+_RANSAC_ITERS = 3000
+_MAX_CLUSTER_PTS = 600      # subsample a huge cluster before findHomography (speed)
+_HOMOG_MIN_PTS = 8          # need > the 4-pt minimum so an 8-DoF fit is over-determined
+_HOMOG_MAX_BOTTOM = 0.01    # |H[2,0]|,|H[2,1]| ceiling (px^-1): reject wild projective blow-ups
+_MIN_AFFINE_DET = 1e-6      # reject near-degenerate / mirror-flipped affine parts
+_MIN_SCALE = 1.0 / 1000.0   # sane linear-scale bounds on the recovered transform
+_MAX_SCALE = 1000.0
+
 
 class FeatureMatcher:
     """Dense-feature propose + appearance-verify multi-instance matcher (§J.3).
@@ -772,6 +788,12 @@ class FeatureMatcher:
 
         valid = (pcx >= 0) & (pcx < full_w) & (pcy >= 0) & (pcy < full_h)
         pcx, pcy, rel_s, rel_a = pcx[valid], pcy[valid], rel_s[valid], rel_a[valid]
+        # Keep the matched-keypoint coords index-aligned with the (now-filtered)
+        # vote arrays so each proposal can carry its OWN correspondence cluster for
+        # the perspective (homography) verify fallback. tpx/tpy are in the oriented-
+        # template detection frame; ipx/ipy are full-image coords.
+        tpx, tpy = tpx[valid], tpy[valid]
+        ipx, ipy = ipx[valid], ipy[valid]
         if pcx.size < vote_floor:
             return []
 
@@ -789,6 +811,10 @@ class FeatureMatcher:
             if ct < vote_floor:
                 continue
             members = order[st:st + ct]
+            # This proposal's own correspondences (template->image), for the
+            # perspective homography fallback in _verify.
+            sp = np.ascontiguousarray(np.stack([tpx[members], tpy[members]], 1).astype(np.float32))
+            dp = np.ascontiguousarray(np.stack([ipx[members], ipy[members]], 1).astype(np.float32))
             proposals.append((
                 float(np.median(pcx[members])),
                 float(np.median(pcy[members])),
@@ -798,6 +824,8 @@ class FeatureMatcher:
                 orient,
                 th,
                 tw,
+                sp,
+                dp,
             ))
         return proposals
 
@@ -907,7 +935,11 @@ class FeatureMatcher:
             This is what the rotated-instance generality test exercises.
         """
         cv2 = self._cv2
-        cx, cy, sc, an, votes, orient, th0, tw0 = proposal
+        cx, cy, sc, an, votes, orient, th0, tw0 = proposal[:8]
+        # This proposal's own correspondences (template->image), for the perspective
+        # homography fallback. len-guarded so an 8-tuple (older callers/tests) works.
+        src_pts = proposal[8] if len(proposal) > 8 else None
+        dst_pts = proposal[9] if len(proposal) > 9 else None
 
         net_code = self._net_d4(orient, an) if 0.7 <= sc <= 1.4 else None
         if net_code is not None:
@@ -947,11 +979,13 @@ class FeatureMatcher:
                     s = self._zncc(win, tw_img, weights)
                     if s > best_s:
                         best_s, best_xy = s, (x0, y0)
-            if best_xy is None or best_s < _NCC_ACCEPT:
-                return None
-            # Clamp the ZNCC confidence to [0, 1] (float rounding can nudge an
-            # exact-copy correlation a hair above 1.0).
-            return (best_xy[0], best_xy[1], sw, sh), min(1.0, max(0.0, best_s)), net_code
+            if best_xy is not None and best_s >= _NCC_ACCEPT:
+                # Clamp the ZNCC confidence to [0, 1] (float rounding can nudge an
+                # exact-copy correlation a hair above 1.0).
+                return (best_xy[0], best_xy[1], sw, sh), min(1.0, max(0.0, best_s)), net_code
+            # Axis verify FAILED. A perspective copy can masquerade as near-D4 (its
+            # vote-median angle≈0, scale≈1) yet not match the unwarped template, so
+            # fall through to the off-axis / homography fallback rather than reject.
 
         # General (off-axis) path — arbitrary rotation+scale, the generality test.
         # Inverse-warp the IMAGE window back into the upright-template frame and
@@ -984,29 +1018,134 @@ class FeatureMatcher:
             return self._zncc(back, tmpl, weights), (x0, y0, x1 - x0, y1 - y0)
 
         r0 = _inv_warp_zncc(an, sc)
-        if r0 is None or r0[0] < _NCC_ACCEPT_WARP - _WARP_PREFILTER:
+        if r0 is not None and r0[0] >= _NCC_ACCEPT_WARP - _WARP_PREFILTER:
+            best_s, best_box = r0
+            best_a, best_sc = an, sc
+            for da in (-4.0, -2.0, 0.0, 2.0, 4.0):
+                for ds in (0.88, 0.94, 1.0, 1.06, 1.12):
+                    if da == 0.0 and ds == 1.0:
+                        continue
+                    a, s = an + np.deg2rad(da), sc * ds
+                    r = _inv_warp_zncc(a, s)
+                    if r is not None and r[0] > best_s:
+                        best_s, best_box, best_a, best_sc = r[0], r[1], a, s
+            for da in (-1.5, -0.75, 0.0, 0.75, 1.5):
+                for ds in (0.97, 0.985, 1.0, 1.015, 1.03):
+                    if da == 0.0 and ds == 1.0:
+                        continue
+                    a, s = best_a + np.deg2rad(da), best_sc * ds
+                    r = _inv_warp_zncc(a, s)
+                    if r is not None and r[0] > best_s:
+                        best_s, best_box = r[0], r[1]
+            if best_box is not None and best_s >= _NCC_ACCEPT_WARP:
+                return best_box, min(1.0, max(0.0, best_s)), orient
+
+        # --- PERSPECTIVE homography fallback ---------------------------------
+        # The cheaper similarity paths could not verify this vote-rich proposal. Fit
+        # a homography to its OWN clean correspondence cluster and warp the image
+        # back through it for the SAME ZNCC gate — recovering perspective/affine the
+        # similarity model cannot. Reached only for >= warp_min_votes proposals (the
+        # off-axis votes gate above), so D4/PCB axis-successes never get here.
+        return self._verify_homography(
+            cv2, src_pts, dst_pts, tmpl, th_o, tw_o, verify_image, full_w, full_h, weights
+        )
+
+    def _verify_homography(self, cv2, src_pts, dst_pts, tmpl, th_o, tw_o,
+                           verify_image, full_w, full_h, weights):
+        """Perspective verify: fit a RANSAC homography to a proposal's own
+        correspondence cluster, warp the image back into the template frame, and
+        apply the ZNCC>=_NCC_ACCEPT_WARP appearance gate. Returns ``(box, score,
+        "R0"-tagged orient)`` or ``None``. Geometric guards + the ZNCC gate keep
+        precision and prevent repetitive-lattice phantoms.
+        """
+        if src_pts is None or dst_pts is None or len(src_pts) < _HOMOG_MIN_PTS:
             return None
-        best_s, best_box = r0
-        best_a, best_sc = an, sc
-        for da in (-4.0, -2.0, 0.0, 2.0, 4.0):
-            for ds in (0.88, 0.94, 1.0, 1.06, 1.12):
-                if da == 0.0 and ds == 1.0:
-                    continue
-                a, s = an + np.deg2rad(da), sc * ds
-                r = _inv_warp_zncc(a, s)
-                if r is not None and r[0] > best_s:
-                    best_s, best_box, best_a, best_sc = r[0], r[1], a, s
-        for da in (-1.5, -0.75, 0.0, 0.75, 1.5):
-            for ds in (0.97, 0.985, 1.0, 1.015, 1.03):
-                if da == 0.0 and ds == 1.0:
-                    continue
-                a, s = best_a + np.deg2rad(da), best_sc * ds
-                r = _inv_warp_zncc(a, s)
-                if r is not None and r[0] > best_s:
-                    best_s, best_box = r[0], r[1]
-        if best_box is None or best_s < _NCC_ACCEPT_WARP:
+        ps, pd = src_pts, dst_pts
+        if len(ps) > _MAX_CLUSTER_PTS:  # bound RANSAC cost on dense clusters
+            sel = np.linspace(0, len(ps) - 1, _MAX_CLUSTER_PTS).astype(np.int64)
+            ps, pd = ps[sel], pd[sel]
+        try:
+            H, mask = cv2.findHomography(
+                ps.reshape(-1, 1, 2), pd.reshape(-1, 1, 2),
+                cv2.RANSAC, _REPROJ_THRESH, maxIters=_RANSAC_ITERS, confidence=0.999,
+            )
+        except cv2.error:
             return None
-        return best_box, min(1.0, max(0.0, best_s)), orient
+        if H is None or mask is None or int(mask.ravel().sum()) < _HOMOG_MIN_PTS:
+            return None
+        # Reject wild projective terms (a runaway perspective blow-up).
+        if abs(float(H[2, 0])) > _HOMOG_MAX_BOTTOM or abs(float(H[2, 1])) > _HOMOG_MAX_BOTTOM:
+            return None
+        corners = np.array([[[0, 0], [tw_o, 0], [tw_o, th_o], [0, th_o]]], np.float32)
+        box = self._project_to_box(cv2, H, corners, full_w, full_h)
+        if box is None:
+            return None
+        try:
+            Hinv = np.linalg.inv(H)
+        except np.linalg.LinAlgError:
+            return None
+        back = cv2.warpPerspective(verify_image, Hinv, (tw_o, th_o), flags=cv2.INTER_LINEAR)
+        score = self._zncc(back, tmpl, weights)
+        if score < _NCC_ACCEPT_WARP:
+            return None
+        bx, by, bw, bh = box
+        return (int(round(bx)), int(round(by)), int(round(bw)), int(round(bh))), \
+            min(1.0, max(0.0, score)), "R0"
+
+    @staticmethod
+    def _signed_area2(quad: np.ndarray) -> float:
+        """Twice the signed polygon area (shoelace); >0 for a CCW quad."""
+        x = quad[:, 0]
+        y = quad[:, 1]
+        return float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+    @staticmethod
+    def _is_convex(quad: np.ndarray) -> bool:
+        """True if the ordered 4-point quad is convex (consistent turn direction)."""
+        n = len(quad)
+        sign = 0
+        for i in range(n):
+            dx1 = quad[(i + 1) % n, 0] - quad[i, 0]
+            dy1 = quad[(i + 1) % n, 1] - quad[i, 1]
+            dx2 = quad[(i + 2) % n, 0] - quad[(i + 1) % n, 0]
+            dy2 = quad[(i + 2) % n, 1] - quad[(i + 1) % n, 1]
+            cross = dx1 * dy2 - dy1 * dx2
+            if cross != 0.0:
+                s = 1 if cross > 0 else -1
+                if sign == 0:
+                    sign = s
+                elif s != sign:
+                    return False
+        return True
+
+    def _project_to_box(self, cv2, H, tmpl_corners, iw, ih):
+        """Project template corners through ``H`` to an AABB, with degeneracy guards.
+
+        Rejects (returns ``None``) a near-singular / mirror-flipped affine part, an
+        out-of-range linear scale, a non-finite / non-convex / zero-area projected
+        quad — the guards that stop a homography fit from latching onto a
+        cross-copy lattice phantom. Returns ``(x, y, w, h)`` clamped to the image.
+        """
+        a, b, c, d = float(H[0, 0]), float(H[0, 1]), float(H[1, 0]), float(H[1, 1])
+        det = a * d - b * c
+        if det <= _MIN_AFFINE_DET:
+            return None
+        lin = det ** 0.5
+        if lin < _MIN_SCALE or lin > _MAX_SCALE:
+            return None
+        quad = cv2.perspectiveTransform(tmpl_corners, H).reshape(-1, 2)
+        if not np.all(np.isfinite(quad)):
+            return None
+        if self._signed_area2(quad) <= 0 or not self._is_convex(quad):
+            return None
+        x0 = max(0.0, min(float(quad[:, 0].min()), iw))
+        y0 = max(0.0, min(float(quad[:, 1].min()), ih))
+        x1 = max(0.0, min(float(quad[:, 0].max()), iw))
+        y1 = max(0.0, min(float(quad[:, 1].max()), ih))
+        w, h = x1 - x0, y1 - y0
+        if w < 1 or h < 1:
+            return None
+        return (x0, y0, w, h)
 
     # -- helpers -------------------------------------------------------------
 
