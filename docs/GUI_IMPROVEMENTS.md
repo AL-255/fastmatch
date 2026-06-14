@@ -100,3 +100,20 @@ A holistic convergence review found these still worth doing (not nitpicks):
 
 Verification: 153 tests pass; View menu shows the two dock toggles + a Help menu
 (verified programmatically); confirmed in re-screenshots (04 combo casing, 07 hint).
+
+## Iteration 5 — final consistency polish (loop converged)
+
+The convergence review's theming and affordance lenses returned empty; only minor
+consistency/copy items remained, applied here:
+- Memory dock root layout matched to the Search dock's 8px margins/spacing (one
+  design system). `memory_panel.py`
+- Channel-weight sub-group labels right-aligned to match the panel's label
+  convention. `params_panel.py`
+- Channel-mode tooltip: UI casing (Luminance/RGB/YCbCr) + names NCC/SSD/CCORR
+  instead of the internal term "conv methods". `params_panel.py`
+- Max-results tooltip: dropped the unexplained "NMS" acronym for plain language.
+  `params_panel.py`
+
+**Converged.** After 5 iterations the multi-lens critique surfaces only
+subjective/sub-nitpick items; the substantive hierarchy, theming, structure,
+affordance, and consistency issues are resolved. 153 tests pass throughout.

@@ -237,7 +237,10 @@ class ParamsPanel(QWidget):
         self._max_results = QSpinBox(self)
         self._max_results.setRange(1, 100_000)
         self._max_results.setValue(MatchParams.max_results)
-        self._max_results.setToolTip("Maximum number of matches returned (cap after NMS).")
+        self._max_results.setToolTip(
+            "Maximum number of matches returned (the cap applied after overlapping "
+            "detections are merged)."
+        )
         self._max_results.valueChanged.connect(self._on_param_changed)
         form.addRow("Max results", self._max_results)
 
@@ -251,9 +254,9 @@ class ParamsPanel(QWidget):
         for _key in CHANNEL_MODES:
             self._channel_mode.addItem(CHANNEL_MODE_LABELS.get(_key, _key), userData=_key)
         self._channel_mode.setToolTip(
-            "luminance: single BT.601 luma plane (faster, less VRAM). rgb / ycbcr: "
+            "Luminance: single BT.601 luma plane (faster, less VRAM). RGB / YCbCr: "
             "weighted multi-channel matching (per-channel weights below) — applies "
-            "to the conv methods and feature matching's appearance verification."
+            "to NCC/SSD/CCORR and feature matching's appearance verification."
         )
         self._channel_mode.currentIndexChanged.connect(self._on_channel_mode_changed)
         form.addRow("Channel mode", self._channel_mode)
@@ -467,6 +470,7 @@ class ParamsPanel(QWidget):
         box = QGroupBox(f"{_MODE_DISPLAY.get(mode, mode.upper())} channel weights", self)
         box.setFlat(True)  # nested sub-section: avoid a frame-within-a-frame
         lay = QFormLayout(box)
+        lay.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         lay.setContentsMargins(8, 4, 8, 6)
         lay.setVerticalSpacing(6)
         sliders: list[QSlider] = []

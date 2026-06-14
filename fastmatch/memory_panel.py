@@ -110,6 +110,8 @@ class MemoryPanel(QWidget):
         self._current_path: str | None = None
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)  # match the Search dock's tuned inset
+        root.setSpacing(8)                    # ...and rhythm, so both docks read as one
 
         # --- Header: source image basename + entry count -------------------
         self._header_label = QLabel(self)
