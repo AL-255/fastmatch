@@ -17,6 +17,6 @@ from PIL import Image as _PILImage
 # guard here is deliberate and safe.
 _PILImage.MAX_IMAGE_PIXELS = None
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = ["__version__"]
