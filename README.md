@@ -1,5 +1,7 @@
 # FastMatch
 
+![FastMatch](docs/top.png)
+
 FastMatch is a single-process PySide6 desktop app for exploring **gigapixel
 images** and finding repeated visual patterns inside them. It loads the image
 into a tiled, GPU-composited viewport (scroll-wheel zoom under the cursor,
@@ -11,58 +13,6 @@ regions, CCORR for an alternate correlation measure, or Feature matching for
 rotated / scaled / warped instances (see [Matching methods](#matching-methods)).
 The correlation methods are built on PyTorch and run on the GPU when a suitable
 CUDA build is installed, falling back transparently to CPU otherwise.
-
----
-
-## Web (browser) edition — `docs/`
-
-A zero-install version runs **entirely in the browser** via
-[Pyodide](https://pyodide.org) and is hostable on **GitHub Pages** as static
-files. Because PyTorch and Qt have no WebAssembly builds, the web edition is a
-self-contained **NumPy reimplementation** of the convolution matchers
-(`ncc`/`ssd`/`ccorr`) — same algorithm as the desktop's full-resolution path
-(FFT cross-correlation + integral-image windowed statistics, dihedral-orientation
-and multi-scale search, greedy IoU-NMS, source exclusion). Feature matching is
-desktop-only (it needs OpenCV, unavailable under Pyodide).
-
-The browser engine (`docs/fastmatch_web.py`) is pure NumPy, so it runs in
-CPython too and is unit-tested (`tests/test_web_engine.py`), including a recall
-**parity check against the desktop torch engine** and a check that the parallel
-worker decomposition reproduces the single-call `match()`.
-
-**Multi-core + responsive:** the search runs in a **pool of Web Workers** (one
-Pyodide per core — `docs/worker.js`), not on the UI thread. The work is split
-into independent *(orientation × scale)* tasks dispatched across the pool, and
-the page merges the candidates (greedy NMS / source-exclusion / top-K). Because
-the UI thread stays free, a **spinner** animates during a search and it is
-**interruptible** — drawing a new box, changing a parameter, **Cancel**, or
-`Esc` supersedes the in-flight search immediately (a monotonic generation token
-discards stale worker results). Multi-core uses a worker pool rather than
-Pyodide's pthreads because `SharedArrayBuffer` needs COOP/COEP headers that
-GitHub Pages can't send.
-
-**Try it locally:**
-
-```bash
-python -m http.server -d docs 8000   # then open http://localhost:8000
-```
-
-Open an image (or **Load sample**), drag a box around a pattern, and it finds
-every similar region. Everything is client-side; it scales across CPU cores, but
-very large images (more than a few thousand px per side) are still heavier in
-WASM than on the native desktop engine.
-
-**Deploy on GitHub Pages:** the repo ships a workflow
-(`.github/workflows/pages.yml`) that publishes `docs/` via the official Pages
-Actions. One-time setup: **Settings → Pages → Source = GitHub Actions**. After
-that, every push that touches `docs/` builds and deploys automatically (or run
-the workflow manually from the Actions tab); the app is served at
-`https://<user>.github.io/<repo>/`. There is no build step — `docs/` already
-contains everything (`index.html`, `app.js`, `style.css`, `fastmatch_web.py`,
-`sample.png`) and `index.html` becomes the site root, so the app's relative
-fetches resolve exactly as they do locally. Pyodide + NumPy load from a CDN on
-first visit (~10 MB, cached). *(Alternatively, set Source to "Deploy from a
-branch" → `main` → `/docs`, which needs no workflow.)*
 
 ---
 
