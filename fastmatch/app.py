@@ -237,7 +237,7 @@ class MainWindow(QMainWindow):
 
         self._act_fit = QAction("Fit", self)
         self._act_fit.setShortcut(QKeySequence("F"))  # F = zoom-to-fit
-        self._act_fit.setToolTip("Zoom to fit the whole image (F)")
+        self._act_fit.setToolTip("Zoom to fit the whole image (F).")
         self._act_fit.triggered.connect(self._viewport.fit_in_view)
         tb.addAction(self._act_fit)
 

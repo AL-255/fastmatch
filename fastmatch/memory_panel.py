@@ -119,7 +119,7 @@ class MemoryPanel(QWidget):
         root.addWidget(self._header_label)
         # Surface the otherwise-invisible recall gesture (double-click). Muted via
         # the shared "matchCount" secondary-text style hook (themed in theme.py).
-        self._hint_label = QLabel("Double-click an entry to revisit it.", self)
+        self._hint_label = QLabel("Double-click an entry to restore its boxes and selection.", self)
         self._hint_label.setObjectName("matchCount")
         self._hint_label.setTextFormat(Qt.TextFormat.PlainText)
         root.addWidget(self._hint_label)

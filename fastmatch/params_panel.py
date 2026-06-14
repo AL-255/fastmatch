@@ -296,6 +296,10 @@ class ParamsPanel(QWidget):
         self._multiscale.toggled.connect(self._on_param_changed)
         self._apply_device_to_multiscale()
         conv_layout.addWidget(self._multiscale)
+        # The stacked widget sizes to the taller (feature) page, so on this single-
+        # checkbox page pin the checkbox to the top instead of letting it float
+        # centered in the slack.
+        conv_layout.setAlignment(self._multiscale, Qt.AlignmentFlag.AlignTop)
         self._method_stack.addWidget(conv_box)  # index 0
 
         # Page 1: feature-matching controls.

@@ -124,3 +124,11 @@ Convergence review: 3 lenses empty; affordance found one real gap — every tool
 action had a tooltip except "Open" and "Clear matches", and "Clear matches" silently
 also clears the selection + disables Run (more than its label implies). Added both
 tooltips (`app.py`). 153 tests pass.
+
+## Iteration 7 — last layout/copy nitpicks
+
+Theming + affordance lenses empty. Applied: top-align the lone "Search multiple
+scales" checkbox so it pins under its title (the stacked widget sizes to the taller
+feature page); gave CCORR the "when to use" parenthetical the other methods have;
+"Fit" tooltip terminal period; unified the memory double-click wording ("restore
+its boxes and selection") across hint + tooltip. 153 tests pass.

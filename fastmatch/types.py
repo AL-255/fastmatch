@@ -139,7 +139,7 @@ METHODS: tuple[str, ...] = ("ncc", "ssd", "ccorr", "features")
 METHOD_LABELS: dict[str, str] = {
     "ncc": "NCC — normalized cross-correlation (textured, illumination-robust)",
     "ssd": "SSD — squared difference (flat / low-texture / exact appearance)",
-    "ccorr": "CCORR — cosine cross-correlation",
+    "ccorr": "CCORR — cosine cross-correlation (bright / high-energy templates; no mean subtraction)",
     "features": "Feature matching — ORB keypoints + appearance verify (rotated / scaled)",
 }
 
