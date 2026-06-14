@@ -54,6 +54,10 @@ from .params_panel import _HIST_BIN_PRESETS, _HIST_BINS, ParamsPanel
 from .types import CONV_METHODS, MatchParams
 from . import theme
 
+# File ▸ Open Recent: persisted history of opened image paths (most-recent first).
+_RECENT_KEY = "files/recent"
+_RECENT_MAX = 10
+
 
 class MainWindow(QMainWindow):
     """Top-level window wiring viewport, controller, and params panel."""
@@ -215,6 +219,9 @@ class MainWindow(QMainWindow):
             self._act_close_image.setEnabled(False)
             self._params_panel.set_run_enabled(False)
             self._count_label.setText("No image")
+        else:
+            # A CLI-launched image is "opened" too — record it in the recent list.
+            self._record_recent(self._doc.path)
 
         # Fit the freshly loaded image into the view (no-op when empty).
         self._viewport.fit_in_view()
@@ -302,6 +309,9 @@ class MainWindow(QMainWindow):
         self._act_close_image.setToolTip("Close the current image and clear the view.")
         self._act_close_image.triggered.connect(self._on_close_image)
         file_menu.addAction(self._act_close_image)
+        # Recently opened images (most-recent first; persisted across sessions).
+        self._recent_menu = file_menu.addMenu("Open &Recent")
+        self._rebuild_recent_menu()
         file_menu.addSeparator()
         # Memory operations (backed by the Memory panel's file methods).
         act_open_mem = QAction("Open Memory…", self)
@@ -561,6 +571,85 @@ class MainWindow(QMainWindow):
             return
         self._swap_document(doc)
 
+    # ------------------------------------------------------- recent images
+    def _load_recent(self) -> list[str]:
+        """Persisted recent-image paths, most-recent first, dropping any that no
+        longer exist on disk (so stale entries self-prune)."""
+        raw = theme.settings().value(_RECENT_KEY, [])
+        if isinstance(raw, str):          # a lone entry can round-trip as a bare str
+            raw = [raw]
+        elif not isinstance(raw, (list, tuple)):
+            raw = []
+        out: list[str] = []
+        seen: set[str] = set()
+        for p in raw:
+            p = str(p)
+            if p and p not in seen and Path(p).is_file():
+                out.append(p)
+                seen.add(p)
+        return out[:_RECENT_MAX]
+
+    def _record_recent(self, path: str) -> None:
+        """Push a successfully-opened image to the front of the recent list."""
+        if not path:
+            return
+        try:
+            ap = str(Path(path).resolve())
+        except Exception:
+            ap = path
+        if not Path(ap).is_file():        # skip synthetic / in-memory sources
+            return
+        items = [p for p in self._load_recent() if p != ap]
+        items.insert(0, ap)
+        theme.settings().setValue(_RECENT_KEY, items[:_RECENT_MAX])
+        self._rebuild_recent_menu()
+
+    def _rebuild_recent_menu(self) -> None:
+        """Repopulate the *Open Recent* submenu from the persisted list."""
+        menu = self._recent_menu
+        menu.clear()
+        items = self._load_recent()
+        if not items:
+            act = menu.addAction("(No recent images)")
+            act.setEnabled(False)
+            return
+        for p in items:
+            # File name, plus the parent dir for disambiguation; full path on hover.
+            parent = Path(p).parent.name
+            label = f"{Path(p).name}  —  {parent}" if parent else Path(p).name
+            act = QAction(label, self)
+            act.setToolTip(p)
+            act.triggered.connect(lambda _checked=False, path=p: self._open_recent(path))
+            menu.addAction(act)
+        menu.addSeparator()
+        clear = menu.addAction("Clear Recent")
+        clear.triggered.connect(self._clear_recent)
+
+    def _open_recent(self, path: str) -> None:
+        """Open an image chosen from the recent list (validating it still exists)."""
+        if not Path(path).is_file():
+            QMessageBox.warning(
+                self, "Open Recent", f"This image is no longer available:\n{path}"
+            )
+            theme.settings().setValue(
+                _RECENT_KEY, [p for p in self._load_recent() if p != path]
+            )
+            self._rebuild_recent_menu()
+            return
+        from .loader import load_image
+
+        try:
+            doc = load_image(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Open failed", f"Could not load image:\n{exc}")
+            return
+        self._swap_document(doc)
+
+    def _clear_recent(self) -> None:
+        """Forget the recent-image history."""
+        theme.settings().remove(_RECENT_KEY)
+        self._rebuild_recent_menu()
+
     def _on_close_image(self) -> None:
         """Close the current image: clear the view, matches, and selection.
 
@@ -634,6 +723,7 @@ class MainWindow(QMainWindow):
             return
 
         self._doc = doc
+        self._record_recent(doc.path)  # remember it in File ▸ Open Recent
         self._last_rect = None
         self._all_matches = []
         self._calibration = None  # calibration is per-image; drop it on swap

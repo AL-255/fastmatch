@@ -252,6 +252,12 @@ def _settings() -> QSettings:
     return QSettings()
 
 
+def settings() -> QSettings:
+    """Shared app :class:`QSettings` (FastMatch identity), for non-theme prefs too
+    (e.g. the File ▸ Open Recent history) so they share one identity/store."""
+    return _settings()
+
+
 def save_theme(key: str) -> None:
     """Persist the chosen theme key."""
     _settings().setValue(_THEME_KEY, normalize_theme(key))
