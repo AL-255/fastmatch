@@ -673,14 +673,14 @@ class ParamsPanel(QWidget):
                 self._multiscale.setChecked(True)
                 self._multiscale.setToolTip(
                     "Search the scale grid "
-                    f"{', '.join(f'{s:g}x' for s in _SCALES_CUDA)} (GPU only)."
+                    f"{', '.join(f'{s:g}×' for s in _SCALES_CUDA)} (GPU only)."
                 )
                 self._multiscale_hint.setVisible(False)
             else:
                 self._multiscale.setChecked(False)
                 self._multiscale.setEnabled(False)
                 self._multiscale.setToolTip(
-                    "Multi-scale search is GPU-only; CPU is locked to 1.0x to keep "
+                    "Multi-scale search is GPU-only; CPU is locked to 1.0× to keep "
                     "queries responsive."
                 )
                 self._multiscale_hint.setText("GPU only — CPU is locked to 1.0×.")
