@@ -806,15 +806,40 @@ class FeatureMatcher:
         keys_s = keys[order]
         _uniq, starts, counts = np.unique(keys_s, return_index=True, return_counts=True)
 
+        # Bin-key -> member indices, for 3x3 neighbourhood cluster enrichment below.
+        # Under strong perspective the SIMILARITY vote predicts an instance centre per
+        # correspondence; the warp makes those predicted centres scatter across
+        # adjacent bins, so a single peak bin starves to a handful of points even
+        # though hundreds of ORB matches physically sit on the copy. RANSAC then has
+        # too few inliers (few_inliers) or fits an ill-conditioned H (project_box).
+        bin_members = {int(k): order[s:s + c] for k, s, c in zip(keys_s[starts], starts, counts)}
+
         proposals: list[tuple] = []
         for st, ct in zip(starts, counts):
             if ct < vote_floor:
                 continue
             members = order[st:st + ct]
-            # This proposal's own correspondences (template->image), for the
-            # perspective homography fallback in _verify.
-            sp = np.ascontiguousarray(np.stack([tpx[members], tpy[members]], 1).astype(np.float32))
-            dp = np.ascontiguousarray(np.stack([ipx[members], ipy[members]], 1).astype(np.float32))
+            # Enrich the correspondence cluster with the ±1-bin (3x3) neighbourhood:
+            # gather the coherent matches whose predicted centres scattered into
+            # adjacent bins so RANSAC regains support. The vote count ``ct`` still
+            # keys ONLY the peak bin (routing/gating + medians below are unchanged),
+            # so precision is preserved. The 3x3 reach is ≤ 3*binsz (~96px for the
+            # 130px motif) — far below the ~320px inter-copy spacing, so the gather
+            # cannot cross into a neighbouring copy.
+            kpx = int(bx[members[0]])
+            kpy = int(by[members[0]])
+            enriched = members
+            for dxb in (-1, 0, 1):
+                for dyb in (-1, 0, 1):
+                    if dxb == 0 and dyb == 0:
+                        continue
+                    nbr = bin_members.get((kpx + dxb) * 1_000_000 + (kpy + dyb))
+                    if nbr is not None:
+                        enriched = np.concatenate((enriched, nbr))
+            # This proposal's own (enriched) correspondences (template->image), for
+            # the perspective homography fallback in _verify.
+            sp = np.ascontiguousarray(np.stack([tpx[enriched], tpy[enriched]], 1).astype(np.float32))
+            dp = np.ascontiguousarray(np.stack([ipx[enriched], ipy[enriched]], 1).astype(np.float32))
             proposals.append((
                 float(np.median(pcx[members])),
                 float(np.median(pcy[members])),
