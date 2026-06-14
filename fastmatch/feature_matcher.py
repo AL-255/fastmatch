@@ -201,6 +201,35 @@ _MIN_AFFINE_DET = 1e-6      # reject near-degenerate / mirror-flipped affine par
 _MIN_SCALE = 1.0 / 1000.0   # sane linear-scale bounds on the recovered transform
 _MAX_SCALE = 1000.0
 
+#: IMAGE-SPACE CLUSTER homography fallback (the perspective recall fix). The
+#: similarity-vote PROPOSE step scatters a single perspective copy into dozens of
+#: conflicting (wrong-scale/angle) poses, so the per-proposal peak-bin cluster that
+#: feeds :meth:`_verify_homography` is starved/contaminated and RANSAC settles on a
+#: degenerate consensus. A perspective copy's IMAGE keypoints, however, stay
+#: physically clustered regardless of the warp. So when every cheaper path
+#: (axis / affine-warp / peak-bin homography) has REJECTED a vote-rich proposal,
+#: gather ALL of that orientation's good correspondences whose IMAGE position lies
+#: in a box around the proposal centre (one complete, high-inlier cluster), RANSAC
+#: a homography on it, and apply the SAME ZNCC>=_NCC_ACCEPT_WARP gate. This is a
+#: last-resort SUPPLEMENT: the gate + geometry guards keep precision (FP=0) and the
+#: vote/centre gating keep it off the D4/PCB axis-successes.
+_CLUSTER_RADIUS_FACTOR = 1.2  # half-box edge = this * max(th, tw) around the centre
+_CLUSTER_MIN_PTS = 12         # min correspondences in the image-space box to attempt
+#: The image-space cluster is COMPLETE (a copy's whole, high-inlier-ratio match set),
+#: so RANSAC converges in a handful of samples — far fewer iterations than the
+#: peak-bin path's contaminated cluster needs, and a tighter point cap keeps each fit
+#: cheap. These bound the cluster path's cost so it does not blow up the bench.
+_CLUSTER_RANSAC_ITERS = 200
+_CLUSTER_MAX_PTS = 140
+#: The peak-bin homography's ``_project_to_box`` rejects a NEGATIVE linear-2x2
+#: determinant as a mirror-flip. Under real perspective the homography's linear
+#: block can carry a negative det even for an orientation-PRESERVING copy (the
+#: foreshortening sign lives in the projective terms, not the 2x2), so the
+#: image-space cluster path validates orientation by the SIGNED AREA of the
+#: projected quad instead (positive == not mirrored) — the same flip test applied
+#: where it is geometrically correct. ``_project_to_box`` is left untouched so the
+#: existing peak-bin path's (correct, FP-guarding) rejections are unchanged.
+
 
 class FeatureMatcher:
     """Dense-feature propose + appearance-verify multi-instance matcher (§J.3).
@@ -637,6 +666,9 @@ class FeatureMatcher:
 
         # --- 2. PROPOSE across active orientations ---------------------------
         proposals: list[tuple] = []
+        # Per-orientation COMPLETE correspondence sets, populated by the propose step
+        # and consumed only by the image-space cluster homography fallback (§J.3).
+        orient_corr: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
         for orient in active:
             if cancel is not None and cancel():
                 return []
@@ -644,6 +676,7 @@ class FeatureMatcher:
                 self._propose_for_variant(
                     tmpl_gray_oriented[orient], orient, level, detector_name, norm, maxd,
                     ik_xy, ik_sz, ik_ang, img_desc, full_h, full_w, vote_floor,
+                    corr_out=orient_corr,
                 )
             )
         if progress is not None:
@@ -666,7 +699,7 @@ class FeatureMatcher:
                 break
             r = self._verify(
                 p, tmpl_verify_oriented, verify_image, full_h, full_w, warp_min_votes,
-                verify_weights,
+                verify_weights, orient_corr,
             )
             if r is None:
                 continue
@@ -720,6 +753,7 @@ class FeatureMatcher:
         full_h: int,
         full_w: int,
         vote_floor: int,
+        corr_out: "dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] | None" = None,
     ) -> list[tuple]:
         """Similarity-transform centre vote -> candidate poses for one variant.
 
@@ -796,6 +830,18 @@ class FeatureMatcher:
         ipx, ipy = ipx[valid], ipy[valid]
         if pcx.size < vote_floor:
             return []
+
+        # Record this orientation's COMPLETE correspondence set (template->image, in
+        # full-res coords) for the image-space cluster homography fallback. Unlike
+        # the per-proposal peak-bin clusters below, this is every good match for the
+        # variant; the fallback box-gathers the subset around a failing proposal's
+        # centre — a copy's image keypoints stay clustered regardless of perspective,
+        # so that gather is the copy's COMPLETE cluster (high inlier ratio for RANSAC).
+        if corr_out is not None:
+            corr_out[orient] = (
+                np.ascontiguousarray(tpx), np.ascontiguousarray(tpy),
+                np.ascontiguousarray(ipx), np.ascontiguousarray(ipy),
+            )
 
         # Coarse 2-D centre histogram (bin ≈ a quarter of the template short side).
         binsz = max(8, int(min(tw, th) // 4))
@@ -941,6 +987,7 @@ class FeatureMatcher:
         full_w: int,
         warp_min_votes: int,
         weights: "list[float] | None" = None,
+        orient_corr: "dict[str, tuple] | None" = None,
     ) -> tuple[tuple[int, int, int, int], float, str] | None:
         """Verify a proposal by appearance. Returns ``(box, zncc, orient)`` or None.
 
@@ -986,28 +1033,37 @@ class FeatureMatcher:
             # Centre-prefilter: one ZNCC at the vote centre; a true copy within
             # ±_NCC_SEARCH px cannot recover from a centre this far below the floor,
             # so reject cheaply (the dominant runtime win on large templates).
+            # A genuine PERSPECTIVE copy can masquerade as near-D4 (vote angle≈0,
+            # scale≈1) yet have a near-zero unwarped centre ZNCC, so a vote-RICH
+            # proposal that fails the prefilter still falls through to the homography
+            # / image-space cluster fallback; only a low-vote proposal is rejected
+            # cheaply here (the fast PCB path — those never warrant a homography fit).
+            axis_failed = False
             if 0 <= bx0 <= full_w - sw and 0 <= by0 <= full_h - sh:
                 c = self._zncc(verify_image[by0:by0 + sh, bx0:bx0 + sw], tw_img, weights)
                 if c < _NCC_ACCEPT - _AXIS_PREFILTER_MARGIN:
-                    return None
-            # Local ±-px alignment search (the vote-median centre is a few px noisy
-            # — exactly what NCC/SSD slides over); keep the best alignment.
-            best_s, best_xy = -2.0, None
-            for dy in range(-_NCC_SEARCH, _NCC_SEARCH + 1):
-                for dx in range(-_NCC_SEARCH, _NCC_SEARCH + 1):
-                    x0, y0 = bx0 + dx, by0 + dy
-                    if x0 < 0 or y0 < 0 or x0 + sw > full_w or y0 + sh > full_h:
-                        continue
-                    win = verify_image[y0:y0 + sh, x0:x0 + sw]
-                    if win.shape != tw_img.shape:
-                        continue
-                    s = self._zncc(win, tw_img, weights)
-                    if s > best_s:
-                        best_s, best_xy = s, (x0, y0)
-            if best_xy is not None and best_s >= _NCC_ACCEPT:
-                # Clamp the ZNCC confidence to [0, 1] (float rounding can nudge an
-                # exact-copy correlation a hair above 1.0).
-                return (best_xy[0], best_xy[1], sw, sh), min(1.0, max(0.0, best_s)), net_code
+                    if votes < warp_min_votes:
+                        return None
+                    axis_failed = True  # skip the local search; go to the fallback
+            if not axis_failed:
+                # Local ±-px alignment search (the vote-median centre is a few px
+                # noisy — exactly what NCC/SSD slides over); keep the best alignment.
+                best_s, best_xy = -2.0, None
+                for dy in range(-_NCC_SEARCH, _NCC_SEARCH + 1):
+                    for dx in range(-_NCC_SEARCH, _NCC_SEARCH + 1):
+                        x0, y0 = bx0 + dx, by0 + dy
+                        if x0 < 0 or y0 < 0 or x0 + sw > full_w or y0 + sh > full_h:
+                            continue
+                        win = verify_image[y0:y0 + sh, x0:x0 + sw]
+                        if win.shape != tw_img.shape:
+                            continue
+                        s = self._zncc(win, tw_img, weights)
+                        if s > best_s:
+                            best_s, best_xy = s, (x0, y0)
+                if best_xy is not None and best_s >= _NCC_ACCEPT:
+                    # Clamp the ZNCC confidence to [0, 1] (float rounding can nudge an
+                    # exact-copy correlation a hair above 1.0).
+                    return (best_xy[0], best_xy[1], sw, sh), min(1.0, max(0.0, best_s)), net_code
             # Axis verify FAILED. A perspective copy can masquerade as near-D4 (its
             # vote-median angle≈0, scale≈1) yet not match the unwarped template, so
             # fall through to the off-axis / homography fallback rather than reject.
@@ -1071,8 +1127,23 @@ class FeatureMatcher:
         # back through it for the SAME ZNCC gate — recovering perspective/affine the
         # similarity model cannot. Reached only for >= warp_min_votes proposals (the
         # off-axis votes gate above), so D4/PCB axis-successes never get here.
-        return self._verify_homography(
+        r = self._verify_homography(
             cv2, src_pts, dst_pts, tmpl, th_o, tw_o, verify_image, full_w, full_h, weights
+        )
+        if r is not None:
+            return r
+
+        # --- IMAGE-SPACE CLUSTER homography fallback -------------------------
+        # The peak-bin cluster was starved/contaminated by the similarity vote's
+        # perspective scatter (it keys only the centre-histogram peak). Re-gather
+        # this orientation's COMPLETE correspondence set restricted to an image-space
+        # box around the proposal centre — a perspective copy's image keypoints stay
+        # physically clustered, so that box holds the copy's whole, high-inlier
+        # cluster — and RANSAC + the SAME ZNCC gate on it. Last resort, so it only
+        # ever runs for proposals every cheaper path already rejected.
+        return self._verify_cluster_homography(
+            cv2, orient, cx, cy, orient_corr, tmpl, th_o, tw_o,
+            verify_image, full_w, full_h, weights,
         )
 
     def _verify_homography(self, cv2, src_pts, dst_pts, tmpl, th_o, tw_o,
@@ -1115,6 +1186,84 @@ class FeatureMatcher:
             return None
         bx, by, bw, bh = box
         return (int(round(bx)), int(round(by)), int(round(bw)), int(round(bh))), \
+            min(1.0, max(0.0, score)), "R0"
+
+    def _verify_cluster_homography(self, cv2, orient, cx, cy, orient_corr, tmpl,
+                                   th_o, tw_o, verify_image, full_w, full_h, weights):
+        """Image-space cluster perspective verify (the perspective recall fix).
+
+        Gathers ALL of ``orient``'s good template->image correspondences whose IMAGE
+        position lies in a ``±_CLUSTER_RADIUS_FACTOR·max(th,tw)`` box around the
+        proposal centre ``(cx, cy)`` — a perspective copy's image keypoints stay
+        physically clustered, so this is the copy's COMPLETE, high-inlier cluster
+        (the peak-bin cluster that ``_verify_homography`` uses was starved by the
+        similarity vote's scatter). RANSAC a homography on it and apply the SAME
+        ZNCC>=_NCC_ACCEPT_WARP gate; returns ``(box, score, "R0")`` or ``None``.
+
+        Reached only after every cheaper path (and the peak-bin homography) rejected
+        the proposal, so the D4/PCB axis-successes never enter it. Precision is the
+        ZNCC gate plus the convex/positive-area/scale guards, which (unlike the
+        peak-bin path's ``_project_to_box``) flip-test by the SIGNED AREA of the
+        projected quad — correct under perspective, where the linear-2x2 det can go
+        negative for an orientation-preserving copy.
+        """
+        if orient_corr is None:
+            return None
+        corr = orient_corr.get(orient)
+        if corr is None:
+            return None
+        tpx, tpy, ipx, ipy = corr
+        rad = _CLUSTER_RADIUS_FACTOR * max(th_o, tw_o)
+        sel = (np.abs(ipx - cx) < rad) & (np.abs(ipy - cy) < rad)
+        if int(sel.sum()) < _CLUSTER_MIN_PTS:
+            return None
+        ps = np.ascontiguousarray(np.stack([tpx[sel], tpy[sel]], 1).astype(np.float32))
+        pd = np.ascontiguousarray(np.stack([ipx[sel], ipy[sel]], 1).astype(np.float32))
+        if len(ps) > _CLUSTER_MAX_PTS:  # bound RANSAC cost on a dense cluster
+            idx = np.linspace(0, len(ps) - 1, _CLUSTER_MAX_PTS).astype(np.int64)
+            ps, pd = ps[idx], pd[idx]
+        try:
+            H, mask = cv2.findHomography(
+                ps.reshape(-1, 1, 2), pd.reshape(-1, 1, 2),
+                cv2.RANSAC, _REPROJ_THRESH, maxIters=_CLUSTER_RANSAC_ITERS, confidence=0.999,
+            )
+        except cv2.error:
+            return None
+        if H is None or mask is None or int(mask.ravel().sum()) < _HOMOG_MIN_PTS:
+            return None
+        # Reject wild projective terms (a runaway perspective blow-up) — same ceiling
+        # as the peak-bin path.
+        if abs(float(H[2, 0])) > _HOMOG_MAX_BOTTOM or abs(float(H[2, 1])) > _HOMOG_MAX_BOTTOM:
+            return None
+        corners = np.array([[[0, 0], [tw_o, 0], [tw_o, th_o], [0, th_o]]], np.float32)
+        quad = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
+        if not np.all(np.isfinite(quad)):
+            return None
+        # Orientation-preserving + non-degenerate by the PROJECTED quad (perspective-
+        # correct flip test, not the linear-2x2 det), then a sane scale bound from the
+        # quad's area and convexity (a cross-copy lattice fit is non-convex / wrong area).
+        area2 = self._signed_area2(quad)
+        if area2 <= 0 or not self._is_convex(quad):
+            return None
+        lin = (0.5 * area2 / (tw_o * th_o)) ** 0.5 if tw_o * th_o > 0 else 0.0
+        if lin < _MIN_SCALE or lin > _MAX_SCALE:
+            return None
+        try:
+            Hinv = np.linalg.inv(H)
+        except np.linalg.LinAlgError:
+            return None
+        back = cv2.warpPerspective(verify_image, Hinv, (tw_o, th_o), flags=cv2.INTER_LINEAR)
+        score = self._zncc(back, tmpl, weights)
+        if score < _NCC_ACCEPT_WARP:
+            return None
+        x0 = max(0.0, min(float(quad[:, 0].min()), full_w))
+        y0 = max(0.0, min(float(quad[:, 1].min()), full_h))
+        x1 = max(0.0, min(float(quad[:, 0].max()), full_w))
+        y1 = max(0.0, min(float(quad[:, 1].max()), full_h))
+        bw, bh = x1 - x0, y1 - y0
+        if bw < 1 or bh < 1:
+            return None
+        return (int(round(x0)), int(round(y0)), int(round(bw)), int(round(bh))), \
             min(1.0, max(0.0, score)), "R0"
 
     @staticmethod
