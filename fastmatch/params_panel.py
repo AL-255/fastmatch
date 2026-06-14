@@ -57,7 +57,6 @@ from .types import (
     CONV_METHODS,
     METHOD_LABELS,
     METHODS,
-    ORIENTATION_LABELS,
     MatchParams,
     active_orientations,
     normalize_weights,
@@ -469,8 +468,8 @@ class ParamsPanel(QWidget):
         )
         n = len(active)
         plural = "orientation" if n == 1 else "orientations"
-        names = ", ".join(ORIENTATION_LABELS.get(o, o) for o in active)
-        self._orientation_label.setText(f"{n} {plural}: {names}")
+        # Old notation: list the D4 orientation CODES (R0, R90, MX, MY, ...).
+        self._orientation_label.setText(f"{n} {plural}: {', '.join(active)}")
 
     def _sync_method_page(self) -> None:
         """Show the control page (conv vs features) matching the current method."""
