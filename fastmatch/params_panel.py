@@ -34,6 +34,7 @@ we only nudge the default on a method switch and otherwise respect manual edits.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -64,6 +65,12 @@ from .types import (
 
 #: Channel-weight slider resolution (ticks per slider; value/100 == the weight).
 _WEIGHT_TICKS = 100
+
+#: Labels in the parent "Match parameters" form. Their widest text sets that
+#: form's label-column width; nested sub-forms (the weight groups, the feature
+#: form) pin their own labels to the same width so every field in the panel
+#: shares one left edge instead of stepping left at each sub-form.
+_PARENT_FORM_LABELS = ("Threshold", "Max results", "Channel mode")
 
 #: Display casing for a multi-channel mode's weight-group title (mode key -> label).
 _MODE_DISPLAY = {"rgb": "RGB", "ycbcr": "YCbCr"}
@@ -149,6 +156,12 @@ class ParamsPanel(QWidget):
         # re-emit while we are mid-construction or mid-sync.
         self._emitting = False
 
+        # Width of the parent "Match parameters" form's label column (the widest
+        # of its labels). Nested sub-forms pin their labels to this so all fields
+        # share one left edge. Computed from the panel font so it tracks the theme.
+        fm = QFontMetrics(self.font())
+        self._label_col_width = max(fm.horizontalAdvance(t) for t in _PARENT_FORM_LABELS)
+
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)  # even outer breathing room
         root.setSpacing(8)                    # consistent gap between sibling groups
@@ -231,7 +244,7 @@ class ParamsPanel(QWidget):
         thresh_row = QHBoxLayout()
         thresh_row.addWidget(self._threshold, 1)
         thresh_row.addWidget(self._threshold_label)
-        form.addRow("Threshold", thresh_row)
+        form.addRow(self._form_label("Threshold"), thresh_row)
 
         # Max results: cap after NMS, default 500.
         self._max_results = QSpinBox(self)
@@ -242,7 +255,7 @@ class ParamsPanel(QWidget):
             "detections are merged)."
         )
         self._max_results.valueChanged.connect(self._on_param_changed)
-        form.addRow("Max results", self._max_results)
+        form.addRow(self._form_label("Max results"), self._max_results)
 
         # Channel mode combo: luminance (fast, default), rgb, or ycbcr. Applies to
         # ALL methods — the conv methods combine the channels before normalizing,
@@ -259,7 +272,7 @@ class ParamsPanel(QWidget):
             "to NCC/SSD/CCORR and feature matching's appearance verification."
         )
         self._channel_mode.currentIndexChanged.connect(self._on_channel_mode_changed)
-        form.addRow("Channel mode", self._channel_mode)
+        form.addRow(self._form_label("Channel mode"), self._channel_mode)
 
         # Per-channel weight sliders for the multi-channel modes (one group each;
         # only the active mode's group is shown). The three sliders are relative
@@ -322,7 +335,7 @@ class ParamsPanel(QWidget):
             "Feature matching runs on CPU via OpenCV."
         )
         self._feature_detector.currentIndexChanged.connect(self._on_param_changed)
-        feature_form.addRow("Detector", self._feature_detector)
+        feature_form.addRow(self._form_label("Detector"), self._feature_detector)
 
         self._feature_min_inliers = QSpinBox(self)
         self._feature_min_inliers.setRange(4, 10_000)
@@ -332,7 +345,7 @@ class ParamsPanel(QWidget):
             "instance. Lower finds more (and weaker) instances; higher is stricter."
         )
         self._feature_min_inliers.valueChanged.connect(self._on_param_changed)
-        feature_form.addRow("Min matches", self._feature_min_inliers)
+        feature_form.addRow(self._form_label("Min matches"), self._feature_min_inliers)
         self._method_stack.addWidget(feature_box)  # index 1
 
         root.addWidget(self._method_stack)
@@ -458,6 +471,18 @@ class ParamsPanel(QWidget):
         """Show the control page (conv vs features) matching the current method."""
         self._method_stack.setCurrentIndex(0 if self._is_conv_method() else 1)
 
+    def _form_label(self, text: str) -> QLabel:
+        """A right-aligned form label pinned to the parent label-column width.
+
+        Used for the nested sub-forms (weight groups, feature form) so their
+        fields share the same left edge as the parent "Match parameters" form
+        instead of stepping left under their own (narrower) label column.
+        """
+        lbl = QLabel(text, self)
+        lbl.setMinimumWidth(self._label_col_width)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        return lbl
+
     # ------------------------------------------------------- channel weights
     def _make_weight_group(self, mode: str):
         """Build a 3-slider weight group for ``mode`` ("rgb" / "ycbcr").
@@ -488,7 +513,10 @@ class ParamsPanel(QWidget):
                 "(the three are normalized to sum to 1.0)."
             )
             s.valueChanged.connect(self._on_weight_changed)
-            lay.addRow(nm, s)
+            # Pin the (single-letter) label to the parent form's label-column
+            # width so the slider lines up under the Channel-mode combo above
+            # instead of jutting left of every other field in the box.
+            lay.addRow(self._form_label(nm), s)
             sliders.append(s)
         readout = QLabel(self)
         readout.setTextFormat(Qt.TextFormat.PlainText)

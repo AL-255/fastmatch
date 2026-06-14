@@ -147,3 +147,13 @@ sibling Scale search and peer Orientation were already flat — it was the lone
 framed secondary group); label the status-bar cursor readout ("Cursor: (-, -)"
 instead of a bare "(-, -)"); capitalize "Memory" in the two Add-to-Memory status
 messages to match the rest of the chrome. 153 tests pass.
+
+## Iteration 10 — unify the field column across nested sub-forms
+
+Three lenses empty. Hierarchy lens found the most visible remaining defect: inside
+"Match parameters" the field column stepped ~76px left at the weight sliders
+(each QFormLayout sized its own label column; the single-letter R/G/B labels made a
+tiny one). Fix: a font-metrics-derived shared label-column width (`_label_col_width`)
+and a `_form_label()` helper, routing the parent rows + weight groups + feature form
+through it so every field shares one left edge. `params_panel.py`. 153 tests pass;
+luminance/dark views pixel-unchanged.
