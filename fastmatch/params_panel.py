@@ -56,6 +56,7 @@ from .types import (
     CONV_METHODS,
     METHOD_LABELS,
     METHODS,
+    ORIENTATION_LABELS,
     MatchParams,
     active_orientations,
     normalize_weights,
@@ -149,6 +150,8 @@ class ParamsPanel(QWidget):
         self._emitting = False
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)  # even outer breathing room
+        root.setSpacing(8)                    # consistent gap between sibling groups
 
         # --- Run controls (top) --------------------------------------------
         # A manual "Run" button plus an "Auto Run" toggle. Auto Run defaults ON
@@ -166,7 +169,7 @@ class ParamsPanel(QWidget):
         self._run_button.setEnabled(False)  # enabled once a region is selected
         self._run_button.clicked.connect(lambda *_: self.run_clicked.emit())
         run_row.addWidget(self._run_button, 1)
-        self._auto_run = QCheckBox("Auto Run", self)
+        self._auto_run = QCheckBox("Auto run", self)
         self._auto_run.setChecked(True)
         self._auto_run.setToolTip(
             "When on, the search runs automatically as you draw a selection or "
@@ -179,6 +182,8 @@ class ParamsPanel(QWidget):
         # --- Method selector (top, DESIGN.md §J.5) -------------------------
         method_box = QGroupBox("Method", self)
         method_layout = QVBoxLayout(method_box)
+        method_layout.setContentsMargins(8, 4, 8, 8)
+        method_layout.setSpacing(6)
         self._method = QComboBox(self)
         for key in METHODS:
             # Store the method key as item data; show the human-readable label.
@@ -205,6 +210,9 @@ class ParamsPanel(QWidget):
         form = QFormLayout(params_box)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setContentsMargins(8, 4, 8, 8)
+        form.setVerticalSpacing(8)
+        form.setHorizontalSpacing(8)
 
         # Threshold: live [0, 1] filter, default tracks the selected method. The
         # numeric value sits right-aligned on the slider's own row (no orphan row).
@@ -274,7 +282,10 @@ class ParamsPanel(QWidget):
         # Page 0: convolution-only controls (scale search). Channel mode moved to
         # the always-visible params box above (it now applies to features too).
         conv_box = QGroupBox("Scale search", self)
+        conv_box.setFlat(True)  # secondary group: title rule only, no full frame
         conv_layout = QVBoxLayout(conv_box)
+        conv_layout.setContentsMargins(8, 4, 8, 4)
+        conv_layout.setSpacing(6)
         self._multiscale = QCheckBox("Search multiple scales", self)
         # Always connect the signal (even though it starts disabled on CPU) so it
         # works after a runtime CPU->CUDA engine switch; enable/checked/tooltip are
@@ -291,6 +302,9 @@ class ParamsPanel(QWidget):
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
         feature_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        feature_form.setContentsMargins(8, 4, 8, 8)
+        feature_form.setVerticalSpacing(8)
+        feature_form.setHorizontalSpacing(8)
         self._feature_detector = QComboBox(self)
         for det in _FEATURE_DETECTORS:
             self._feature_detector.addItem(_FEATURE_DETECTOR_LABELS[det], userData=det)
@@ -323,8 +337,11 @@ class ParamsPanel(QWidget):
         # default off, so with neither checked the search is the upright "R0"
         # template only — byte-for-byte the prior behaviour.
         orient_box = QGroupBox("Orientation", self)
+        orient_box.setFlat(True)  # secondary group: title rule only, no full frame
         orient_layout = QVBoxLayout(orient_box)
-        self._enable_rotation = QCheckBox("Enable Rotation", self)
+        orient_layout.setContentsMargins(8, 4, 8, 4)
+        orient_layout.setSpacing(6)
+        self._enable_rotation = QCheckBox("Enable rotation", self)
         self._enable_rotation.setChecked(MatchParams.enable_rotation)
         self._enable_rotation.setToolTip(
             "Also search the template rotated 90°, 180°, and 270°."
@@ -332,7 +349,7 @@ class ParamsPanel(QWidget):
         self._enable_rotation.toggled.connect(self._on_orientation_changed)
         orient_layout.addWidget(self._enable_rotation)
 
-        self._enable_flipping = QCheckBox("Enable Flipping", self)
+        self._enable_flipping = QCheckBox("Enable flipping", self)
         self._enable_flipping.setChecked(MatchParams.enable_flipping)
         self._enable_flipping.setToolTip(
             "Also search mirrored templates. Combined with rotation this adds the "
@@ -426,7 +443,8 @@ class ParamsPanel(QWidget):
         )
         n = len(active)
         plural = "orientation" if n == 1 else "orientations"
-        self._orientation_label.setText(f"{n} {plural}: {', '.join(active)}")
+        names = ", ".join(ORIENTATION_LABELS.get(o, o) for o in active)
+        self._orientation_label.setText(f"{n} {plural}: {names}")
 
     def _sync_method_page(self) -> None:
         """Show the control page (conv vs features) matching the current method."""
@@ -447,7 +465,10 @@ class ParamsPanel(QWidget):
             MatchParams().rgb_weights if mode == "rgb" else MatchParams().ycbcr_weights
         )
         box = QGroupBox(f"{_MODE_DISPLAY.get(mode, mode.upper())} channel weights", self)
+        box.setFlat(True)  # nested sub-section: avoid a frame-within-a-frame
         lay = QFormLayout(box)
+        lay.setContentsMargins(8, 4, 8, 6)
+        lay.setVerticalSpacing(6)
         sliders: list[QSlider] = []
         for i, nm in enumerate(names):
             s = QSlider(Qt.Orientation.Horizontal, self)

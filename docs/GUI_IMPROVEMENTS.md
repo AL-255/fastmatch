@@ -55,3 +55,28 @@ Emphasis / secondary text (`theme.py` + `app.py` + `params_panel.py`):
 Verification: 153 tests pass; verified in light+dark re-screenshots (02 dark main
 window frames/slider now visible; 08 dark panel + 03 light panel show the enabled
 Run accent, muted readout, legible disabled text).
+
+## Iteration 3 — toolbar/menu structure, de-duplication, spacing & copy
+
+Toolbar / menus (`app.py`):
+- Toolbar grouped by task with separators: Open | Pan mode / Fit | Clear matches |
+  Calibrate / Measure. The duplicate "Add to Memory" action was removed from the
+  toolbar (it lives only on the Memory dock now); "Self-test" (a diagnostic) was
+  demoted off the toolbar into a new **Help** menu. Actions/handlers unchanged.
+
+Layout / density (`params_panel.py`):
+- Explicit, even margins/spacing on the root + Method/Match-parameters/Feature
+  forms for a consistent vertical rhythm.
+- Low-priority single-control groups flattened (`setFlat(True)`): Scale search,
+  Orientation, and the RGB/YCbCr weight sub-groups — establishing framed-primary
+  (Method, Match parameters, Feature matching) vs flat-secondary hierarchy and
+  removing the frame-within-a-frame around the weight sliders.
+
+Copy / consistency (`params_panel.py`):
+- Sentence-case checkboxes: "Auto run", "Enable rotation", "Enable flipping"
+  (matching "Search multiple scales").
+- Friendly orientation readout via `ORIENTATION_LABELS`: "1 orientation: 0°"
+  (was the internal code "R0").
+
+Verification: 153 tests pass (test traps avoided — Tools-menu list, Theme/Engine
+titles, status-bar count label all untouched); confirmed in re-screenshots.

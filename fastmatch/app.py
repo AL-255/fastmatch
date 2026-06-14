@@ -236,16 +236,12 @@ class MainWindow(QMainWindow):
         self._act_fit.triggered.connect(self._viewport.fit_in_view)
         tb.addAction(self._act_fit)
 
+        tb.addSeparator()  # view group | results group
+
         self._act_clear = QAction("Clear matches", self)
         self._act_clear.triggered.connect(self._on_clear_matches)
         tb.addAction(self._act_clear)
-
-        self._act_add_memory = QAction("Add to Memory", self)
-        self._act_add_memory.setToolTip(
-            "Save the current selection and its matches as a Memory entry."
-        )
-        self._act_add_memory.triggered.connect(self._on_add_to_memory)
-        tb.addAction(self._act_add_memory)
+        # "Add to Memory" lives only on the Memory dock now (was duplicated here).
 
         tb.addSeparator()
 
@@ -264,14 +260,14 @@ class MainWindow(QMainWindow):
         self._act_measure.triggered.connect(self._on_measure_tool)
         tb.addAction(self._act_measure)
 
-        tb.addSeparator()
-
+        # Self-test is a diagnostic, not a primary tool — the action is created here
+        # (toolbar build runs before the menus) but lives in the Help menu, not the
+        # toolbar (see _build_help_menu).
         self._act_selftest = QAction("Self-test", self)
         self._act_selftest.setToolTip(
             "Generate a labelled sample, search one motif, and report recall."
         )
         self._act_selftest.triggered.connect(self._on_self_test)
-        tb.addAction(self._act_selftest)
 
     def _build_menus(self) -> None:
         """Menu bar — File (image + memory ops) and View (box appearance)."""
@@ -337,6 +333,11 @@ class MainWindow(QMainWindow):
         self._build_tools_menu()
         self._build_theme_menu()
         self._build_engine_menu()
+
+        # Help menu (last, by convention) — home of the Self-test diagnostic, which
+        # was demoted off the primary toolbar.
+        self._help_menu = self.menuBar().addMenu("&Help")
+        self._help_menu.addAction(self._act_selftest)
 
     def _build_tools_menu(self) -> None:
         """&Tools menu — physical-scale calibration and the measuring ruler.
