@@ -139,3 +139,11 @@ Three lenses empty. Affordance found one real clarity bug: the toolbar mode togg
 read "Pan mode" at startup while the app launches in Select mode (the handler labels
 the current state, so only the initial text was wrong). Fixed the initial label to
 "Select mode". `app.py`. 153 tests pass.
+
+## Iteration 9 — cross-method group parity + status clarity
+
+Theming lens empty. Applied: flatten the "Feature matching" group (its stack
+sibling Scale search and peer Orientation were already flat — it was the lone
+framed secondary group); label the status-bar cursor readout ("Cursor: (-, -)"
+instead of a bare "(-, -)"); capitalize "Memory" in the two Add-to-Memory status
+messages to match the rest of the chrome. 153 tests pass.

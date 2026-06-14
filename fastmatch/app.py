@@ -180,7 +180,7 @@ class MainWindow(QMainWindow):
         self._build_menus()
 
         # --- Status bar ----------------------------------------------------
-        self._cursor_label = QLabel("(-, -)", self)
+        self._cursor_label = QLabel("Cursor: (-, -)", self)
         self._area_label = QLabel("", self)        # physical area of the selection
         self._count_label = QLabel("0 matches", self)
         self._progress = QProgressBar(self)
@@ -659,7 +659,7 @@ class MainWindow(QMainWindow):
         is no completed search to save.
         """
         if self._last_rect is None or not self._all_matches:
-            self.statusBar().showMessage("Run a match first to add to memory.", 6000)
+            self.statusBar().showMessage("Run a match first to add to Memory.", 6000)
             return
         visible = [m for m in self._all_matches if m.score >= self._params.threshold]
         rect = self._last_rect
@@ -668,7 +668,7 @@ class MainWindow(QMainWindow):
         # NMS/feature params, ...) via the full MatchParams snapshot.
         entry = MemoryEntry(selection=sel, params=self._params, matches=list(visible))
         self._memory.add_entry(entry)
-        self.statusBar().showMessage(f"Added {len(visible)} matches to memory.", 6000)
+        self.statusBar().showMessage(f"Added {len(visible)} matches to Memory.", 6000)
 
     def _on_revisit_entry(self, entry: object) -> None:
         """Recall a saved entry: restore its reference box and matches (revisit).
@@ -896,9 +896,9 @@ class MainWindow(QMainWindow):
         """
         self._last_cursor = None if (x < 0 or y < 0) else (x, y)
         if self._last_cursor is None:
-            self._cursor_label.setText("(-, -)")
+            self._cursor_label.setText("Cursor: (-, -)")
             return
-        text = f"({x}, {y}) px"
+        text = f"Cursor: ({x}, {y}) px"
         if self._calibration is not None:
             text += "   " + self._calibration.format_point(x, y)
         self._cursor_label.setText(text)

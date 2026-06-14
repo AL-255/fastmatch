@@ -304,6 +304,7 @@ class ParamsPanel(QWidget):
 
         # Page 1: feature-matching controls.
         feature_box = QGroupBox("Feature matching", self)
+        feature_box.setFlat(True)  # secondary group, matching Scale search / Orientation
         feature_form = QFormLayout(feature_box)
         feature_form.setLabelAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
