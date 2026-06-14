@@ -142,6 +142,11 @@ class MainWindow(QMainWindow):
 
         dock_body = QWidget(self)
         dock_layout = QVBoxLayout(dock_body)
+        # Zero the wrapper margins so the ParamsPanel's own 8px inset is the sole
+        # one — matching the Memory dock (whose panel is the dock widget) so both
+        # docks share one left edge.
+        dock_layout.setContentsMargins(0, 0, 0, 0)
+        dock_layout.setSpacing(0)
         # The primary controls (Run / Method / Match parameters) lead the dock; the
         # device/engine banner is a low-priority diagnostic, so it sits at the
         # bottom (and the same hint is in the status bar).
@@ -221,7 +226,10 @@ class MainWindow(QMainWindow):
         tb.setObjectName("mainToolbar")
         self.addToolBar(tb)
 
-        self._act_open = QAction("Open", self)
+        # Toolbar uses sentence case ("Open image…") to match its siblings (Select
+        # mode / Clear matches); the File menu gets its own Title-Case "Open Image…"
+        # action below (menu convention: Close Image, Open Memory…).
+        self._act_open = QAction("Open image…", self)
         self._act_open.setToolTip("Open an image to search (PNG / JPEG / TIFF / BMP).")
         self._act_open.triggered.connect(self._on_open)
         tb.addAction(self._act_open)
@@ -285,9 +293,11 @@ class MainWindow(QMainWindow):
         # Keep references on self: a menu held only by a local can have its C++
         # object GC-deleted by shiboken (-> "QMenu already deleted" on access).
         file_menu = self._file_menu = self.menuBar().addMenu("&File")
-        # Image operations.
-        self._act_open.setText("Open Image…")  # reuse the toolbar action
-        file_menu.addAction(self._act_open)
+        # Image operations. A dedicated Title-Case menu action (the toolbar keeps
+        # its own sentence-case "Open image…"); both trigger _on_open.
+        self._act_open_menu = QAction("Open Image…", self)
+        self._act_open_menu.triggered.connect(self._on_open)
+        file_menu.addAction(self._act_open_menu)
         self._act_close_image = QAction("Close Image", self)
         self._act_close_image.setToolTip("Close the current image and clear the view.")
         self._act_close_image.triggered.connect(self._on_close_image)

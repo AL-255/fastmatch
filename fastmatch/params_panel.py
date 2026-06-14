@@ -304,15 +304,20 @@ class ParamsPanel(QWidget):
         conv_layout.setSpacing(6)
         self._multiscale = QCheckBox("Search multiple scales", self)
         # Always connect the signal (even though it starts disabled on CPU) so it
-        # works after a runtime CPU->CUDA engine switch; enable/checked/tooltip are
-        # set by _apply_device_to_multiscale, called here and on set_device().
+        # works after a runtime CPU->CUDA engine switch; enable/checked/tooltip and
+        # the hint below are set by _apply_device_to_multiscale (here + set_device).
         self._multiscale.toggled.connect(self._on_param_changed)
+        # Muted reason shown only when the control is disabled (CPU), so the greyed
+        # checkbox is not an unexplained dead control. Reuses the secondary-text QSS.
+        self._multiscale_hint = QLabel(self)
+        self._multiscale_hint.setObjectName("matchCount")
+        self._multiscale_hint.setWordWrap(True)
         self._apply_device_to_multiscale()
         conv_layout.addWidget(self._multiscale)
-        # The stacked widget sizes to the taller (feature) page, so on this single-
-        # checkbox page pin the checkbox to the top instead of letting it float
-        # centered in the slack.
-        conv_layout.setAlignment(self._multiscale, Qt.AlignmentFlag.AlignTop)
+        conv_layout.addWidget(self._multiscale_hint)
+        # The stacked widget sizes to the taller (feature) page; pin content to the
+        # top instead of letting it float centered in the slack.
+        conv_layout.addStretch(1)
         self._method_stack.addWidget(conv_box)  # index 0
 
         # Page 1: feature-matching controls.
@@ -670,6 +675,7 @@ class ParamsPanel(QWidget):
                     "Search the scale grid "
                     f"{', '.join(f'{s:g}x' for s in _SCALES_CUDA)} (GPU only)."
                 )
+                self._multiscale_hint.setVisible(False)
             else:
                 self._multiscale.setChecked(False)
                 self._multiscale.setEnabled(False)
@@ -677,6 +683,8 @@ class ParamsPanel(QWidget):
                     "Multi-scale search is GPU-only; CPU is locked to 1.0x to keep "
                     "queries responsive."
                 )
+                self._multiscale_hint.setText("GPU only — CPU is locked to 1.0×.")
+                self._multiscale_hint.setVisible(True)
         finally:
             self._multiscale.blockSignals(blocked)
 

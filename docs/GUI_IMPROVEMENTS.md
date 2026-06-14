@@ -157,3 +157,12 @@ tiny one). Fix: a font-metrics-derived shared label-column width (`_label_col_wi
 and a `_form_label()` helper, routing the parent rows + weight groups + feature form
 through it so every field shares one left edge. `params_panel.py`. 153 tests pass;
 luminance/dark views pixel-unchanged.
+
+## Iteration 11 — dock-inset parity, toolbar casing, disabled-control reason
+
+Theming lens empty. Applied: zero the Search-dock wrapper margins so its content
+nets the same 8px inset as the Memory dock (`app.py`); give the toolbar its own
+sentence-case "Open image…" while the File menu keeps Title-Case "Open Image…"
+(`app.py`); show a muted "GPU only — CPU is locked to 1.0×." reason under the
+disabled CPU scale checkbox instead of an unexplained dead control (`params_panel.py`).
+153 tests pass.
