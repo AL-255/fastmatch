@@ -33,6 +33,8 @@ we only nudge the default on a method switch and otherwise respect manual edits.
 
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPalette
 from PySide6.QtWidgets import (
@@ -234,6 +236,10 @@ class _ThresholdHistogram(QWidget):
 
         slot = span / bins
         gap = 1.0 if slot > 3.0 else 0.0   # drop the inter-bar gap once bars get thin
+        # Log-y scale: heights ∝ log1p(count) so a handful of high-score hits stay
+        # visible next to a large low-score blob. log1p keeps count==1 nonzero (a
+        # true linear log would vanish it) and count==max maps to full height.
+        denom = math.log1p(self._max)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         painter.setPen(Qt.PenStyle.NoPen)
@@ -242,7 +248,7 @@ class _ThresholdHistogram(QWidget):
                 continue
             bx0 = x0 + i * slot
             bw = max(1.0, slot - gap)
-            bh = (c / self._max) * usable
+            bh = (math.log1p(c) / denom) * usable if denom > 0 else 0.0
             bin_centre = (i + 0.5) / bins
             painter.setBrush(kept if bin_centre >= thr else filtered)
             painter.drawRect(int(round(bx0)), int(round(base - bh)),
