@@ -50,7 +50,7 @@ from .device import device_banner_text, resolve_device
 from .document import ImageDocument
 from .memory import MemoryEntry
 from .memory_panel import MemoryPanel
-from .params_panel import ParamsPanel
+from .params_panel import _HIST_BIN_PRESETS, _HIST_BINS, ParamsPanel
 from .types import CONV_METHODS, MatchParams
 from . import theme
 
@@ -342,6 +342,21 @@ class MainWindow(QMainWindow):
             self._box_width_group.addAction(act)
             width_menu.addAction(act)
 
+        # Score histogram (above the threshold slider): tunable bin count, an
+        # exclusive set of presets. "Hidden" here in the View menu rather than the
+        # always-visible params panel.
+        bins_menu = view_menu.addMenu("Histogram &bins")
+        self._hist_bins_group = QActionGroup(self)
+        self._hist_bins_group.setExclusive(True)
+        for nbins in _HIST_BIN_PRESETS:
+            act = QAction(f"{nbins} bins", self, checkable=True)
+            act.setChecked(nbins == _HIST_BINS)  # default
+            act.triggered.connect(
+                lambda _checked, n=nbins: self._params_panel.set_histogram_bins(n)
+            )
+            self._hist_bins_group.addAction(act)
+            bins_menu.addAction(act)
+
         # XOR-with-background toggle.
         self._act_box_xor = QAction("&XOR with background", self, checkable=True)
         self._act_box_xor.setToolTip(
@@ -561,6 +576,7 @@ class MainWindow(QMainWindow):
         self._area_label.setText("")
         self._params_panel.set_run_enabled(False)
         self._params_panel.set_match_count(0)
+        self._params_panel.set_score_histogram([])
         self._memory.set_source("", (0, 0))
         self._progress.setValue(0)
         self._progress.setVisible(False)
@@ -636,6 +652,7 @@ class MainWindow(QMainWindow):
         self._viewport.fit_in_view()
         self._count_label.setText("0 matches")
         self._params_panel.set_match_count(0)
+        self._params_panel.set_score_histogram([])
         # Re-seed the Memory panel's source header so entries added after the
         # swap record the new image (existing entries are left untouched).
         self._memory.set_source(self._doc.path, self._viewport.image_size())
@@ -658,6 +675,7 @@ class MainWindow(QMainWindow):
         self._params_panel.set_run_enabled(False)  # nothing to Run anymore
         self._count_label.setText("0 matches")
         self._params_panel.set_match_count(0)
+        self._params_panel.set_score_histogram([])
 
     # ----------------------------------------------------------------- memory
     def _on_add_to_memory(self) -> None:
@@ -929,6 +947,8 @@ class MainWindow(QMainWindow):
         self._all_matches = match_list
         self._count_label.setText(self._count_text(shown, match_list, self._params.threshold))
         self._params_panel.set_match_count(shown)
+        # Feed the full (pre-threshold) score distribution to the slider histogram.
+        self._params_panel.set_score_histogram([m.score for m in match_list])
 
     def _count_text(self, shown: int, matches: list, threshold: float) -> str:
         """Build the status-bar count string, with an orientation breakdown.

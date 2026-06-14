@@ -34,11 +34,12 @@ we only nudge the default on a method switch and otherwise respect manual edits.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFontMetrics
+from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPalette
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -46,6 +47,8 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QStackedWidget,
+    QStyle,
+    QStyleOptionSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -83,6 +86,12 @@ _SCALES_CPU: tuple[float, ...] = (1.0,)
 # so the user gets 0.001 resolution on a [0, 1] score.
 _THRESH_TICKS = 1000
 
+# Score histogram drawn directly above the threshold slider (aligned to its track).
+_HIST_HEIGHT = 38    # px tall (excludes the small gap to the slider below)
+_HIST_BINS = 100     # DEFAULT score bins across [0, 1]; tunable via the View menu
+# Bin-count presets offered in the View ▸ Score histogram menu (the tunable param).
+_HIST_BIN_PRESETS: tuple[int, ...] = (50, 100, 200, 400)
+
 # Per-method default for the threshold *slider* (DESIGN.md §J.5). Conv methods
 # want a strict cutoff against repetitive-texture floods; the feature path scores
 # by inlier ratio and so reads lower for genuine instances, hence a softer 0.5.
@@ -112,6 +121,133 @@ def _cv2_available() -> bool:
         # Any import failure (missing wheel, broken install) means no features.
         return False
     return True
+
+
+class _ThresholdHistogram(QWidget):
+    """A small bar chart of match-score counts, drawn to align with a horizontal
+    :class:`QSlider`'s track so the bars sit directly above the slider value axis.
+
+    Each bar is one score bin across ``[0, 1]``; its height is that bin's hit count
+    (shared linear scale, tallest bin == full height). Bars at or above the current
+    threshold are drawn in the accent colour (kept / shown); bars below it are muted
+    (filtered out), so dragging the slider gives live feedback on how many detections
+    survive. Purely a readout — it forwards no input; the slider beneath owns
+    interaction. Colours come from the widget palette, so it tracks the app theme.
+    """
+
+    def __init__(self, slider: QSlider, parent: "QWidget | None" = None) -> None:
+        super().__init__(parent)
+        self._slider = slider
+        self._scores: list[float] = []   # raw scores, kept so a bin change re-bins
+        self._bins = _HIST_BINS
+        self._counts: list[int] = []
+        self._max = 0
+        self.setFixedHeight(_HIST_HEIGHT)
+        # Non-interactive: let clicks fall through to whatever is beneath.
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setToolTip(
+            "Distribution of match scores. Bars at/above the threshold are shown; "
+            "bars below it are filtered out. Bin count: View ▸ Score histogram."
+        )
+
+    def set_scores(self, scores: "list[float]") -> None:
+        """Store the match scores ([0, 1]), re-bin, and repaint."""
+        self._scores = [min(1.0, max(0.0, float(s))) for s in scores]
+        self._rebin()
+
+    def set_bins(self, bins: int) -> None:
+        """Set the number of histogram bins across [0, 1] (re-bins the stored scores)."""
+        bins = max(1, int(bins))
+        if bins != self._bins:
+            self._bins = bins
+            self._rebin()
+
+    def bins(self) -> int:
+        """Current bin count."""
+        return self._bins
+
+    def _rebin(self) -> None:
+        counts = [0] * self._bins
+        for s in self._scores:
+            b = int(s * self._bins)
+            if b >= self._bins:  # the score == 1.0 edge falls in the last bin
+                b = self._bins - 1
+            counts[b] += 1
+        self._counts = counts
+        self._max = max(counts) if counts else 0
+        self.update()
+
+    def refresh_threshold(self) -> None:
+        """Repaint after the slider moved (recolours kept vs filtered bars)."""
+        self.update()
+
+    def _track_span(self) -> "tuple[float, float]":
+        """Pixel x-range (value 0 .. value 1) of the slider's handle-centre travel.
+
+        Mapping each bin edge through this makes a bar boundary line up with the
+        slider handle when it sits at the same score — the alignment the chart wants.
+        The slider and this widget share the grid column, so the slider's local x
+        coordinates equal ours.
+        """
+        opt = QStyleOptionSlider()
+        self._slider.initStyleOption(opt)
+        st = self._slider.style()
+        groove = st.subControlRect(
+            QStyle.ComplexControl.CC_Slider, opt,
+            QStyle.SubControl.SC_SliderGroove, self._slider,
+        )
+        handle = st.subControlRect(
+            QStyle.ComplexControl.CC_Slider, opt,
+            QStyle.SubControl.SC_SliderHandle, self._slider,
+        )
+        half = handle.width() / 2.0
+        return groove.x() + half, groove.x() + groove.width() - half
+
+    def paintEvent(self, event: object) -> None:  # noqa: N802 (Qt override)
+        if not self._counts or self._max <= 0:
+            return
+        x0, x1 = self._track_span()
+        if x1 <= x0:
+            return
+        span = x1 - x0
+        bins = self._bins
+        h = self.height()
+        base = h - 1                       # leave a 1px baseline at the bottom
+        top_pad = 2                        # headroom so the tallest bar isn't clipped
+        usable = max(1.0, base - top_pad)
+
+        # Theme-aware colours, both derived from the palette accent so the chart
+        # reads as one distribution. Kept bars use the full accent; filtered bars are
+        # the accent blended ~42% over the panel background — same hue, clearly
+        # de-emphasised, yet OPAQUE so they never wash out to "gray on gray".
+        pal = self.palette()
+        accent = pal.color(QPalette.ColorRole.Highlight)
+        win = pal.color(QPalette.ColorRole.Window)
+        kept = accent
+        a = 0.42
+        filtered = QColor(
+            round(accent.red() * a + win.red() * (1 - a)),
+            round(accent.green() * a + win.green() * (1 - a)),
+            round(accent.blue() * a + win.blue() * (1 - a)),
+        )
+        thr = self._slider.value() / float(self._slider.maximum() or 1)
+
+        slot = span / bins
+        gap = 1.0 if slot > 3.0 else 0.0   # drop the inter-bar gap once bars get thin
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setPen(Qt.PenStyle.NoPen)
+        for i, c in enumerate(self._counts):
+            if c <= 0:
+                continue
+            bx0 = x0 + i * slot
+            bw = max(1.0, slot - gap)
+            bh = (c / self._max) * usable
+            bin_centre = (i + 0.5) / bins
+            painter.setBrush(kept if bin_centre >= thr else filtered)
+            painter.drawRect(int(round(bx0)), int(round(base - bh)),
+                             int(round(bw)), int(round(bh)))
+        painter.end()
 
 
 class ParamsPanel(QWidget):
@@ -240,10 +376,19 @@ class ParamsPanel(QWidget):
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
         self._threshold.valueChanged.connect(self._on_threshold_changed)
-        thresh_row = QHBoxLayout()
-        thresh_row.addWidget(self._threshold, 1)
-        thresh_row.addWidget(self._threshold_label)
-        form.addRow(self._form_label("Threshold"), thresh_row)
+        # Score histogram sits directly above the slider, in the SAME grid column so
+        # it shares the slider's width/x; it aligns its bars to the slider track in
+        # paintEvent. The numeric readout stays beside the slider (column 1).
+        self._threshold_hist = _ThresholdHistogram(self._threshold, self)
+        thresh_grid = QGridLayout()
+        thresh_grid.setContentsMargins(0, 0, 0, 0)
+        thresh_grid.setHorizontalSpacing(8)
+        thresh_grid.setVerticalSpacing(2)
+        thresh_grid.addWidget(self._threshold_hist, 0, 0)
+        thresh_grid.addWidget(self._threshold, 1, 0)
+        thresh_grid.addWidget(self._threshold_label, 1, 1)
+        thresh_grid.setColumnStretch(0, 1)
+        form.addRow(self._form_label("Threshold"), thresh_grid)
 
         # Max results: cap after NMS, default 500.
         self._max_results = QSpinBox(self)
@@ -584,8 +729,9 @@ class ParamsPanel(QWidget):
         self._emit()
 
     def _on_threshold_changed(self) -> None:
-        """Threshold moved: update its label, then emit (live filter path)."""
+        """Threshold moved: update its label + histogram, then emit (live filter)."""
         self._sync_threshold_label()
+        self._threshold_hist.refresh_threshold()
         self._emit()
 
     def _on_param_changed(self, *args: object) -> None:
@@ -649,6 +795,16 @@ class ParamsPanel(QWidget):
     def set_match_count(self, n: int) -> None:
         """Update the match-count readout label."""
         self._count_label.setText(f"Matches shown: {n}")
+
+    def set_score_histogram(self, scores: "list[float]") -> None:
+        """Feed the per-detection scores ([0, 1]) for the hit-count histogram drawn
+        above the threshold slider. Pass an empty list to clear it (e.g. on a new
+        image or cleared matches)."""
+        self._threshold_hist.set_scores(list(scores))
+
+    def set_histogram_bins(self, bins: int) -> None:
+        """Set the threshold-histogram bin count (the View-menu tunable)."""
+        self._threshold_hist.set_bins(bins)
 
     def auto_run_enabled(self) -> bool:
         """Whether the **Auto Run** checkbox is currently checked."""
