@@ -166,3 +166,10 @@ sentence-case "Open image…" while the File menu keeps Title-Case "Open Image�
 (`app.py`); show a muted "GPU only — CPU is locked to 1.0×." reason under the
 disabled CPU scale checkbox instead of an unexplained dead control (`params_panel.py`).
 153 tests pass.
+
+## Iteration 12 — empty-state button affordance
+
+3 of 4 lenses empty. Affordance found: the Memory panel's Rename/Remove buttons
+were enabled even with no entries (dead controls). Added `_sync_button_state()`
+(enable Rename/Remove only when entries exist; Add stays enabled), called from all
+entry-count paths. `memory_panel.py`. 153 tests pass.

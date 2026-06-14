@@ -168,8 +168,21 @@ class MemoryPanel(QWidget):
         root.addLayout(buttons)
 
         self._sync_header()
+        self._sync_button_state()
 
     # ------------------------------------------------------------------ helpers
+    def _sync_button_state(self) -> None:
+        """Enable Rename/Remove only when there is at least one entry to act on.
+
+        "Add to Memory" stays enabled (it is the meaningful action on an empty
+        list); the two row-acting buttons are dead with no entries — Remove
+        no-ops and Rename only pops a "select an entry" prompt — so we grey them
+        out to keep the empty-state affordance honest.
+        """
+        has_entries = len(self._entries) > 0
+        self._rename_button.setEnabled(has_entries)
+        self._remove_button.setEnabled(has_entries)
+
     def _sync_header(self) -> None:
         """Refresh the header label from the current source + entry count."""
         n = len(self._entries)
@@ -250,6 +263,7 @@ class MemoryPanel(QWidget):
         for entry in self._entries:
             self._append_row(entry)
         self._sync_header()
+        self._sync_button_state()
 
     # ------------------------------------------------------------------- slots
     def _on_item_double_clicked(self, item: QTableWidgetItem) -> None:
@@ -312,6 +326,7 @@ class MemoryPanel(QWidget):
                 self._table.removeRow(row)
                 del self._entries[row]
         self._sync_header()
+        self._sync_button_state()
 
     # --------------------------------------------------------- file operations
     def current_memory_path(self) -> str | None:
@@ -378,6 +393,7 @@ class MemoryPanel(QWidget):
         self._entries.append(entry)
         row = self._append_row(entry)
         self._sync_header()
+        self._sync_button_state()
         self._select_row(row)
 
     def set_source(self, source_image: str, image_size: tuple[int, int]) -> None:
@@ -407,3 +423,4 @@ class MemoryPanel(QWidget):
         self._table.clearContents()
         self._table.setRowCount(0)
         self._sync_header()
+        self._sync_button_state()
