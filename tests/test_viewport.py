@@ -170,3 +170,49 @@ def test_focus_mode_no_dim_without_boxes(qapp) -> None:
     vp.drawForeground(p, QRectF(0, 0, 64, 64))
     p.end()
     assert img.pixelColor(32, 32).red() == 255  # untouched
+
+
+# ----------------------------------------------------------- rectilinear select
+def test_rectilinear_snap_axis_aligned(qapp) -> None:
+    """A new vertex snaps so its edge from the previous one is horizontal/vertical."""
+    from PySide6.QtCore import QPoint, QPointF
+
+    vp = _viewport(qapp)
+    last = QPoint(10, 10)
+    assert vp._snap_rectilinear(last, QPointF(100, 18)) == QPoint(100, 10)  # H wins
+    assert vp._snap_rectilinear(last, QPointF(18, 100)) == QPoint(10, 100)  # V wins
+
+
+def test_rectilinear_close_builds_mask_and_emits_bbox(qapp) -> None:
+    """Closing an L-shaped polygon yields its bbox + a matching boolean mask."""
+    from PySide6.QtCore import QPoint
+
+    vp = _viewport(qapp)
+    vp.set_mode(ImageViewport.Mode.RECTILINEAR)
+    seen: list[tuple] = []
+    vp.regionSelected.connect(lambda r: seen.append((r.x(), r.y(), r.width(), r.height())))
+    # L-shape: full top band (y 10..60), left arm only below (x 10..60).
+    vp._poly_pts = [QPoint(10, 10), QPoint(110, 10), QPoint(110, 60),
+                    QPoint(60, 60), QPoint(60, 110), QPoint(10, 110)]
+    vp._close_rectilinear()
+
+    assert seen == [(10, 10, 100, 100)]
+    m = vp.selection_mask()
+    assert m is not None and m.shape == (100, 100) and m.dtype == bool
+    assert bool(m[5, 5]) is True       # top-left, inside the L
+    assert bool(m[80, 80]) is False    # bottom-right notch, cut out
+    assert 0.5 < float(m.mean()) < 0.9  # ~0.75 fill for this L
+
+
+def test_rectilinear_mask_clears_on_plain_rect_and_template_clear(qapp) -> None:
+    """A plain rectangle select and clear_template both drop the mask."""
+    from PySide6.QtCore import QPoint
+
+    vp = _viewport(qapp)
+    vp.set_mode(ImageViewport.Mode.RECTILINEAR)
+    vp._poly_pts = [QPoint(10, 10), QPoint(60, 10), QPoint(60, 60), QPoint(10, 60)]
+    vp._close_rectilinear()
+    assert vp.selection_mask() is not None
+
+    vp.clear_template()
+    assert vp.selection_mask() is None

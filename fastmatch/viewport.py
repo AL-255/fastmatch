@@ -36,7 +36,16 @@ from PySide6.QtCore import (
     QThreadPool,
     Signal,
 )
-from PySide6.QtGui import QColor, QImage, QPainterPath, QPixmap
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QPolygon,
+)
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QGraphicsItem,
@@ -62,6 +71,12 @@ _BG_COLOR = QColor(30, 30, 30)
 # Focus mode: opacity (0-255) of the dark veil laid over the image OUTSIDE the
 # boxes. ~60% keeps dimmed context faintly visible while the boxes pop.
 _FOCUS_DIM_ALPHA = 150
+
+# Rectilinear selection: click within this many VIEWPORT px of the first vertex
+# to close the polygon. Outline colours for the committed / in-progress shapes.
+_POLY_CLOSE_PX = 12
+_POLY_COMMIT_COLOR = QColor(60, 150, 235)   # committed selection outline (accent)
+_POLY_DRAW_COLOR = QColor(255, 180, 40)     # in-progress polyline (amber)
 
 # BT.601 luminance weights (R, G, B), matching the engine's convention (§D.1)
 # so the grayscale display mode shows exactly what the matcher "sees" in
@@ -234,6 +249,7 @@ class ImageViewport(QGraphicsView):
 
         SELECT = enum.auto()
         PAN = enum.auto()
+        RECTILINEAR = enum.auto()  # click right-angle vertices -> orthogonal-polygon select
         CALIBRATE = enum.auto()   # one-shot: left-drag picks the calibration span
         MEASURE = enum.auto()     # one-shot: left-drag measures a distance
 
@@ -317,6 +333,15 @@ class ImageViewport(QGraphicsView):
         self._rubber = QRubberBand(QRubberBand.Shape.Rectangle, self.viewport())
         self._template_rect: QRect | None = None
 
+        # Rectilinear (orthogonal-polygon) selection state. Vertices are in IMAGE
+        # px; each committed edge is axis-aligned (snapped H/V). _sel_polygon holds
+        # the last COMMITTED selection outline (for drawing); _selection_mask is its
+        # rasterized boolean mask (bbox-sized) or None for a plain rectangle.
+        self._poly_pts: list[QPoint] = []          # in-progress vertices (image px)
+        self._poly_preview: QPoint | None = None   # live snapped cursor (image px)
+        self._sel_polygon: list[QPoint] | None = None
+        self._selection_mask: np.ndarray | None = None
+
         # Calibration / measurement (ruler) state.
         self._measure_overlay: MeasureOverlayItem | None = None
         self._measuring = False
@@ -390,6 +415,9 @@ class ImageViewport(QGraphicsView):
         self._measuring = False
         self._measure_p1 = None
         self._template_rect = None
+        self._reset_rectilinear_state()
+        self._sel_polygon = None
+        self._selection_mask = None
         self.tile_cache.clear()
         self._pending_tiles.clear()
         self._bump_generation()
@@ -483,10 +511,14 @@ class ImageViewport(QGraphicsView):
         return QRect(self._template_rect) if self._template_rect is not None else None
 
     def clear_template(self) -> None:
-        """Clear the template selection and its highlighted source box."""
+        """Clear the template selection, its highlighted source box, and any mask."""
         self._template_rect = None
+        self._reset_rectilinear_state()
+        self._sel_polygon = None
+        self._selection_mask = None
         if self._overlay is not None:
             self._overlay.set_source_box(None)
+        self.viewport().update()
 
     def set_template_rect(self, rect: QRect | None) -> None:
         """Set the template selection + its highlighted (blue) source box.
@@ -503,9 +535,12 @@ class ImageViewport(QGraphicsView):
 
     # --------------------------------------------------------------- view ctl
     def set_mode(self, mode: "ImageViewport.Mode") -> None:
-        """Switch interaction mode (SELECT vs PAN) and update the cursor."""
+        """Switch interaction mode and update the cursor."""
+        if mode is not ImageViewport.Mode.RECTILINEAR:
+            self._reset_rectilinear_state()  # leaving the tool drops an unfinished poly
         self._mode = mode
         self._apply_cursor()
+        self.viewport().update()
 
     def set_display_grayscale(self, on: bool) -> None:
         """Render base-image tiles in BT.601 luminance (grayscale) when ``on``.
@@ -765,8 +800,25 @@ class ImageViewport(QGraphicsView):
 
     # ------------------------------------------------------------- key events
     def keyPressEvent(self, e) -> None:
-        """Space toggles focus mode (spotlight the boxes); guarded vs auto-repeat."""
-        if e.key() == Qt.Key.Key_Space and not e.isAutoRepeat():
+        """Space toggles focus mode; in rectilinear mode Enter closes / Esc cancels
+        the in-progress polygon (Backspace removes the last vertex)."""
+        key = e.key()
+        if self._mode is ImageViewport.Mode.RECTILINEAR and self._poly_pts:
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                if len(self._poly_pts) >= 3:
+                    self._close_rectilinear()
+                e.accept()
+                return
+            if key == Qt.Key.Key_Escape:
+                self._cancel_rectilinear()
+                e.accept()
+                return
+            if key == Qt.Key.Key_Backspace:
+                self._poly_pts.pop()
+                self.viewport().update()
+                e.accept()
+                return
+        if key == Qt.Key.Key_Space and not e.isAutoRepeat():
             self.set_focus_mode(not self._focus_mode)
             e.accept()
             return
@@ -797,15 +849,21 @@ class ImageViewport(QGraphicsView):
         return boxes
 
     def drawForeground(self, painter, rect) -> None:
-        """In focus mode, lay a dark veil over the image everywhere EXCEPT inside
-        the boxes — so matches / the selection stand out and the rest is dimmed."""
+        """Foreground overlays: the focus-mode veil and the rectilinear-selection
+        outline (committed shape + in-progress polyline)."""
         super().drawForeground(painter, rect)
-        if not self._focus_mode or self._doc is None:
+        if self._doc is None:
+            return
+        self._draw_focus_veil(painter, rect)
+        self._draw_rectilinear(painter)
+
+    def _draw_focus_veil(self, painter, rect) -> None:
+        """Lay a dark veil over the image everywhere EXCEPT inside the boxes."""
+        if not self._focus_mode:
             return
         boxes = self._focus_boxes()
         if not boxes:
             return  # nothing to spotlight -> don't pointlessly dim the whole image
-        # Only dim over the image itself, never the surrounding canvas.
         image = QRectF(0.0, 0.0, float(self._doc.width), float(self._doc.height))
         area = rect.intersected(image)
         if area.isEmpty():
@@ -820,6 +878,123 @@ class ImageViewport(QGraphicsView):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.fillPath(veil, QColor(0, 0, 0, _FOCUS_DIM_ALPHA))
         painter.restore()
+
+    def _draw_rectilinear(self, painter) -> None:
+        """Draw the committed selection polygon and any in-progress polyline."""
+        painter.save()
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if self._sel_polygon and len(self._sel_polygon) >= 2:
+            pen = QPen(_POLY_COMMIT_COLOR)
+            pen.setCosmetic(True)
+            pen.setWidth(2)
+            painter.setPen(pen)
+            painter.drawPolygon(QPolygon(self._sel_polygon))
+        if self._mode is ImageViewport.Mode.RECTILINEAR and self._poly_pts:
+            pen = QPen(_POLY_DRAW_COLOR)
+            pen.setCosmetic(True)
+            pen.setWidth(2)
+            painter.setPen(pen)
+            pts = list(self._poly_pts)
+            if self._poly_preview is not None:
+                pts.append(self._poly_preview)
+            painter.drawPolyline(QPolygon(pts))
+            # First-vertex marker (~10 device px), so the user can aim to close on it.
+            s = max(1.0, 5.0 / max(self._view_scale, 1e-6))
+            first = self._poly_pts[0]
+            painter.drawRect(QRectF(first.x() - s, first.y() - s, 2 * s, 2 * s))
+        painter.restore()
+
+    # ----------------------------------------------------- rectilinear select
+    def selection_mask(self) -> "np.ndarray | None":
+        """Boolean mask (bbox-sized, ``True`` == inside) for the last rectilinear
+        selection, or ``None`` for a plain rectangular selection."""
+        return None if self._selection_mask is None else self._selection_mask.copy()
+
+    @staticmethod
+    def _snap_rectilinear(last: QPoint, p: "QPointF | QPoint") -> QPoint:
+        """Snap ``p`` so the edge ``last -> result`` is axis-aligned (the longer of
+        the two deltas wins -> a horizontal or vertical segment)."""
+        px, py = int(round(p.x())), int(round(p.y()))
+        if abs(px - last.x()) >= abs(py - last.y()):
+            return QPoint(px, last.y())   # horizontal edge
+        return QPoint(last.x(), py)        # vertical edge
+
+    def _rectilinear_click(self, viewport_pt: QPoint) -> None:
+        """Add a (snapped) vertex, or close the polygon if clicking near the first."""
+        ip = self._clamped_image_point(viewport_pt)
+        if not self._poly_pts:
+            v = QPoint(int(round(ip.x())), int(round(ip.y())))
+            self._poly_pts.append(v)
+            self._poly_preview = v
+            self.viewport().update()
+            return
+        if len(self._poly_pts) >= 3:
+            first = self._poly_pts[0]
+            vp_first = self.mapFromScene(QPointF(first.x(), first.y()))
+            if (abs(viewport_pt.x() - vp_first.x()) <= _POLY_CLOSE_PX
+                    and abs(viewport_pt.y() - vp_first.y()) <= _POLY_CLOSE_PX):
+                self._close_rectilinear()
+                return
+        self._poly_pts.append(self._snap_rectilinear(self._poly_pts[-1], ip))
+        self.viewport().update()
+
+    def _reset_rectilinear_state(self) -> None:
+        self._poly_pts = []
+        self._poly_preview = None
+
+    def _cancel_rectilinear(self) -> None:
+        """Discard the in-progress polygon (Esc / mode switch)."""
+        self._reset_rectilinear_state()
+        self.viewport().update()
+
+    def _close_rectilinear(self) -> None:
+        """Finalize the orthogonal polygon: rasterize its mask, set it as the
+        template selection, and emit ``regionSelected`` with the bounding box."""
+        pts = list(self._poly_pts)
+        self._reset_rectilinear_state()
+        if len(pts) < 3:
+            self.viewport().update()
+            return
+        # Guarantee an orthogonal closure: if the last vertex shares neither axis
+        # with the first, insert an L-corner so every edge stays axis-aligned.
+        last, first = pts[-1], pts[0]
+        if last.x() != first.x() and last.y() != first.y():
+            pts.append(QPoint(last.x(), first.y()))
+        xs = [p.x() for p in pts]
+        ys = [p.y() for p in pts]
+        rect = QRect(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+        if rect.width() < 1 or rect.height() < 1:
+            self.viewport().update()
+            return
+        mask = self._rasterize_polygon(pts, rect)
+        if mask is None or not mask.any():
+            self.viewport().update()
+            return
+        self._sel_polygon = pts
+        self._selection_mask = mask
+        self._template_rect = rect
+        if self._overlay is not None:
+            self._overlay.set_source_box(rect)
+        self.viewport().update()
+        self.regionSelected.emit(QRect(rect))
+
+    @staticmethod
+    def _rasterize_polygon(pts: "list[QPoint]", rect: QRect) -> "np.ndarray | None":
+        """Rasterize the polygon (image-px vertices) into a bbox-sized bool mask."""
+        w, h = rect.width(), rect.height()
+        if w < 1 or h < 1:
+            return None
+        img = QImage(w, h, QImage.Format.Format_Grayscale8)
+        img.fill(0)
+        poly = QPolygon([QPoint(p.x() - rect.x(), p.y() - rect.y()) for p in pts])
+        painter = QPainter(img)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(Qt.GlobalColor.white))
+        painter.drawPolygon(poly)
+        painter.end()
+        bpl = img.bytesPerLine()
+        arr = np.frombuffer(bytes(img.constBits()), np.uint8).reshape(h, bpl)[:, :w]
+        return arr > 127
 
     # ----------------------------------------------------------- mouse events
     def mousePressEvent(self, e) -> None:
@@ -853,6 +1028,10 @@ class ImageViewport(QGraphicsView):
                     )
                 e.accept()
                 return
+            if self._mode is ImageViewport.Mode.RECTILINEAR:
+                self._rectilinear_click(e.position().toPoint())
+                e.accept()
+                return
             # Start a rubber-band selection in viewport coordinates.
             self._selecting = True
             self._sel_origin = e.position().toPoint()
@@ -861,6 +1040,14 @@ class ImageViewport(QGraphicsView):
             e.accept()
             return
         super().mousePressEvent(e)
+
+    def mouseDoubleClickEvent(self, e) -> None:
+        """Double-click closes an in-progress rectilinear polygon."""
+        if self._mode is ImageViewport.Mode.RECTILINEAR and len(self._poly_pts) >= 3:
+            self._close_rectilinear()
+            e.accept()
+            return
+        super().mouseDoubleClickEvent(e)
 
     def mouseMoveEvent(self, e) -> None:
         """Pan via scrollbars, extend the rubber-band, and emit cursor pos."""
@@ -889,6 +1076,14 @@ class ImageViewport(QGraphicsView):
 
         if self._selecting and self._sel_origin is not None:
             self._rubber.setGeometry(QRect(self._sel_origin, pos).normalized())
+            e.accept()
+            return
+
+        if self._mode is ImageViewport.Mode.RECTILINEAR and self._poly_pts:
+            # Live preview of the next axis-aligned edge from the last vertex.
+            ip = self._clamped_image_point(pos)
+            self._poly_preview = self._snap_rectilinear(self._poly_pts[-1], ip)
+            self.viewport().update()
             e.accept()
             return
 
@@ -930,6 +1125,9 @@ class ImageViewport(QGraphicsView):
             rect_img = self._viewport_band_to_image_rect()
             self._sel_origin = None
             if rect_img is not None and rect_img.width() >= 1 and rect_img.height() >= 1:
+                # A plain rectangle clears any prior rectilinear polygon/mask.
+                self._sel_polygon = None
+                self._selection_mask = None
                 self._template_rect = rect_img
                 if self._overlay is not None:
                     self._overlay.set_source_box(rect_img)
