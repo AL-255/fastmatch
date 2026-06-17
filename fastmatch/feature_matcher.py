@@ -511,10 +511,16 @@ class FeatureMatcher:
         *,
         image_rgb: np.ndarray | None = None,
         exclude_box: tuple[int, int, int, int] | None = None,
+        mask: np.ndarray | None = None,
         cancel: Callable[[], bool] | None = None,
         progress: Callable[[int], None] | None = None,
         scale_back: int = 1,
     ) -> list[Match]:
+        # NOTE: ``mask`` (a rectilinear-selection template mask) is accepted for
+        # API parity with the conv path but not yet honored here — feature matching
+        # currently uses the template's bounding box. Masked feature matching
+        # (mask-restricted keypoints + masked appearance verify) is a follow-up.
+        _ = mask
         """Find every (possibly warped) instance of ``template`` in the image.
 
         Keypoint **detection** is always on luminance (ORB/AKAZE/SIFT are

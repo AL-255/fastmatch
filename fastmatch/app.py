@@ -95,6 +95,9 @@ class MainWindow(QMainWindow):
         self._params: MatchParams = MatchParams(device=device)
         # Remember the last selection so non-threshold param changes can re-run it.
         self._last_rect: QRect | None = None
+        # Mask for the last selection (rectilinear/orthogonal-polygon), or None for
+        # a plain rectangle; threaded to the matcher on every (re-)run of this rect.
+        self._last_mask = None
         # Physical-scale calibration (None until the user calibrates); reset per
         # image. _tool_return_mode restores Pan/Select after a one-shot tool.
         self._calibration: Calibration | None = None
@@ -539,7 +542,7 @@ class MainWindow(QMainWindow):
 
         # Re-run the last query so results reflect the new engine immediately.
         if self._auto_run and self._last_rect is not None:
-            self._controller.request(self._last_rect, self._params)
+            self._controller.request(self._last_rect, self._params, self._last_mask)
 
     def _connect_signals(self) -> None:
         """Connect viewport/controller/panel signals per DESIGN.md §F.2."""
@@ -683,6 +686,7 @@ class MainWindow(QMainWindow):
         self._viewport.clear_template()
         self._viewport.clear_image()
         self._last_rect = None
+        self._last_mask = None
         self._all_matches = []
         self._calibration = None  # calibration is image-specific
         self._area_label.setText("")
@@ -748,6 +752,7 @@ class MainWindow(QMainWindow):
         self._doc = doc
         self._record_recent(doc.path)  # remember it in File ▸ Open Recent
         self._last_rect = None
+        self._last_mask = None
         self._all_matches = []
         self._calibration = None  # calibration is per-image; drop it on swap
         self._area_label.setText("")
@@ -804,6 +809,7 @@ class MainWindow(QMainWindow):
         self._viewport.clear_matches()
         self._viewport.clear_template()
         self._last_rect = None
+        self._last_mask = None
         self._all_matches = []
         self._params_panel.set_run_enabled(False)  # nothing to Run anymore
         self._count_label.setText("0 matches")
@@ -908,10 +914,12 @@ class MainWindow(QMainWindow):
     def _on_region_selected(self, rect: QRect) -> None:
         """Record a freshly drawn selection; search now only if Auto Run is on."""
         self._last_rect = QRect(rect)  # copy: caller may reuse/mutate its QRect
+        # Capture the rectilinear mask (None for a plain rectangle) for this rect.
+        self._last_mask = self._viewport.selection_mask()
         self._params_panel.set_run_enabled(True)  # there is now something to Run
         self._update_area_label()
         if self._auto_run:
-            self._controller.request(rect, self._params)
+            self._controller.request(rect, self._params, self._last_mask)
         else:
             self.statusBar().showMessage("Selection set — press Run to search.", 4000)
 
@@ -1041,13 +1049,13 @@ class MainWindow(QMainWindow):
         if self._last_rect is None:
             self.statusBar().showMessage("Draw a selection box first.", 4000)
             return
-        self._controller.request(self._last_rect, self._params)
+        self._controller.request(self._last_rect, self._params, self._last_mask)
 
     def _on_auto_run_changed(self, on: bool) -> None:
         """Track the Auto Run toggle; turning it on runs the pending selection."""
         self._auto_run = bool(on)
         if self._auto_run and self._last_rect is not None:
-            self._controller.request(self._last_rect, self._params)
+            self._controller.request(self._last_rect, self._params, self._last_mask)
 
     def _on_about(self) -> None:
         """Show the modal About dialog (author, build ID, full license)."""
@@ -1197,7 +1205,7 @@ class MainWindow(QMainWindow):
             # Auto Run on: re-run the last selection with the new parameters
             # (latest-wins debounce in the controller coalesces rapid edits).
             # With Auto Run off, the new params are stored and applied on Run.
-            self._controller.request(self._last_rect, self._params)
+            self._controller.request(self._last_rect, self._params, self._last_mask)
 
     def _announce_method(self, method: str) -> None:
         """Surface, in the status bar, where the selected method runs.

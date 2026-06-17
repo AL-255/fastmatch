@@ -551,6 +551,7 @@ class Matcher:
         params: MatchParams,
         *,
         exclude_box: tuple[int, int, int, int] | None = None,
+        mask: np.ndarray | None = None,
         cancel: Callable[[], bool] | None = None,
         progress: Callable[[int], None] | None = None,
     ) -> list[Match]:
@@ -572,6 +573,12 @@ class Matcher:
         if self._lum is None:
             raise RuntimeError("Matcher.set_image() must be called before match()")
 
+        # Normalize an optional template mask (rectilinear/orthogonal-polygon
+        # selection): a 2-D bool array the size of the template's H×W marking which
+        # pixels participate. None — or an all-True mask — means "no masking", and
+        # the byte-for-byte legacy rectangular path runs.
+        mask = self._normalize_mask(mask, template)
+
         # Method dispatch (§J.4). The convolution methods (ncc/ssd/ccorr) share
         # ALL the tiled machinery below and differ only in the per-window score
         # formula (§J.2). "features" delegates to a wholly separate CPU/OpenCV
@@ -579,7 +586,8 @@ class Matcher:
         method = params.method or "ncc"
         if method == "features":
             return self._match_features(
-                template, params, exclude_box=exclude_box, cancel=cancel, progress=progress
+                template, params, exclude_box=exclude_box, mask=mask,
+                cancel=cancel, progress=progress,
             )
         if method == SHAZAM_METHOD:
             # Experimental, DISABLED-by-default landmark-pair-hash matcher: it is
@@ -629,7 +637,7 @@ class Matcher:
             # --- legacy single-orientation path (no behaviour change) ----------
             # Prepare the device-resident template channels once (validated here).
             # The variance-floor rejection is gated on method (NCC only) inside.
-            tmpl = self._prepare_template(template, channel_mode, method, weights)
+            tmpl = self._prepare_template(template, channel_mode, method, weights, mask)
             th0, tw0 = tmpl["th"], tmpl["tw"]
             cands = self._search_template(tmpl, params, channel_mode, method, cancel, progress)
             if cancel is not None and cancel():
@@ -648,7 +656,10 @@ class Matcher:
             if cancel is not None and cancel():
                 return []
             t_oriented = apply_orientation(template, orient)
-            tmpl = self._prepare_template(t_oriented, channel_mode, method, weights)
+            m_oriented = apply_orientation(mask, orient) if mask is not None else None
+            tmpl = self._prepare_template(
+                t_oriented, channel_mode, method, weights, m_oriented
+            )
             th0, tw0 = tmpl["th"], tmpl["tw"]
 
             # Scope the per-orientation progress into this orientation's slice of
@@ -701,7 +712,10 @@ class Matcher:
         # any error/OOM the whole job degrades to the full path below — so recall
         # parity holds and existing tests (which hit the not-beneficial branch or
         # a forced core_tile) exercise the byte-identical full path.
-        use_pyramid = self._pyramid_beneficial(tmpl, scales)
+        # The coarse-to-fine pyramid prep does not carry the mask kernel, so a
+        # masked (rectilinear) template always takes the full-resolution path,
+        # where _scaled_template + _compute_score_terms apply the mask.
+        use_pyramid = self._pyramid_beneficial(tmpl, scales) and not tmpl.get("mask_present")
 
         # The whole search is wrapped in the CUDA OOM degradation ladder. On CPU
         # the ladder collapses to a single straight run (no OOM expected).
@@ -765,6 +779,7 @@ class Matcher:
         channel_mode: str,
         method: str = "ncc",
         weights: tuple[float, ...] = (1.0,),
+        mask: np.ndarray | None = None,
     ) -> dict:
         """Validate and stage the template channels on the compute device.
 
@@ -843,15 +858,48 @@ class Matcher:
         # so they must accept such templates. Checked on the structural
         # (luminance / summed) signal so an all-one-color crop is rejected even
         # in rgb mode where each channel is individually flat.
+        # Optional template mask (rectilinear selection): a device float plane,
+        # 1.0 inside the selected region / 0.0 outside. None == plain rectangle.
+        mask_t = None
+        if mask is not None:
+            mask_t = torch.from_numpy(np.ascontiguousarray(mask.astype(np.float32))).to(
+                self._device
+            )
+
         if method == "ncc":
             struct = torch.stack(channels, dim=0).mean(dim=0) if len(channels) > 1 else channels[0]
-            if float(struct.std().item()) < _VAR_FLOOR:
+            # Judge featurelessness over the SELECTED pixels only when masked.
+            sig = struct if mask_t is None else struct[mask_t > 0.5]
+            if sig.numel() == 0 or float(sig.std().item()) < _VAR_FLOOR:
                 raise ValueError(
                     "template has near-zero variance (featureless region); "
                     "select a more distinctive area, or use the SSD method"
                 )
 
-        return {"channels": channels, "th": th, "tw": tw, "weights": chan_weights}
+        return {
+            "channels": channels,
+            "th": th,
+            "tw": tw,
+            "weights": chan_weights,
+            "mask": mask_t,
+            "mask_present": mask_t is not None,
+        }
+
+    @staticmethod
+    def _normalize_mask(
+        mask: np.ndarray | None, template: np.ndarray
+    ) -> np.ndarray | None:
+        """Validate a template mask to a bool array matching the template H×W, or
+        ``None`` (no masking) for a missing / shape-mismatched / all-True mask."""
+        if mask is None:
+            return None
+        m = np.ascontiguousarray(np.asarray(mask)).astype(bool)
+        th, tw = int(template.shape[0]), int(template.shape[1])
+        if m.ndim != 2 or m.shape != (th, tw):
+            return None  # misaligned (e.g. an edge-clipped selection) -> ignore
+        if m.all():
+            return None  # full mask == plain rectangle: take the fast legacy path
+        return m
 
     def _scaled_template(
         self, tmpl: dict, scale: float
@@ -884,16 +932,40 @@ class Matcher:
                 )[0, 0]
                 chans.append(r)
 
-        n = float(sth * stw)
+        # Optional mask kernel, resampled to the scaled size. When present, every
+        # windowed quantity is computed over the MASK instead of the full box: the
+        # pixel count is n = Σm, the template mean/zero-mean/sum-of-squares are
+        # masked, and _compute_score_terms correlates the image with this kernel
+        # (instead of a uniform box) for S1/S2. The masked terms slot straight into
+        # the SAME score formulas (the box is just the all-ones mask).
+        mask_t = tmpl.get("mask")
+        mask_k = None
+        if mask_t is not None:
+            if abs(scale - 1.0) < 1e-9:
+                mk = mask_t
+            else:
+                mk = F.interpolate(
+                    mask_t.unsqueeze(0).unsqueeze(0), size=(sth, stw),
+                    mode="nearest",
+                )[0, 0]
+            mk = (mk > 0.5).to(mask_t.dtype)
+            mask_k = mk.unsqueeze(0).unsqueeze(0).contiguous()  # (1,1,sth,stw)
+
+        n = float(mask_k.sum().item()) if mask_k is not None else float(sth * stw)
+        n = max(1.0, n)
         weights = tmpl.get("weights") or [1.0] * len(chans)
         per_channel: list[dict] = []
         for c, w in zip(chans, weights):
-            mean = c.mean()
-            tz = (c - mean)
+            if mask_k is not None:
+                m2 = mask_k[0, 0]
+                mean = (c * m2).sum() / n          # masked mean
+                tz = (c - mean) * m2               # masked zero-mean (0 outside)
+                sum_t2 = (c * c * m2).sum()        # masked Σ T²
+            else:
+                mean = c.mean()
+                tz = (c - mean)
+                sum_t2 = (c * c).sum()
             norm_tz = torch.sqrt((tz * tz).sum()).clamp(min=self._eps)
-            # sum_w(T^2) per channel: needed by both CCORR (denominator) and SSD
-            # (the +sumT2 term). Kept as a scalar tensor on-device.
-            sum_t2 = (c * c).sum()
             per_channel.append(
                 {
                     "tz": tz.unsqueeze(0).unsqueeze(0).contiguous(),  # (1,1,sth,stw)
@@ -902,6 +974,7 @@ class Matcher:
                     "sum_t2": sum_t2,
                     "n": n,
                     "weight": float(w),
+                    "mask_k": mask_k,  # None for the plain rectangular path
                 }
             )
         return per_channel, sth, stw
@@ -1865,10 +1938,19 @@ class Matcher:
             w = float(ch.get("weight", 1.0))
             sum_w += w
 
-            # Separable box filters give the windowed sum S1 and sum-of-squares
-            # S2 for this channel in fp32 accumulators (§D.1).
-            s1 = self._box_filter(img32, sth, stw)
-            s2 = self._box_filter(img32 * img32, sth, stw)
+            # Windowed sum S1 and sum-of-squares S2 in fp32 accumulators (§D.1).
+            # Plain rectangle: separable box filters. Masked (rectilinear) select:
+            # correlate with the mask kernel so the sums cover only selected pixels
+            # (F.conv2d is cross-correlation — no flip — matching _box_filter).
+            mask_k = ch.get("mask_k")
+            if mask_k is None:
+                s1 = self._box_filter(img32, sth, stw)
+                s2 = self._box_filter(img32 * img32, sth, stw)
+            else:
+                # [:, 0] squeezes the channel dim to (B, oh, ow), matching
+                # _box_filter so the downstream term arithmetic shape-aligns.
+                s1 = F.conv2d(img32, mask_k)[:, 0]
+                s2 = F.conv2d(img32 * img32, mask_k)[:, 0]
 
             # n*varI = clamp(S2 - S1^2/n, 0); clamp removes fp negatives.
             n_var = (s2 - (s1 * s1) / n).clamp(min=0.0)
@@ -2126,6 +2208,7 @@ class Matcher:
         params: MatchParams,
         *,
         exclude_box: tuple[int, int, int, int] | None,
+        mask: np.ndarray | None = None,
         cancel: Callable[[], bool] | None,
         progress: Callable[[int], None] | None,
     ) -> list[Match]:
@@ -2184,6 +2267,7 @@ class Matcher:
             params,
             image_rgb=image_rgb,
             exclude_box=exclude_box,
+            mask=mask,
             cancel=cancel,
             progress=progress,
             scale_back=1,

@@ -66,7 +66,7 @@ class MatchController(QObject):
     # Private queued bridge to the worker's run() slot. Declared as a signal
     # (not a direct call) so the cross-thread invocation is marshalled onto the
     # worker thread's event loop. Payload is plain CPU data only.
-    _run_requested = Signal(object, object, object, int)  # (template, params, exclude_box, job_id)
+    _run_requested = Signal(object, object, object, object, int)  # (template, params, exclude_box, mask, job_id)
 
     # Private queued bridge to staging. Emitted from the GUI thread in __init__;
     # the connected slot (_prepare_engine) runs on the *worker* thread so the
@@ -112,7 +112,7 @@ class MatchController(QObject):
         # Pending dispatch parameters, captured by request() and consumed when
         # the debounce timer fires (or when staging completes, if a request
         # raced ahead of it). None means "nothing armed".
-        self._pending: tuple[QRect, MatchParams] | None = None
+        self._pending: tuple[QRect, MatchParams, object] | None = None
         # Staging gate: the worker thread builds the engine + stages the image
         # asynchronously, so _dispatch must not emit _run_requested until that
         # has completed. A request arriving first stays armed in _pending and is
@@ -228,13 +228,17 @@ class MatchController(QObject):
 
     # ------------------------------------------------------------------ request
     @Slot(QRect, object)
-    def request(self, rect_img: QRect, params: MatchParams) -> None:
+    def request(
+        self, rect_img: QRect, params: MatchParams, mask: object = None
+    ) -> None:
         """Validate a selection and (re)arm a debounced search.
 
         Args:
             rect_img: Selection in half-open image px (the viewport already
                 applied floor-TL / ceil-BR rounding).
             params: Parameters for this search.
+            mask: Optional bbox-sized boolean template mask (rectilinear select),
+                aligned to ``rect_img``; cropped here if the rect clips the image.
 
         Invalid selections (after clipping to the image) emit :attr:`failed`
         with a reason and dispatch nothing. Valid ones cancel any in-flight job
@@ -246,6 +250,13 @@ class MatchController(QObject):
             self.failed.emit(reason)
             return
 
+        # Keep the mask aligned to the (possibly edge-clipped) rect: crop it by the
+        # same top-left/size shift the clip applied, so it matches the cropped crop.
+        if mask is not None and clipped != rect_img:
+            dx = clipped.x() - rect_img.x()
+            dy = clipped.y() - rect_img.y()
+            mask = mask[dy : dy + clipped.height(), dx : dx + clipped.width()]
+
         # A new valid selection supersedes whatever is running: cancel it so the
         # GPU/CPU stops wasting work, then debounce this one. Latest-wins is
         # ultimately enforced by job_id stale-drop, but cancelling early frees
@@ -253,7 +264,7 @@ class MatchController(QObject):
         if self._busy:
             self._worker.request_cancel()
 
-        self._pending = (clipped, params)
+        self._pending = (clipped, params, mask)
         self._debounce.start()  # (re)arm; restarts countdown if already running
 
     # ----------------------------------------------------------------- dispatch
@@ -269,7 +280,7 @@ class MatchController(QObject):
             # thread. Keep the request armed in _pending; _on_ready will dispatch
             # it once the engine is ready, so the first search is never lost.
             return
-        rect, params = self._pending
+        rect, params, mask = self._pending
         self._pending = None
 
         x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
@@ -278,12 +289,15 @@ class MatchController(QObject):
         # non-contiguous view. This produces an owned plain ndarray safe to
         # ship across the (queued) signal to the worker thread.
         template = np.ascontiguousarray(self._doc.full[y : y + h, x : x + w])
+        mask_arr = None if mask is None else np.ascontiguousarray(mask)
 
         self._current_job_id += 1
         self._set_busy(True)
         # exclude_box is the source region in full-image coords so the engine
         # can suppress the template's own location among the hits (§H4).
-        self._run_requested.emit(template, params, (x, y, w, h), self._current_job_id)
+        self._run_requested.emit(
+            template, params, (x, y, w, h), mask_arr, self._current_job_id
+        )
 
     # ------------------------------------------------------------ result slots
     def _is_superseded(self, job_id: int) -> bool:

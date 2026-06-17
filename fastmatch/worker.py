@@ -97,7 +97,8 @@ class MatchWorker(QObject):
         template: "object",
         params: MatchParams,
         exclude_box: "tuple | None",
-        job_id: int,
+        mask: "object" = None,
+        job_id: int = 0,
     ) -> None:
         """Execute one match job and emit its result.
 
@@ -143,6 +144,7 @@ class MatchWorker(QObject):
                 template,
                 params,
                 exclude_box=exclude_box,
+                mask=mask,
                 cancel=_cancel,
                 progress=_progress,
             )
