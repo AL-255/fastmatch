@@ -298,6 +298,8 @@ class MatchController(QObject):
         mask_arr = None if mask is None else np.ascontiguousarray(mask)
 
         self._current_job_id += 1
+        # Let the worker skip/abort every older job still queued or running.
+        self._worker.latest_job_id = self._current_job_id
         self._set_busy(True)
         # exclude_box is the source region in full-image coords so the engine
         # can suppress the template's own location among the hits (§H4).

@@ -69,6 +69,15 @@ class MatchWorker(QObject):
         # two distinct stops a queued run() from wiping a shutdown-intent cancel
         # (which would let a slow match start uncancelled and wedge the join).
         self._stop_event = threading.Event()
+        # Id of the newest job the controller has dispatched. Written by the GUI
+        # thread before each dispatch, read here (a plain int; attribute stores
+        # are atomic under the GIL). Jobs queue up on this thread's event loop:
+        # adding example boxes one by one with Auto Run on dispatched a search
+        # per box, and a queued job cleared the per-job cancel when it started,
+        # so every superseded search still ran to completion (minutes each on a
+        # large image) before the one the user wanted. A job whose id is older
+        # than this is skipped, or aborted at its next cancel poll.
+        self.latest_job_id = 0
 
     def request_cancel(self) -> None:
         """Signal the in-flight (or next) ``match()`` to abort cooperatively.
@@ -91,7 +100,7 @@ class MatchWorker(QObject):
         """
         self._stop_event.set()
 
-    @Slot(object, object, object, int)
+    @Slot(object, object, object, object, object, int)
     def run(
         self,
         template: "object",
@@ -123,6 +132,10 @@ class MatchWorker(QObject):
         # it would let a subsequent match run uncancelled and wedge the join).
         if self._stop_event.is_set():
             return
+        # A newer job is already queued behind this one: its result would be
+        # stale-dropped anyway, so don't spend minutes computing it.
+        if job_id < self.latest_job_id:
+            return
 
         # Clear any cancel left over from a previous job *before* the engine can
         # observe it. A cancel arriving after this point (for the current job)
@@ -133,11 +146,14 @@ class MatchWorker(QObject):
         def _cancel() -> bool:
             """Cancel callback polled by the engine at every tile boundary.
 
-            Honours both the per-job cancel and the sticky stop, so a stop set
-            mid-job (after run() already passed the start-of-job guard) still
-            aborts the in-flight match.
+            Honours the per-job cancel, the sticky stop (set mid-job after run()
+            passed the start-of-job guard), and supersession by a newer job.
             """
-            return self._cancel_event.is_set() or self._stop_event.is_set()
+            return (
+                self._cancel_event.is_set()
+                or self._stop_event.is_set()
+                or job_id < self.latest_job_id
+            )
 
         def _progress(pct: int) -> None:
             """Progress callback the engine calls per finished tile (0..100)."""
