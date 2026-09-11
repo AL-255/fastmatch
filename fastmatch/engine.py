@@ -38,7 +38,7 @@ import torch.nn.functional as F
 
 from dataclasses import replace
 
-from .device import resolve_device
+from .device import gpu_backend, resolve_device
 from .types import (
     CONV_METHODS,
     METHODS,
@@ -166,6 +166,26 @@ def _next_smooth(n: int) -> int:
             p23 *= _SMOOTH_RADICES[1]
         p2 *= _SMOOTH_RADICES[0]
     return best
+
+
+def _next_fft_bucket(n: int) -> int:
+    """Smallest length ``>= n`` from a sparse set of 4 sizes per octave.
+
+    The candidates in ``(p/2, p]`` (``p`` = next power of two) are ``5p/8``,
+    ``3p/4``, ``7p/8`` and ``p``: all 2-3-5-7 smooth, so they stay on fast FFT
+    radix paths, at most 25% larger than ``n``. ROCm's rocFFT compiles kernels at
+    runtime for every new transform length (5-8 s each); with :func:`_next_smooth`
+    nearly every selection size and tile edge lands on a new length, while these
+    buckets are shared across sizes and so hit rocFFT's persistent kernel cache.
+    """
+    if n <= 32:
+        return _next_smooth(n)
+    p = 1 << (n - 1).bit_length()
+    q = p // 8
+    for m in (5, 6, 7):
+        if m * q >= n:
+            return m * q
+    return p
 
 
 def _max_filter_2d(x: torch.Tensor, kh: int, kw: int) -> torch.Tensor:
@@ -342,6 +362,12 @@ class Matcher:
                 ``False`` forces the full path — the recall-parity reference.
         """
         self._device = resolve_device(device if device is not None else "auto")
+        # rocFFT compiles per transform length; share lengths across queries there.
+        self._fft_len = (
+            _next_fft_bucket
+            if self._device.type == "cuda" and gpu_backend() == "rocm"
+            else _next_smooth
+        )
         self._compute_dtype = compute_dtype
         self._channel_mode = channel_mode
         self._conv_backend = conv_backend
@@ -1669,8 +1695,8 @@ class Matcher:
         if self._cross_backend(sth, stw) == "fft":
             # FFT pads to a smooth (fh x fw); per ROI it holds a half-spectrum
             # complex buffer + a full real buffer, plus comparable cuFFT scratch.
-            fh = _next_smooth(win_h + sth - 1)
-            fw = _next_smooth(win_w + stw - 1)
+            fh = self._fft_len(win_h + sth - 1)
+            fw = self._fft_len(win_w + stw - 1)
             per_cand += fh * (fw // 2 + 1) * 8 * 2 + fh * fw * 4 * 3
         else:
             per_cand += win_h * win_w * 8 * dtype_size  # spatial conv scratch
@@ -2094,8 +2120,8 @@ class Matcher:
         """
         ih, iw = img.shape[-2], img.shape[-1]
         # Linear-conv length, padded to a 2-3-5-7 smooth size for FFT speed.
-        fh = _next_smooth(ih + sth - 1)
-        fw = _next_smooth(iw + stw - 1)
+        fh = self._fft_len(ih + sth - 1)
+        fw = self._fft_len(iw + stw - 1)
 
         img2 = img[:, 0]  # (B,H,W)
         tzf = torch.flip(tz[0, 0], dims=(0, 1))  # flip so circular conv == correlation

@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (
 )
 
 from .calibration import Calibration
-from .device import device_banner_text, resolve_device
+from .device import device_banner_text, gpu_backend, resolve_device
 from .document import ImageDocument
 from .memory import MemoryEntry
 from .about import AboutDialog
@@ -58,6 +58,11 @@ from . import theme
 # File ▸ Open Recent: persisted history of opened image paths (most-recent first).
 _RECENT_KEY = "files/recent"
 _RECENT_MAX = 10
+
+_ROCM_COMPILE_HINT = (
+    "ROCm is compiling GPU kernels for this selection size; the first search "
+    "can take a while, later ones are fast. Please wait."
+)
 
 
 class MainWindow(QMainWindow):
@@ -1134,6 +1139,31 @@ class MainWindow(QMainWindow):
         self._progress.setVisible(busy)
         if busy:
             self._progress.setValue(0)
+        self._update_rocm_compile_hint(busy)
+
+    def _update_rocm_compile_hint(self, busy: bool) -> None:
+        """On ROCm, explain a first search that sits at 0% (GPU kernel compilation).
+
+        ROCm compiles kernels the first time it meets a new convolution / FFT
+        shape, so the first search at a new selection size can stall for tens of
+        seconds before any tile completes. Without a hint that looks like a hang,
+        and redrawing the box cancels the job and restarts the compilation.
+        """
+        if not hasattr(self, "_compile_hint_timer"):
+            self._compile_hint_timer = QTimer(self)
+            self._compile_hint_timer.setSingleShot(True)
+            self._compile_hint_timer.setInterval(3000)
+            self._compile_hint_timer.timeout.connect(self._show_rocm_compile_hint)
+        if busy and self._resolved_device.type == "cuda" and gpu_backend() == "rocm":
+            self._compile_hint_timer.start()
+            return
+        self._compile_hint_timer.stop()
+        if self.statusBar().currentMessage() == _ROCM_COMPILE_HINT:
+            self.statusBar().clearMessage()
+
+    def _show_rocm_compile_hint(self) -> None:
+        if self._progress.isVisible() and self._progress.value() == 0:
+            self.statusBar().showMessage(_ROCM_COMPILE_HINT, 0)
 
     def _on_progress(self, pct: int) -> None:
         """Forward worker progress (0..100) to the status-bar progress bar."""
