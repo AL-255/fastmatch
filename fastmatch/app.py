@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QToolBar,
@@ -50,6 +51,7 @@ from .device import device_banner_text, gpu_backend, resolve_device
 from .document import ImageDocument
 from .memory import MemoryEntry
 from .about import AboutDialog
+from .examples_panel import ExamplesPanel
 from .memory_panel import MemoryPanel
 from .params_panel import _HIST_BIN_PRESETS, _HIST_BINS, ParamsPanel
 from .types import CONV_METHODS, MatchParams
@@ -59,6 +61,10 @@ from . import theme
 _RECENT_KEY = "files/recent"
 _RECENT_MAX = 10
 
+_SELECT_TOOLTIP = (
+    "Toggle between Select (draw region) and Pan (drag to move). While selecting: "
+    "Shift+drag adds another example of the same structure, Ctrl+drag marks "
+    "something that must not match. Right-click a numbered example to delete it."
 _ROCM_COMPILE_HINT = (
     "ROCm is compiling GPU kernels for this selection size; the first search "
     "can take a while, later ones are fast. Please wait."
@@ -193,6 +199,18 @@ class MainWindow(QMainWindow):
         self._memory_dock.setWidget(self._memory)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._memory_dock)
 
+        # --- Examples panel dock (multi-example search) --------------------
+        # Below the Search dock: one numbered row per example box, so a long
+        # set (dozens of boxes) can be reviewed and pruned.
+        self._examples_panel = ExamplesPanel(self)
+        self._examples_dock = QDockWidget("Examples", self)
+        self._examples_dock.setWidget(self._examples_panel)
+        self._examples_dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._examples_dock)
+        self.splitDockWidget(self._dock, self._examples_dock, Qt.Orientation.Vertical)
+
         # --- Toolbar + menu bar -------------------------------------------
         self._build_toolbar()
         self._build_menus()
@@ -201,6 +219,8 @@ class MainWindow(QMainWindow):
         self._cursor_label = QLabel("Cursor: (-, -)", self)
         self._area_label = QLabel("", self)        # physical area of the selection
         self._count_label = QLabel("0 matches", self)
+        self._examples_label = QLabel("", self)  # multi-example counts (hidden when none)
+        self._examples_label.setVisible(False)
         self._progress = QProgressBar(self)
         self._progress.setRange(0, 100)
         self._progress.setMaximumWidth(180)
@@ -211,6 +231,7 @@ class MainWindow(QMainWindow):
         sb.addWidget(self._focus_label)            # left side
         sb.addPermanentWidget(self._cursor_label)  # right side
         sb.addPermanentWidget(self._area_label)
+        sb.addPermanentWidget(self._examples_label)
         sb.addPermanentWidget(self._count_label)
         sb.addPermanentWidget(self._progress)
 
@@ -260,7 +281,7 @@ class MainWindow(QMainWindow):
         # to match the unchecked/Select startup state.
         self._act_mode = QAction("Select mode", self)
         self._act_mode.setCheckable(True)
-        self._act_mode.setToolTip("Toggle between Select (draw region) and Pan (drag to move).")
+        self._act_mode.setToolTip(_SELECT_TOOLTIP)
         self._act_mode.toggled.connect(self._on_mode_toggled)
         tb.addAction(self._act_mode)
 
@@ -291,6 +312,15 @@ class MainWindow(QMainWindow):
         )
         self._act_clear.triggered.connect(self._on_clear_matches)
         tb.addAction(self._act_clear)
+
+        self._act_clear_examples = QAction("Clear examples", self)
+        self._act_clear_examples.setToolTip(
+            "Remove the extra examples (Shift+drag / Ctrl+drag boxes) and search "
+            "with the selection alone."
+        )
+        self._act_clear_examples.triggered.connect(self._viewport.clear_examples)
+        self._act_clear_examples.setEnabled(False)
+        tb.addAction(self._act_clear_examples)
         # "Add to Memory" lives only on the Memory dock now (was duplicated here).
 
         tb.addSeparator()
@@ -410,6 +440,9 @@ class MainWindow(QMainWindow):
         act_dock_memory = self._memory_dock.toggleViewAction()
         act_dock_memory.setText("&Memory panel")
         view_menu.addAction(act_dock_memory)
+        act_dock_examples = self._examples_dock.toggleViewAction()
+        act_dock_examples.setText("&Examples panel")
+        view_menu.addAction(act_dock_examples)
 
         self._build_tools_menu()
         self._build_theme_menu()
@@ -547,7 +580,7 @@ class MainWindow(QMainWindow):
 
         # Re-run the last query so results reflect the new engine immediately.
         if self._auto_run and self._last_rect is not None:
-            self._controller.request(self._last_rect, self._params, self._last_mask)
+            self._request_search()
 
     def _connect_signals(self) -> None:
         """Connect viewport/controller/panel signals per DESIGN.md §F.2."""
@@ -560,6 +593,16 @@ class MainWindow(QMainWindow):
         self._viewport.measurePicked.connect(self._on_measure_picked)
         # Focus mode (Space): show a left-aligned status-bar hint while active.
         self._viewport.focusModeChanged.connect(self._on_focus_mode_changed)
+        # Multi-example search: Shift/Ctrl+drag example boxes; right-click one
+        # to delete it.
+        self._viewport.examplesChanged.connect(self._on_examples_changed)
+        self._viewport.exampleMenuRequested.connect(self._on_example_menu)
+        self._viewport.selectionRemoved.connect(self._on_clear_matches)
+        # The Examples side panel: review, highlight, and delete example boxes.
+        self._examples_panel.delete_requested.connect(self._viewport.remove_examples)
+        self._examples_panel.clear_requested.connect(self._viewport.clear_examples)
+        self._examples_panel.highlight_changed.connect(self._viewport.set_example_highlight)
+        self._examples_panel.focus_requested.connect(self._viewport.centre_on_example)
 
         # Controller results / state. With no image at startup there is no
         # controller yet; _install_new_controller wires these when one is opened.
@@ -689,6 +732,7 @@ class MainWindow(QMainWindow):
         """
         self._viewport.clear_matches()
         self._viewport.clear_template()
+        self._update_examples_label()
         self._viewport.clear_image()
         self._last_rect = None
         self._last_mask = None
@@ -764,6 +808,7 @@ class MainWindow(QMainWindow):
         self._params_panel.set_run_enabled(False)  # new image -> no selection yet
         self._viewport.clear_matches()
         self._viewport.clear_template()
+        self._update_examples_label()
         self._viewport.set_image(doc)
         # Keep the display mode (grayscale/colour) consistent for the new image.
         self._viewport.set_display_grayscale(self._params.channel_mode == "luminance")
@@ -813,6 +858,7 @@ class MainWindow(QMainWindow):
         """Clear overlay matches and the current template selection."""
         self._viewport.clear_matches()
         self._viewport.clear_template()
+        self._update_examples_label()
         self._last_rect = None
         self._last_mask = None
         self._all_matches = []
@@ -859,6 +905,7 @@ class MainWindow(QMainWindow):
         sx, sy, sw, sh = entry.selection  # type: ignore[attr-defined]
         rect = QRect(int(sx), int(sy), int(sw), int(sh))
         self._viewport.set_template_rect(rect)
+        self._update_examples_label()
         self._last_rect = QRect(rect)
         self._params_panel.set_run_enabled(True)
         # Show every saved box: the entry already holds the matches the user
@@ -923,10 +970,62 @@ class MainWindow(QMainWindow):
         self._last_mask = self._viewport.selection_mask()
         self._params_panel.set_run_enabled(True)  # there is now something to Run
         self._update_area_label()
+        self._update_examples_label()  # a new selection starts a new example set
         if self._auto_run:
-            self._controller.request(rect, self._params, self._last_mask)
+            self._request_search()
         else:
             self.statusBar().showMessage("Selection set — press Run to search.", 4000)
+
+    def _request_search(self) -> None:
+        """Search the current selection, as a multi-example search if the user
+        added Shift/Ctrl+drag example boxes to it."""
+        if self._controller is None or self._last_rect is None:
+            return
+        pos, neg = self._viewport.examples()
+        examples = (pos, neg) if (pos or neg) else None
+        self._controller.request(self._last_rect, self._params, self._last_mask, examples)
+
+    def _on_examples_changed(self, n_pos: int, n_neg: int) -> None:
+        """An example box was added (or all were cleared): update and re-search."""
+        self._update_examples_label()
+        if self._last_rect is None:
+            self.statusBar().showMessage("Draw a selection box first.", 4000)
+            return
+        if self._auto_run:
+            self._request_search()
+        else:
+            self.statusBar().showMessage("Selection set — press Run to search.", 4000)
+
+    def _on_example_menu(self, kind: str, number: int, global_pos) -> None:
+        """Right-click menu on a numbered example box: delete it, or all."""
+        menu = QMenu(self)
+        text = (f"Delete example #{number}" if kind == "pos"
+                else f"Delete negative example ×{number}")
+        act_delete = menu.addAction(text)
+        act_all = menu.addAction("Clear examples")
+        chosen = self._exec_menu(menu, global_pos)
+        if chosen is act_delete:
+            self._viewport.remove_example(kind, number)
+        elif chosen is act_all:
+            self._viewport.clear_examples()
+
+    @staticmethod
+    def _exec_menu(menu: "QMenu", global_pos):
+        """``menu.exec`` (a seam so tests can pick an action without a modal loop)."""
+        return menu.exec(global_pos)
+
+    def _update_examples_label(self) -> None:
+        """Refresh every view of the example set: status label, Clear action,
+        and the numbered list in the Examples panel."""
+        pos, neg = self._viewport.examples()
+        self._examples_panel.set_examples(self._viewport.template_rect(), pos, neg)
+        active = bool(pos or neg)
+        self._examples_label.setVisible(active)
+        self._act_clear_examples.setEnabled(active)
+        if active:
+            # The selection counts as the first positive example.
+            self._examples_label.setText(
+                f"Examples: {len(pos) + 1} positive, {len(neg)} negative")
 
     # ------------------------------------------------- calibration / measure
     def _enter_tool(self, mode) -> None:
@@ -1054,13 +1153,13 @@ class MainWindow(QMainWindow):
         if self._last_rect is None:
             self.statusBar().showMessage("Draw a selection box first.", 4000)
             return
-        self._controller.request(self._last_rect, self._params, self._last_mask)
+        self._request_search()
 
     def _on_auto_run_changed(self, on: bool) -> None:
         """Track the Auto Run toggle; turning it on runs the pending selection."""
         self._auto_run = bool(on)
         if self._auto_run and self._last_rect is not None:
-            self._controller.request(self._last_rect, self._params, self._last_mask)
+            self._request_search()
 
     def _on_about(self) -> None:
         """Show the modal About dialog (author, build ID, full license)."""
@@ -1235,7 +1334,7 @@ class MainWindow(QMainWindow):
             # Auto Run on: re-run the last selection with the new parameters
             # (latest-wins debounce in the controller coalesces rapid edits).
             # With Auto Run off, the new params are stored and applied on Run.
-            self._controller.request(self._last_rect, self._params, self._last_mask)
+            self._request_search()
 
     def _announce_method(self, method: str) -> None:
         """Surface, in the status bar, where the selected method runs.

@@ -262,6 +262,11 @@ class ImageViewport(QGraphicsView):
     zoomChanged = Signal(float, int)      # (view_scale, current_pyramid_level)
     viewChanged = Signal(QRect)           # visible image-px rect (prefetch hint)
     focusModeChanged = Signal(bool)       # focus/spotlight mode toggled (Space)
+    examplesChanged = Signal(int, int)    # (extra positives, negatives) after a Shift/Ctrl drag
+    # Right-click on a numbered example box: ("pos" | "neg", its number, global
+    # pos). Positives are numbered from 1 (the selection itself); negatives too.
+    exampleMenuRequested = Signal(str, int, QPoint)
+    selectionRemoved = Signal()           # the last positive (the selection) was deleted
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -332,6 +337,12 @@ class ImageViewport(QGraphicsView):
         self._sel_origin: QPoint | None = None
         self._rubber = QRubberBand(QRubberBand.Shape.Rectangle, self.viewport())
         self._template_rect: QRect | None = None
+        # Multi-example search: Shift+drag adds a positive example (more of the
+        # selected structure), Ctrl+drag a negative ("not this"). The selection
+        # itself is the first positive; a plain new selection starts over.
+        self._sel_kind = "select"   # "select" | "pos" | "neg" for the active drag
+        self._ex_pos: list[QRect] = []
+        self._ex_neg: list[QRect] = []
 
         # Rectilinear (orthogonal-polygon) selection state. Vertices are in IMAGE
         # px; each committed edge is axis-aligned (snapped H/V). _sel_polygon holds
@@ -415,6 +426,7 @@ class ImageViewport(QGraphicsView):
         self._measuring = False
         self._measure_p1 = None
         self._template_rect = None
+        self._ex_pos, self._ex_neg = [], []
         self._reset_rectilinear_state()
         self._sel_polygon = None
         self._selection_mask = None
@@ -511,14 +523,129 @@ class ImageViewport(QGraphicsView):
         return QRect(self._template_rect) if self._template_rect is not None else None
 
     def clear_template(self) -> None:
-        """Clear the template selection, its highlighted source box, and any mask."""
+        """Clear the template selection, its highlighted source box, any mask,
+        and the multi-example boxes that belong to it."""
         self._template_rect = None
         self._reset_rectilinear_state()
         self._sel_polygon = None
         self._selection_mask = None
+        self._set_examples([], [])
         if self._overlay is not None:
             self._overlay.set_source_box(None)
         self.viewport().update()
+
+    # ---------------------------------------------------------- examples
+    def examples(self) -> "tuple[list[tuple[int, int, int, int]], list[tuple[int, int, int, int]]]":
+        """``(extra_positives, negatives)`` as ``(x, y, w, h)`` image-px boxes."""
+        as_box = lambda r: (r.x(), r.y(), r.width(), r.height())  # noqa: E731
+        return [as_box(r) for r in self._ex_pos], [as_box(r) for r in self._ex_neg]
+
+    def clear_examples(self) -> None:
+        """Drop every extra positive / negative example (keeps the selection)."""
+        if self._ex_pos or self._ex_neg:
+            self._set_examples([], [])
+            self.examplesChanged.emit(0, 0)
+
+    def _set_examples(self, pos: "list[QRect]", neg: "list[QRect]") -> None:
+        self._ex_pos, self._ex_neg = list(pos), list(neg)
+        if self._overlay is not None:
+            self._overlay.set_examples(self._ex_pos, self._ex_neg)
+
+    def example_at(self, scene_pt: QPointF) -> "tuple[str, int] | None":
+        """The numbered example box under ``scene_pt`` as ``(kind, number)``.
+
+        Positive #1 is the selection itself (only numbered while there are other
+        examples). When boxes overlap, the smallest one under the point wins.
+        """
+        hits: list[tuple[int, str, int]] = []
+        for i, r in enumerate(self._ex_neg):
+            if QRectF(r).contains(scene_pt):
+                hits.append((r.width() * r.height(), "neg", i + 1))
+        for i, r in enumerate(self._ex_pos):
+            if QRectF(r).contains(scene_pt):
+                hits.append((r.width() * r.height(), "pos", i + 2))
+        t = self._template_rect
+        if t is not None and (self._ex_pos or self._ex_neg) and QRectF(t).contains(scene_pt):
+            hits.append((t.width() * t.height(), "pos", 1))
+        if not hits:
+            return None
+        _, kind, number = min(hits)
+        return kind, number
+
+    def remove_example(self, kind: str, number: int) -> None:
+        """Delete example ``number`` (1-based, as labelled) of ``kind``."""
+        self.remove_examples([(kind, number)])
+
+    def remove_examples(self, items: "list[tuple[str, int]]") -> None:
+        """Delete several examples at once, identified as labelled on the image.
+
+        One notification for the whole batch (so a 20-row delete re-runs the
+        search once). Deleting positive #1 (the selection) promotes the first
+        remaining positive to be the selection; with no positive left the
+        whole selection is cleared.
+        """
+        if not items:
+            return
+        neg_del = {n for k, n in items if k == "neg"}
+        pos_del = {n for k, n in items if k == "pos"}
+        negatives = [r for i, r in enumerate(self._ex_neg) if i + 1 not in neg_del]
+        extras = [r for i, r in enumerate(self._ex_pos) if i + 2 not in pos_del]
+        if 1 not in pos_del:
+            self._set_examples(extras, negatives)
+            self.examplesChanged.emit(len(extras), len(negatives))
+            return
+        if not extras:
+            self.clear_template()
+            self.selectionRemoved.emit()
+            return
+        promoted = extras.pop(0)
+        self._reset_rectilinear_state()
+        self._sel_polygon = None
+        self._selection_mask = None
+        self._template_rect = QRect(promoted)
+        self._set_examples(extras, negatives)
+        if self._overlay is not None:
+            self._overlay.set_source_box(QRect(promoted))
+        self.viewport().update()
+        self.regionSelected.emit(QRect(promoted))
+
+    def example_rect(self, kind: str, number: int) -> "QRect | None":
+        """The box of example ``number`` of ``kind`` (positive #1 = the selection)."""
+        if kind == "neg":
+            boxes = self._ex_neg
+            i = number - 1
+        elif number == 1:
+            return QRect(self._template_rect) if self._template_rect is not None else None
+        else:
+            boxes = self._ex_pos
+            i = number - 2
+        return QRect(boxes[i]) if 0 <= i < len(boxes) else None
+
+    def set_example_highlight(self, items: "list[tuple[str, int]]") -> None:
+        """Outline the given examples in the highlight colour (panel selection)."""
+        if self._overlay is not None:
+            rects = [self.example_rect(k, n) for k, n in items]
+            self._overlay.set_highlight([r for r in rects if r is not None])
+
+    def centre_on_example(self, kind: str, number: int) -> None:
+        """Scroll (without zooming) so the example's box is in the view centre."""
+        r = self.example_rect(kind, number)
+        if r is None:
+            return
+        self.centerOn(QRectF(r).center())
+        self._bump_generation()
+        self._emit_view_changed()
+        self.viewport().update()
+
+    def contextMenuEvent(self, e) -> None:
+        """Right-click on a numbered example box offers to delete it."""
+        if self._doc is not None and not self._selecting:
+            hit = self.example_at(self.mapToScene(e.pos()))
+            if hit is not None:
+                self.exampleMenuRequested.emit(hit[0], hit[1], e.globalPos())
+                e.accept()
+                return
+        super().contextMenuEvent(e)
 
     def set_template_rect(self, rect: QRect | None) -> None:
         """Set the template selection + its highlighted (blue) source box.
@@ -530,6 +657,7 @@ class ImageViewport(QGraphicsView):
             self.clear_template()
             return
         self._template_rect = QRect(rect)
+        self._set_examples([], [])  # a restored selection has no example set
         if self._overlay is not None:
             self._overlay.set_source_box(QRect(rect))
 
@@ -973,6 +1101,7 @@ class ImageViewport(QGraphicsView):
         self._sel_polygon = pts
         self._selection_mask = mask
         self._template_rect = rect
+        self._set_examples([], [])  # a new selection starts a new example set
         if self._overlay is not None:
             self._overlay.set_source_box(rect)
         self.viewport().update()
@@ -1032,7 +1161,16 @@ class ImageViewport(QGraphicsView):
                 self._rectilinear_click(e.position().toPoint())
                 e.accept()
                 return
-            # Start a rubber-band selection in viewport coordinates.
+            # Start a rubber-band selection in viewport coordinates. Shift / Ctrl
+            # turn the drag into a positive / negative example for the current
+            # selection (a plain drag replaces the selection).
+            mods = e.modifiers()
+            if mods & Qt.KeyboardModifier.ControlModifier:
+                self._sel_kind = "neg"
+            elif mods & Qt.KeyboardModifier.ShiftModifier and self._template_rect is not None:
+                self._sel_kind = "pos"
+            else:
+                self._sel_kind = "select"
             self._selecting = True
             self._sel_origin = e.position().toPoint()
             self._rubber.setGeometry(QRect(self._sel_origin, self._sel_origin))
@@ -1125,13 +1263,22 @@ class ImageViewport(QGraphicsView):
             rect_img = self._viewport_band_to_image_rect()
             self._sel_origin = None
             if rect_img is not None and rect_img.width() >= 1 and rect_img.height() >= 1:
-                # A plain rectangle clears any prior rectilinear polygon/mask.
-                self._sel_polygon = None
-                self._selection_mask = None
-                self._template_rect = rect_img
-                if self._overlay is not None:
-                    self._overlay.set_source_box(rect_img)
-                self.regionSelected.emit(QRect(rect_img))
+                if self._sel_kind == "pos":
+                    self._set_examples(self._ex_pos + [rect_img], self._ex_neg)
+                    self.examplesChanged.emit(len(self._ex_pos), len(self._ex_neg))
+                elif self._sel_kind == "neg":
+                    self._set_examples(self._ex_pos, self._ex_neg + [rect_img])
+                    self.examplesChanged.emit(len(self._ex_pos), len(self._ex_neg))
+                else:
+                    # A plain rectangle clears any prior rectilinear polygon/mask
+                    # and starts a new example set.
+                    self._sel_polygon = None
+                    self._selection_mask = None
+                    self._template_rect = rect_img
+                    self._set_examples([], [])
+                    if self._overlay is not None:
+                        self._overlay.set_source_box(rect_img)
+                    self.regionSelected.emit(QRect(rect_img))
             e.accept()
             return
 

@@ -29,6 +29,10 @@ _OVERLAY_Z = 10.0
 # thing you selected" versus "the things we found".
 _MATCH_COLOR = QColor(40, 220, 70)
 _SOURCE_COLOR = QColor(0, 200, 255)
+# Multi-example search: extra positive examples share the selection's cyan (they
+# are "more of what I selected"); negatives are orange-red and crossed out.
+_NEGATIVE_COLOR = QColor(255, 90, 0)
+_HIGHLIGHT_COLOR = QColor(255, 230, 0)  # examples selected in the side panel
 # A semi-transparent dark casing drawn just under the coloured outline (normal
 # mode only) so the bright box edges stay legible on light backgrounds too — the
 # match/selection colours are theme-independent, the casing keeps them readable.
@@ -63,6 +67,9 @@ class MatchOverlayItem(QGraphicsItem):
         self._visible_rects: list[QRectF] | None = None
         self._threshold = 0.85
         self._source_box: QRect | None = None
+        self._example_pos: list[QRectF] = []
+        self._example_neg: list[QRectF] = []
+        self._highlight: list[QRectF] = []   # examples selected in the side panel
 
         # Configurable box appearance (set from the View menu).
         self._line_width = 1     # cosmetic pen width in DEVICE px (immune to zoom)
@@ -117,6 +124,18 @@ class MatchOverlayItem(QGraphicsItem):
         self._source_box = QRect(rect) if rect is not None else None
         self.update()
 
+    def set_examples(self, positives: "list[QRect]", negatives: "list[QRect]") -> None:
+        """Set the extra positive / negative example boxes of a multi-example search."""
+        self._example_pos = [QRectF(r) for r in positives]
+        self._example_neg = [QRectF(r) for r in negatives]
+        self._highlight = []
+        self.update()
+
+    def set_highlight(self, rects: "list[QRect]") -> None:
+        """Emphasise the given boxes (the examples selected in the side panel)."""
+        self._highlight = [QRectF(r) for r in rects]
+        self.update()
+
     def set_line_width(self, px: int) -> None:
         """Set the box outline width in device px (cosmetic; zoom-independent)."""
         w = max(1, int(px))
@@ -156,6 +175,9 @@ class MatchOverlayItem(QGraphicsItem):
         self._mask = np.empty((0,), dtype=bool)
         self._visible_rects = None
         self._source_box = None
+        self._example_pos = []
+        self._example_neg = []
+        self._highlight = []
         self.update()
 
     # ------------------------------------------------------------- internals
@@ -263,6 +285,16 @@ class MatchOverlayItem(QGraphicsItem):
                 rects = cached if keep.all() else [cached[i] for i in np.flatnonzero(keep)]
                 _draw_boxes(rects, _MATCH_COLOR)
 
+        # Example boxes (few, so no culling): positives like the selection,
+        # negatives in orange with a cross so "not this" reads at a glance.
+        if self._example_pos:
+            _draw_boxes(self._example_pos, _SOURCE_COLOR)
+        if self._example_neg:
+            _draw_boxes(self._example_neg, _NEGATIVE_COLOR)
+            for r in self._example_neg:
+                painter.drawLine(r.topLeft(), r.bottomRight())
+                painter.drawLine(r.topRight(), r.bottomLeft())
+
         # Source box on top, in its own color, if present and exposed.
         sb = self._source_box
         if sb is not None and not sb.isNull():
@@ -274,6 +306,47 @@ class MatchOverlayItem(QGraphicsItem):
             ):
                 _draw_boxes([QRectF(sb)], _SOURCE_COLOR)
 
+        if self._highlight:
+            pen = QPen(_HIGHLIGHT_COLOR)
+            pen.setCosmetic(True)
+            pen.setWidth(self._line_width + 2)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRects(self._highlight)
+
+        # Number the examples (the selection is positive #1) so a specific one
+        # can be picked out and deleted from its right-click menu.
+        if self._example_pos or self._example_neg:
+            tags: list[tuple[QRectF, str, QColor]] = []
+            if sb is not None and not sb.isNull():
+                tags.append((QRectF(sb), "1", _SOURCE_COLOR))
+            tags += [(r, str(i + 2), _SOURCE_COLOR) for i, r in enumerate(self._example_pos)]
+            tags += [(r, f"×{i + 1}", _NEGATIVE_COLOR) for i, r in enumerate(self._example_neg)]
+            self._draw_tags(painter, tags)
+
+        painter.restore()
+
+    @staticmethod
+    def _draw_tags(painter, tags: "list[tuple[QRectF, str, QColor]]") -> None:
+        """Draw each label just above its box's top-left corner, in device px
+        (constant on-screen size at any zoom), on a dark plate for contrast."""
+        xf = painter.worldTransform()
+        painter.save()
+        painter.resetTransform()
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        fm = painter.fontMetrics()
+        for rect, text, color in tags:
+            anchor = xf.map(rect.topLeft())
+            plate = fm.boundingRect(text).adjusted(-3, -1, 3, 1)
+            y = int(anchor.y()) - plate.height() - 1
+            if y < 0:  # no room above (image top edge): hang it below the box
+                y = int(xf.map(rect.bottomLeft()).y()) + 1
+            plate.moveTo(int(anchor.x()), y)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 180))
+            painter.drawRect(plate)
+            painter.setPen(color)
+            painter.drawText(plate, Qt.AlignmentFlag.AlignCenter, text)
         painter.restore()
 
 
