@@ -422,6 +422,31 @@ class Matcher:
         """The torch device the engine actually runs on (post canary gating)."""
         return self._device
 
+    def gather_patches(
+        self, xs: np.ndarray, ys: np.ndarray, ph: int, pw: int
+    ) -> torch.Tensor:
+        """Crop ``ph x pw`` patches at top-lefts ``(xs, ys)`` from the staged image.
+
+        Runs on the compute device against the already-staged planes (no host
+        round trip): ``(N, ph, pw, C)`` float32 in 0..255, C = 3 (RGB) when
+        colour is staged, else 1 (luminance). Out-of-image pixels are clamped
+        to the edge.
+        """
+        if self._lum is None:
+            raise RuntimeError("Matcher.set_image() must be called before gather_patches")
+        dev = self._device
+        planes = (
+            [p[0, 0] for p in self._rgb] if self._rgb is not None else [self._lum[0, 0] * 255.0]
+        )
+        x = torch.as_tensor(np.asarray(xs), dtype=torch.long, device=dev)
+        y = torch.as_tensor(np.asarray(ys), dtype=torch.long, device=dev)
+        oy = torch.arange(ph, device=dev).view(1, ph, 1)
+        ox = torch.arange(pw, device=dev).view(1, 1, pw)
+        rows = (y.view(-1, 1, 1) + oy).clamp_(0, self._h - 1)
+        cols = (x.view(-1, 1, 1) + ox).clamp_(0, self._w - 1)
+        flat = rows * self._w + cols
+        return torch.stack([p.reshape(-1)[flat].to(torch.float32) for p in planes], dim=-1)
+
     @property
     def host_image(self) -> np.ndarray:
         """The array passed to :meth:`set_image` (a reference, not a copy)."""

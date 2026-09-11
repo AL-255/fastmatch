@@ -85,6 +85,24 @@ def test_negative_boxes_are_never_returned_and_cancel_is_honoured():
                           cancel=lambda: True) == []
 
 
+def test_device_patch_gather_and_orientation_match_numpy():
+    import torch
+    from fastmatch.examples import _orient_batch
+    from fastmatch.types import ORIENTATIONS, apply_orientation
+    img, targets, _ = _scene()
+    m = _matcher(img)
+    xs, ys = np.array([0, 17, 600, 630]), np.array([5, 40, 610, 630])
+    got = m.gather_patches(xs, ys, 12, 15).cpu().numpy()
+    for k, (x, y) in enumerate(zip(xs, ys)):
+        rows = np.clip(np.arange(y, y + 12), 0, img.shape[0] - 1)
+        cols = np.clip(np.arange(x, x + 15), 0, img.shape[1] - 1)
+        assert np.array_equal(got[k], img[rows][:, cols].astype(np.float32))
+    batch = torch.from_numpy(got)
+    for o in ORIENTATIONS:
+        ref = np.stack([apply_orientation(p, o) for p in got])
+        assert np.array_equal(_orient_batch(batch, o).numpy(), ref), o
+
+
 def test_requires_a_positive():
     img, _, _ = _scene()
     with pytest.raises(ValueError):

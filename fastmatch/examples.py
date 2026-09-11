@@ -136,39 +136,54 @@ def _boxes(cands: list[Match]) -> np.ndarray:
     return np.array([(m.x, m.y, m.w, m.h) for m in cands], dtype=np.float64).reshape(-1, 4)
 
 
-def _candidate_patches(image: np.ndarray, cands: list[Match], h: int, w: int) -> torch.Tensor:
+def _orient_batch(t: torch.Tensor, orient: str) -> torch.Tensor:
+    """:func:`apply_orientation` on a ``(N, H, W, C)`` batch (same numpy conventions)."""
+    if orient == "R0":
+        return t
+    if orient in ("R90", "R180", "R270"):
+        return torch.rot90(t, {"R90": 1, "R180": 2, "R270": 3}[orient], dims=(1, 2))
+    if orient == "MX":
+        return torch.flip(t, dims=(1,))
+    if orient == "MY":
+        return torch.flip(t, dims=(2,))
+    if orient == "MXR90":
+        return torch.rot90(torch.flip(t, dims=(1,)), 1, dims=(1, 2))
+    if orient == "MYR90":
+        return torch.rot90(torch.flip(t, dims=(2,)), 1, dims=(1, 2))
+    raise ValueError(f"unknown orientation {orient!r}")
+
+
+def _candidate_patches(matcher, cands: list[Match], h: int, w: int) -> torch.Tensor:
     """Candidate patches in the examples' frame: ``(N, h*w*C)`` float32 rows.
 
-    Undoes each candidate's orientation and resizes scaled hits back to the
-    example size, so every row lines up with the example patches.
+    Cropped on the compute device from the staged image (a host-side numpy
+    gather took ~3.5 s for 260k candidates). Undoes each candidate's
+    orientation and resizes scaled hits back to the example size, so every row
+    lines up with the example patches.
     """
-    img_h, img_w = image.shape[:2]
-    out = torch.empty((len(cands), h * w * (image.shape[2] if image.ndim == 3 else 1)))
     groups: dict[tuple[int, int, str], list[int]] = {}
     for i, m in enumerate(cands):
         groups.setdefault((m.w, m.h, m.orientation), []).append(i)
+    out: torch.Tensor | None = None
     for (cw, ch, orient), idx in groups.items():
-        xs = np.array([cands[i].x for i in idx])
-        ys = np.array([cands[i].y for i in idx])
-        oy, ox = np.mgrid[0:ch, 0:cw]
-        rows = np.clip(ys[:, None, None] + oy, 0, img_h - 1)
-        cols = np.clip(xs[:, None, None] + ox, 0, img_w - 1)
-        patch = np.asarray(image[rows, cols], dtype=np.float32)  # (n, ch, cw[, C])
-        if image.ndim == 2:
-            patch = patch[..., None]
-        if orient != "R0":
-            patch = np.stack([apply_orientation(p, _INVERSE[orient]) for p in patch])
-        t = torch.from_numpy(np.ascontiguousarray(patch))  # (n, ph, pw, C)
+        xs = np.fromiter((cands[i].x for i in idx), dtype=np.int64, count=len(idx))
+        ys = np.fromiter((cands[i].y for i in idx), dtype=np.int64, count=len(idx))
+        t = _orient_batch(matcher.gather_patches(xs, ys, ch, cw), _INVERSE[orient])
         if t.shape[1:3] != (h, w):
             t = F.interpolate(t.permute(0, 3, 1, 2), size=(h, w), mode="bilinear",
                               align_corners=False).permute(0, 2, 3, 1)
-        out[idx] = t.reshape(len(idx), -1)
+        rows = t.reshape(len(idx), -1)
+        if out is None:
+            out = torch.empty((len(cands), rows.shape[1]), device=rows.device)
+        out[torch.as_tensor(idx, device=rows.device)] = rows
+    assert out is not None
     return out
 
 
-def _verify(image: np.ndarray, cands: list[Match], pos: np.ndarray, neg: np.ndarray,
-            device: torch.device, cancel: Callable[[], bool] | None) -> np.ndarray | None:
+def _verify(matcher, cands: list[Match], pos: np.ndarray, neg: np.ndarray,
+            cancel: Callable[[], bool] | None) -> np.ndarray | None:
     """Boolean keep-mask: nearest example of each candidate is a positive."""
+    device = matcher.effective_device
     k_pos = torch.from_numpy(_znorm(pos.reshape(len(pos), -1))).to(device)
     k_neg = torch.from_numpy(_znorm(neg.reshape(len(neg), -1))).to(device)
     h, w = pos.shape[1:3]
@@ -176,7 +191,7 @@ def _verify(image: np.ndarray, cands: list[Match], pos: np.ndarray, neg: np.ndar
     for a in range(0, len(cands), _VERIFY_CHUNK):
         if cancel is not None and cancel():
             return None
-        rows = _candidate_patches(image, cands[a:a + _VERIFY_CHUNK], h, w).to(device)
+        rows = _candidate_patches(matcher, cands[a:a + _VERIFY_CHUNK], h, w)
         rows = rows - rows.mean(dim=1, keepdim=True)
         rows = rows / (rows.norm(dim=1, keepdim=True) + 1e-6)
         best_pos = (rows @ k_pos.T).max(dim=1).values
@@ -222,7 +237,7 @@ def match_examples(
         for nb in neg_boxes:
             overlaps |= _iou_many(b, nb) > float(params.exclude_iou)
         cands = [m for m, o in zip(cands, overlaps) if not o]
-        keep = _verify(image, cands, pos, neg, matcher.effective_device, cancel)
+        keep = _verify(matcher, cands, pos, neg, cancel)
         if keep is None:
             return []
         cands = [m for m, k in zip(cands, keep) if k]
