@@ -287,17 +287,107 @@ def _grid_greedy_order(
     return kept
 
 
+#: Round / pair budgets for :func:`_parallel_greedy_order` before it defers to
+#: the sequential loop (long suppression chains; absurdly dense boxes).
+_PARALLEL_NMS_MAX_ROUNDS = 256
+_PARALLEL_NMS_MAX_PAIRS = 40_000_000
+
+
+def _parallel_greedy_order(
+    x1: np.ndarray, y1: np.ndarray, x2: np.ndarray, y2: np.ndarray,
+    order: np.ndarray, iou_thr: float,
+) -> np.ndarray | None:
+    """Vectorised form of :func:`_grid_greedy_order`; ``None`` = use that instead.
+
+    Greedy NMS keeps a box iff no *kept* higher-priority box overlaps it by more
+    than ``iou_thr``. All overlapping (lower, higher) pairs are found at once
+    with the same grid hashing (cell = largest box, 3x3 neighbourhood), then
+    boxes are decided in parallel rounds: a box with a kept suppressor is
+    dropped; a box whose suppressors are all decided (and none kept) is kept.
+    The highest-priority undecided box is always decidable, so every round makes
+    progress, and the result is exactly the sequential one. Same float64 IoU
+    arithmetic as the loop. ~10x faster on the 100k-300k candidates of a
+    repetitive die shot, where the Python loop took 1-2 s per search.
+    """
+    n = order.shape[0]
+    if iou_thr < 0.0:
+        return None
+    rank = np.empty(n, dtype=np.int64)
+    rank[order] = np.arange(n)
+    area = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
+    cell = max(1.0, float((x2 - x1).max()), float((y2 - y1).max()))
+    cx = np.floor(x1 / cell).astype(np.int64)
+    cy = np.floor(y1 / cell).astype(np.int64)
+    cx -= cx.min() - 1
+    cy -= cy.min() - 1
+    stride = int(cy.max()) + 2
+    key = cx * stride + cy
+    srt = np.argsort(key, kind="stable")
+    skey = key[srt]
+    lo_i, hi_i = [], []   # (lower, higher)-priority overlapping pairs
+    total = 0
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            nk = key + dx * stride + dy
+            lo = np.searchsorted(skey, nk, side="left")
+            cnt = np.searchsorted(skey, nk, side="right") - lo
+            m = int(cnt.sum())
+            total += m
+            if total > _PARALLEL_NMS_MAX_PAIRS:
+                return None
+            if m == 0:
+                continue
+            ii = np.repeat(np.arange(n), cnt)
+            starts = np.repeat(np.cumsum(cnt) - cnt, cnt)
+            jj = srt[np.repeat(lo, cnt) + (np.arange(m) - starts)]
+            sel = rank[jj] < rank[ii]            # j outranks i: j may suppress i
+            ii, jj = ii[sel], jj[sel]
+            iw = np.minimum(x2[ii], x2[jj]) - np.maximum(x1[ii], x1[jj])
+            ih = np.minimum(y2[ii], y2[jj]) - np.maximum(y1[ii], y1[jj])
+            ov = (iw > 0.0) & (ih > 0.0)
+            ii, jj, iw, ih = ii[ov], jj[ov], iw[ov], ih[ov]
+            inter = iw * ih
+            hit = inter / np.maximum(area[ii] + area[jj] - inter, 1e-9) > iou_thr
+            lo_i.append(ii[hit])
+            hi_i.append(jj[hit])
+    low = np.concatenate(lo_i) if lo_i else np.empty(0, dtype=np.int64)
+    high = np.concatenate(hi_i) if hi_i else np.empty(0, dtype=np.int64)
+
+    state = np.zeros(n, dtype=np.int8)  # 0 undecided, 1 kept, 2 suppressed
+    for _ in range(_PARALLEL_NMS_MAX_ROUNDS):
+        suppressed = np.zeros(n, dtype=bool)
+        suppressed[low[state[high] == 1]] = True
+        state[(state == 0) & suppressed] = 2
+        pending = np.zeros(n, dtype=bool)
+        pending[low[state[high] == 0]] = True
+        state[(state == 0) & ~pending] = 1
+        if not (state == 0).any():
+            return order[state[order] == 1]
+    return None
+
+
 def _grid_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thr: float) -> torch.Tensor:
-    """:func:`_greedy_nms` semantics on tensors, via :func:`_grid_greedy_order`."""
+    """:func:`_greedy_nms` semantics on tensors, via the grid-indexed greedy NMS."""
     if boxes.numel() == 0:
         return torch.empty(0, dtype=torch.long)
     order = torch.argsort(scores, descending=True)
-    b = boxes.detach().to("cpu", torch.float64)
-    keep = _grid_greedy_order(
-        b[:, 0].tolist(), b[:, 1].tolist(), b[:, 2].tolist(), b[:, 3].tolist(),
-        order.tolist(), float(iou_thr),
-    )
-    return torch.tensor(keep, dtype=torch.long)
+    b = boxes.detach().to("cpu", torch.float64).numpy()
+    keep = _greedy_order(b[:, 0], b[:, 1], b[:, 2], b[:, 3], order.cpu().numpy(), float(iou_thr))
+    return torch.as_tensor(keep, dtype=torch.long)
+
+
+def _greedy_order(
+    x1: np.ndarray, y1: np.ndarray, x2: np.ndarray, y2: np.ndarray,
+    order: np.ndarray, iou_thr: float,
+) -> list[int]:
+    """Kept indices of greedy NMS in visiting order: parallel, else sequential."""
+    if order.shape[0] == 0:
+        return []
+    fast = _parallel_greedy_order(x1, y1, x2, y2, order, iou_thr)
+    if fast is not None:
+        return fast.tolist()
+    return _grid_greedy_order(x1.tolist(), y1.tolist(), x2.tolist(), y2.tolist(),
+                              order.tolist(), iou_thr)
 
 
 #: Above this many candidates torchvision's NMS is also quadratic (its CPU loop,
@@ -829,14 +919,9 @@ class Matcher:
         if not pooled:
             return []
         ordered = sorted(pooled, key=lambda m: m.score, reverse=True)
-        keep = _grid_greedy_order(
-            [float(m.x) for m in ordered],
-            [float(m.y) for m in ordered],
-            [float(m.x + m.w) for m in ordered],
-            [float(m.y + m.h) for m in ordered],
-            list(range(len(ordered))),
-            float(params.nms_iou),
-        )
+        b = np.array([(m.x, m.y, m.x + m.w, m.y + m.h) for m in ordered], dtype=np.float64)
+        keep = _greedy_order(b[:, 0], b[:, 1], b[:, 2], b[:, 3],
+                             np.arange(len(ordered)), float(params.nms_iou))
         return [ordered[i] for i in keep[: params.max_results]]
 
     # -- template preparation / validation -----------------------------------
@@ -2451,17 +2536,15 @@ class Matcher:
         scores_c = scores.cpu().numpy()
         scale_c = scale.cpu().numpy()
 
-        results: list[Match] = []
-        for i in range(boxes_c.shape[0]):
-            bx1, by1, bx2, by2 = boxes_c[i]
-            results.append(
-                Match(
-                    x=int(round(float(bx1))),
-                    y=int(round(float(by1))),
-                    w=int(round(float(bx2 - bx1))),
-                    h=int(round(float(by2 - by1))),
-                    score=float(scores_c[i]),
-                    scale=float(scale_c[i]),
-                )
+        # Round on the arrays, then build the Matches from plain python lists:
+        # the same values as rounding each numpy scalar in a loop, ~3x faster
+        # for the 100k+ results a repetitive die shot produces.
+        xy = np.rint(boxes_c[:, :2]).astype(np.int64)
+        wh = np.rint(boxes_c[:, 2:] - boxes_c[:, :2]).astype(np.int64)
+        return [
+            Match(x=x, y=y, w=w, h=h, score=s, scale=sc)
+            for (x, y), (w, h), s, sc in zip(
+                xy.tolist(), wh.tolist(), scores_c.astype(np.float64).tolist(),
+                scale_c.astype(np.float64).tolist(),
             )
-        return results
+        ]

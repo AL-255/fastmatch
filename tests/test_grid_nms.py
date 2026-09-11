@@ -5,7 +5,14 @@ import numpy as np
 import pytest
 import torch
 
-from fastmatch.engine import Matcher, _greedy_nms, _grid_nms
+from fastmatch.engine import (
+    Matcher,
+    _greedy_nms,
+    _greedy_order,
+    _grid_greedy_order,
+    _grid_nms,
+    _parallel_greedy_order,
+)
 from fastmatch.types import Match, MatchParams
 
 
@@ -26,6 +33,37 @@ def test_grid_nms_matches_greedy(seed, iou):
     # Mixed box sizes (as a multi-scale search produces) and dense overlap.
     boxes, scores = _random_boxes(rng, 1500, 400, [8, 13, 40, 97])
     assert _grid_nms(boxes, scores, iou).tolist() == _greedy_nms(boxes, scores, iou).tolist()
+
+
+@pytest.mark.parametrize("seed", range(8))
+@pytest.mark.parametrize("iou", [0.0, 0.3, 0.5])
+def test_parallel_rounds_match_sequential_loop(seed, iou):
+    rng = np.random.default_rng(100 + seed)
+    n = 4000
+    x = rng.integers(0, 900, n).astype(np.float64)
+    y = rng.integers(0, 900, n).astype(np.float64)
+    w = rng.choice([6.0, 11.0, 28.0, 60.0], n)
+    h = rng.choice([6.0, 22.0, 28.0], n)
+    order = np.argsort(-rng.random(n), kind="stable")
+    fast = _parallel_greedy_order(x, y, x + w, y + h, order, iou)
+    assert fast is not None
+    ref = _grid_greedy_order(x.tolist(), y.tolist(), (x + w).tolist(), (y + h).tolist(),
+                             order.tolist(), iou)
+    assert fast.tolist() == ref
+
+
+def test_long_suppression_chain_falls_back_to_the_exact_loop():
+    # Each box overlaps the next and scores rise along the row: greedy decisions
+    # alternate down a 2000-long chain, beyond the parallel round budget.
+    n = 2000
+    x = np.arange(n, dtype=np.float64) * 4.0
+    y = np.zeros(n)
+    order = np.arange(n)[::-1].copy()
+    assert _parallel_greedy_order(x, y, x + 10.0, y + 10.0, order, 0.3) is None
+    got = _greedy_order(x, y, x + 10.0, y + 10.0, order, 0.3)
+    ref = _grid_greedy_order(x.tolist(), y.tolist(), (x + 10).tolist(), (y + 10).tolist(),
+                             order.tolist(), 0.3)
+    assert got == ref
 
 
 def test_grid_nms_handles_huge_repeated_grids_quickly():
