@@ -89,6 +89,9 @@ _FFT_THRESHOLD = 4096
 #: refine it (§D.7 / §H "compute tile (start)").
 _TILE_START = 1024
 
+#: Core-tile cap on ROCm, where per-tile overhead is proportionally larger.
+_ROCM_TILE_START = 2048
+
 #: Degrade ladder of tile sizes on CUDA OOM (§D.7).
 _TILE_LADDER = (1024, 512)
 
@@ -362,12 +365,10 @@ class Matcher:
                 ``False`` forces the full path — the recall-parity reference.
         """
         self._device = resolve_device(device if device is not None else "auto")
+        # ROCm-specific tuning (CUDA and CPU keep the original paths bit for bit).
+        self._rocm = self._device.type == "cuda" and gpu_backend() == "rocm"
         # rocFFT compiles per transform length; share lengths across queries there.
-        self._fft_len = (
-            _next_fft_bucket
-            if self._device.type == "cuda" and gpu_backend() == "rocm"
-            else _next_smooth
-        )
+        self._fft_len = _next_fft_bucket if self._rocm else _next_smooth
         self._compute_dtype = compute_dtype
         self._channel_mode = channel_mode
         self._conv_backend = conv_backend
@@ -1657,7 +1658,9 @@ class Matcher:
                 core = max(256, c)
             else:
                 core = _TILE_START
-            return min(core, _TILE_START)
+            # ROCm: bigger tiles amortise the per-tile launches and the
+            # device->host sync, and rocFFT is cheaper per pixel on them.
+            return min(core, _ROCM_TILE_START if self._rocm else _TILE_START)
 
         # CPU: bound the tile so the match stays cancellable between tiles (see
         # the docstring) and per-tile scratch stays small. 1024 is a good balance
@@ -1740,6 +1743,11 @@ class Matcher:
         if self._conv_backend == "spatial":
             return "spatial"
         if self._conv_backend == "fft":
+            return "fft"
+        if self._rocm:
+            # MIOpen's single-channel direct conv is slow for template-sized
+            # kernels (22x28 on a 1024^2 tile: 13.6 ms vs 0.9 ms via rocFFT on an
+            # RX 7900 XT), so ROCm correlates through the FFT at every size.
             return "fft"
         return "spatial" if (sth * stw) <= _FFT_THRESHOLD else "fft"
 
