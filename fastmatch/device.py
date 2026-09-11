@@ -13,6 +13,11 @@ from __future__ import annotations
 import torch
 
 
+def gpu_backend() -> str:
+    """ROCm exposes its devices through torch.cuda, too."""
+    return "rocm" if getattr(torch.version, "hip", None) else "cuda"
+
+
 def canary_kernel_ok() -> bool:
     """Return True iff a trivial CUDA kernel actually executes.
 
