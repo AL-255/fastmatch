@@ -62,6 +62,9 @@ class MatchOverlayItem(QGraphicsItem):
         self._boxes = np.empty((0, 4), dtype=np.int32)
         self._scores = np.empty((0,), dtype=np.float32)
         self._mask = np.empty((0,), dtype=bool)
+        # QRectF per visible box, built lazily once per match/threshold change.
+        # Building 100k QRectF objects took half of every repaint otherwise.
+        self._visible_rects: list[QRectF] | None = None
         self._threshold = 0.85
         self._source_box: QRect | None = None
         self._example_pos: list[QRectF] = []
@@ -163,16 +166,14 @@ class MatchOverlayItem(QGraphicsItem):
         """Post-threshold match boxes as scene-coord rects (for the focus spotlight)."""
         if not (self._boxes.shape[0] and self._mask.any()):
             return []
-        return [
-            QRectF(float(x), float(y), float(w), float(h))
-            for x, y, w, h in self._boxes[self._mask]
-        ]
+        return list(self._rects())
 
     def clear(self) -> None:
         """Remove all matches and the source box."""
         self._boxes = np.empty((0, 4), dtype=np.int32)
         self._scores = np.empty((0,), dtype=np.float32)
         self._mask = np.empty((0,), dtype=bool)
+        self._visible_rects = None
         self._source_box = None
         self._example_pos = []
         self._example_neg = []
@@ -187,6 +188,16 @@ class MatchOverlayItem(QGraphicsItem):
             self._mask = self._scores >= self._threshold
         else:
             self._mask = np.empty((0,), dtype=bool)
+        self._visible_rects = None
+
+    def _rects(self) -> "list[QRectF]":
+        """Cached QRectF list parallel to ``self._boxes[self._mask]``."""
+        if self._visible_rects is None:
+            self._visible_rects = [
+                QRectF(float(x), float(y), float(w), float(h))
+                for x, y, w, h in self._boxes[self._mask].tolist()
+            ]
+        return self._visible_rects
 
     # ----------------------------------------------------------- QGraphicsItem
 
@@ -267,13 +278,11 @@ class MatchOverlayItem(QGraphicsItem):
                 & ((by + bh) > ey0)
             )
             if keep.any():
-                culled = visible[keep]
-                # Build a flat QRectF list in one pass; drawRects batches the
-                # GL calls far better than per-box drawRect.
-                rects = [
-                    QRectF(float(x), float(y), float(w), float(h))
-                    for x, y, w, h in culled
-                ]
+                # One flat QRectF list; drawRects batches the GL calls far better
+                # than per-box drawRect. Reuse the cached list when every visible
+                # box is exposed (e.g. zoomed to fit) instead of indexing it.
+                cached = self._rects()
+                rects = cached if keep.all() else [cached[i] for i in np.flatnonzero(keep)]
                 _draw_boxes(rects, _MATCH_COLOR)
 
         # Example boxes (few, so no culling): positives like the selection,

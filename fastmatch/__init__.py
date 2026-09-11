@@ -10,7 +10,18 @@ headless engine/loader use without dragging in Qt. GUI symbols live in
 ``fastmatch.app`` / ``fastmatch.viewport`` and are imported on demand.
 """
 
+import os as _os
+
 from PIL import Image as _PILImage
+
+# ROCm: MIOpen's default find mode benchmarks and compiles kernels for every new
+# convolution shape (7-21 s each on an RX 7900 XT). Each new selection size brings
+# a fresh set of shapes (pyramid levels, box filters, tile edges), so the first
+# search at a new size could take minutes and looked like it found nothing. FAST
+# mode picks a solver heuristically instead. MIOpen reads this lazily when its
+# handle is created, so setting it here (before any convolution) is enough.
+# setdefault lets a user still override it. Ignored on CUDA/CPU.
+_os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
 
 # Allow decoding gigapixel images. loader.load_image performs an explicit pixel
 # pre-flight before relying on this, so disabling Pillow's decompression-bomb
