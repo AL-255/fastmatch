@@ -32,6 +32,7 @@ _SOURCE_COLOR = QColor(0, 200, 255)
 # Multi-example search: extra positive examples share the selection's cyan (they
 # are "more of what I selected"); negatives are orange-red and crossed out.
 _NEGATIVE_COLOR = QColor(255, 90, 0)
+_HIGHLIGHT_COLOR = QColor(255, 230, 0)  # examples selected in the side panel
 # A semi-transparent dark casing drawn just under the coloured outline (normal
 # mode only) so the bright box edges stay legible on light backgrounds too — the
 # match/selection colours are theme-independent, the casing keeps them readable.
@@ -65,6 +66,7 @@ class MatchOverlayItem(QGraphicsItem):
         self._source_box: QRect | None = None
         self._example_pos: list[QRectF] = []
         self._example_neg: list[QRectF] = []
+        self._highlight: list[QRectF] = []   # examples selected in the side panel
 
         # Configurable box appearance (set from the View menu).
         self._line_width = 1     # cosmetic pen width in DEVICE px (immune to zoom)
@@ -123,6 +125,12 @@ class MatchOverlayItem(QGraphicsItem):
         """Set the extra positive / negative example boxes of a multi-example search."""
         self._example_pos = [QRectF(r) for r in positives]
         self._example_neg = [QRectF(r) for r in negatives]
+        self._highlight = []
+        self.update()
+
+    def set_highlight(self, rects: "list[QRect]") -> None:
+        """Emphasise the given boxes (the examples selected in the side panel)."""
+        self._highlight = [QRectF(r) for r in rects]
         self.update()
 
     def set_line_width(self, px: int) -> None:
@@ -168,6 +176,7 @@ class MatchOverlayItem(QGraphicsItem):
         self._source_box = None
         self._example_pos = []
         self._example_neg = []
+        self._highlight = []
         self.update()
 
     # ------------------------------------------------------------- internals
@@ -287,6 +296,14 @@ class MatchOverlayItem(QGraphicsItem):
                 and (sb.y() + sb.height()) > ey0
             ):
                 _draw_boxes([QRectF(sb)], _SOURCE_COLOR)
+
+        if self._highlight:
+            pen = QPen(_HIGHLIGHT_COLOR)
+            pen.setCosmetic(True)
+            pen.setWidth(self._line_width + 2)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRects(self._highlight)
 
         # Number the examples (the selection is positive #1) so a specific one
         # can be picked out and deleted from its right-click menu.

@@ -97,7 +97,7 @@ def test_requires_a_positive():
 import os  # noqa: E402
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PySide6.QtCore import QEvent, QEventLoop, QPointF, QRect, Qt, QTimer  # noqa: E402
+from PySide6.QtCore import QEvent, QEventLoop, QPointF, QRect, QRectF, Qt, QTimer  # noqa: E402
 from PySide6.QtGui import QMouseEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
@@ -218,6 +218,53 @@ def _window(qapp, img):
 
 def _centre(r):
     return QPointF(r[0] + r[2] / 2, r[1] + r[3] / 2)
+
+
+def test_examples_panel_lists_and_batch_deletes(qapp):
+    img, targets, decoys = _scene()
+    w = _window(qapp, img)
+    try:
+        view, panel = w._viewport, w._examples_panel
+        sel = QRect(5, 5, S, S)
+        view.set_template_rect(sel)
+        w._on_region_selected(sel)
+        assert panel.items() == [("pos", 1)]          # the selection alone is row #1
+        # 50 positives (selection + 49) and 2 negatives, as drawn on the image.
+        extra = [QRect(40 + (i % 12) * 48, 40 + (i // 12) * 48, S, S) for i in range(49)]
+        neg = [QRect(x, y, S, S) for x, y in decoys[:2]]
+        view._set_examples(extra, neg)
+        changes = []
+        view.examplesChanged.connect(lambda p, n: changes.append((p, n)))
+        w._update_examples_label()
+        items = panel.items()
+        assert len(items) == 52 and items[0] == ("pos", 1) and items[49] == ("pos", 50)
+        assert items[50:] == [("neg", 1), ("neg", 2)]
+        # Selecting rows highlights their boxes.
+        panel.select_rows([2, 5, 50])
+        assert panel.selected_items() == [("pos", 3), ("pos", 6), ("neg", 1)]
+        assert len(view._overlay._highlight) == 3
+        # Clicking a row centres the view on that box.
+        panel._on_cell_clicked(40, 0)
+        centre = view.mapToScene(view.viewport().rect().center())
+        target = QRectF(view.example_rect("pos", 41)).center()
+        assert abs(centre.x() - target.x()) < 60 and abs(centre.y() - target.y()) < 60
+        # One batch delete -> one notification, renumbered list, highlight cleared.
+        panel._delete_selected()
+        assert changes == [(47, 1)]
+        items = panel.items()
+        assert len(items) == 49 and items[-2:] == [("pos", 48), ("neg", 1)]
+        assert view.examples()[0][:3] == [(extra[0].x(), extra[0].y(), S, S),
+                                          (extra[2].x(), extra[2].y(), S, S),
+                                          (extra[3].x(), extra[3].y(), S, S)]
+        assert view._overlay._highlight == []
+        assert "48" in w._examples_label.text()
+        # Deleting row #1 from the panel promotes #2 to be the selection.
+        panel.select_rows([0])
+        panel._delete_selected()
+        assert view.template_rect() == extra[0] and panel.items()[0] == ("pos", 1)
+        assert len(panel.items()) == 48
+    finally:
+        w.close()
 
 
 def test_numbered_examples_can_be_deleted_one_by_one(qapp):

@@ -573,33 +573,69 @@ class ImageViewport(QGraphicsView):
         return kind, number
 
     def remove_example(self, kind: str, number: int) -> None:
-        """Delete example ``number`` (1-based, as labelled) of ``kind``.
+        """Delete example ``number`` (1-based, as labelled) of ``kind``."""
+        self.remove_examples([(kind, number)])
 
-        Deleting positive #1 (the selection) promotes #2 to be the selection;
-        with no other positive left the whole selection is cleared.
+    def remove_examples(self, items: "list[tuple[str, int]]") -> None:
+        """Delete several examples at once, identified as labelled on the image.
+
+        One notification for the whole batch (so a 20-row delete re-runs the
+        search once). Deleting positive #1 (the selection) promotes the first
+        remaining positive to be the selection; with no positive left the
+        whole selection is cleared.
         """
-        if kind == "neg":
-            del self._ex_neg[number - 1]
-        elif number >= 2:
-            del self._ex_pos[number - 2]
-        elif self._ex_pos:
-            promoted = self._ex_pos.pop(0)
-            self._reset_rectilinear_state()
-            self._sel_polygon = None
-            self._selection_mask = None
-            self._template_rect = QRect(promoted)
-            self._set_examples(self._ex_pos, self._ex_neg)
-            if self._overlay is not None:
-                self._overlay.set_source_box(QRect(promoted))
-            self.viewport().update()
-            self.regionSelected.emit(QRect(promoted))
+        if not items:
             return
-        else:
+        neg_del = {n for k, n in items if k == "neg"}
+        pos_del = {n for k, n in items if k == "pos"}
+        negatives = [r for i, r in enumerate(self._ex_neg) if i + 1 not in neg_del]
+        extras = [r for i, r in enumerate(self._ex_pos) if i + 2 not in pos_del]
+        if 1 not in pos_del:
+            self._set_examples(extras, negatives)
+            self.examplesChanged.emit(len(extras), len(negatives))
+            return
+        if not extras:
             self.clear_template()
             self.selectionRemoved.emit()
             return
-        self._set_examples(self._ex_pos, self._ex_neg)
-        self.examplesChanged.emit(len(self._ex_pos), len(self._ex_neg))
+        promoted = extras.pop(0)
+        self._reset_rectilinear_state()
+        self._sel_polygon = None
+        self._selection_mask = None
+        self._template_rect = QRect(promoted)
+        self._set_examples(extras, negatives)
+        if self._overlay is not None:
+            self._overlay.set_source_box(QRect(promoted))
+        self.viewport().update()
+        self.regionSelected.emit(QRect(promoted))
+
+    def example_rect(self, kind: str, number: int) -> "QRect | None":
+        """The box of example ``number`` of ``kind`` (positive #1 = the selection)."""
+        if kind == "neg":
+            boxes = self._ex_neg
+            i = number - 1
+        elif number == 1:
+            return QRect(self._template_rect) if self._template_rect is not None else None
+        else:
+            boxes = self._ex_pos
+            i = number - 2
+        return QRect(boxes[i]) if 0 <= i < len(boxes) else None
+
+    def set_example_highlight(self, items: "list[tuple[str, int]]") -> None:
+        """Outline the given examples in the highlight colour (panel selection)."""
+        if self._overlay is not None:
+            rects = [self.example_rect(k, n) for k, n in items]
+            self._overlay.set_highlight([r for r in rects if r is not None])
+
+    def centre_on_example(self, kind: str, number: int) -> None:
+        """Scroll (without zooming) so the example's box is in the view centre."""
+        r = self.example_rect(kind, number)
+        if r is None:
+            return
+        self.centerOn(QRectF(r).center())
+        self._bump_generation()
+        self._emit_view_changed()
+        self.viewport().update()
 
     def contextMenuEvent(self, e) -> None:
         """Right-click on a numbered example box offers to delete it."""

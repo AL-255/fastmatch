@@ -51,6 +51,7 @@ from .device import device_banner_text, resolve_device
 from .document import ImageDocument
 from .memory import MemoryEntry
 from .about import AboutDialog
+from .examples_panel import ExamplesPanel
 from .memory_panel import MemoryPanel
 from .params_panel import _HIST_BIN_PRESETS, _HIST_BINS, ParamsPanel
 from .types import CONV_METHODS, MatchParams
@@ -194,6 +195,18 @@ class MainWindow(QMainWindow):
         self._memory_dock = QDockWidget("Memory", self)
         self._memory_dock.setWidget(self._memory)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._memory_dock)
+
+        # --- Examples panel dock (multi-example search) --------------------
+        # Below the Search dock: one numbered row per example box, so a long
+        # set (dozens of boxes) can be reviewed and pruned.
+        self._examples_panel = ExamplesPanel(self)
+        self._examples_dock = QDockWidget("Examples", self)
+        self._examples_dock.setWidget(self._examples_panel)
+        self._examples_dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._examples_dock)
+        self.splitDockWidget(self._dock, self._examples_dock, Qt.Orientation.Vertical)
 
         # --- Toolbar + menu bar -------------------------------------------
         self._build_toolbar()
@@ -424,6 +437,9 @@ class MainWindow(QMainWindow):
         act_dock_memory = self._memory_dock.toggleViewAction()
         act_dock_memory.setText("&Memory panel")
         view_menu.addAction(act_dock_memory)
+        act_dock_examples = self._examples_dock.toggleViewAction()
+        act_dock_examples.setText("&Examples panel")
+        view_menu.addAction(act_dock_examples)
 
         self._build_tools_menu()
         self._build_theme_menu()
@@ -579,6 +595,11 @@ class MainWindow(QMainWindow):
         self._viewport.examplesChanged.connect(self._on_examples_changed)
         self._viewport.exampleMenuRequested.connect(self._on_example_menu)
         self._viewport.selectionRemoved.connect(self._on_clear_matches)
+        # The Examples side panel: review, highlight, and delete example boxes.
+        self._examples_panel.delete_requested.connect(self._viewport.remove_examples)
+        self._examples_panel.clear_requested.connect(self._viewport.clear_examples)
+        self._examples_panel.highlight_changed.connect(self._viewport.set_example_highlight)
+        self._examples_panel.focus_requested.connect(self._viewport.centre_on_example)
 
         # Controller results / state. With no image at startup there is no
         # controller yet; _install_new_controller wires these when one is opened.
@@ -991,7 +1012,10 @@ class MainWindow(QMainWindow):
         return menu.exec(global_pos)
 
     def _update_examples_label(self) -> None:
+        """Refresh every view of the example set: status label, Clear action,
+        and the numbered list in the Examples panel."""
         pos, neg = self._viewport.examples()
+        self._examples_panel.set_examples(self._viewport.template_rect(), pos, neg)
         active = bool(pos or neg)
         self._examples_label.setVisible(active)
         self._act_clear_examples.setEnabled(active)
