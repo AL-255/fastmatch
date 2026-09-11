@@ -98,6 +98,7 @@ class MatchWorker(QObject):
         params: MatchParams,
         exclude_box: "tuple | None",
         mask: "object" = None,
+        examples: "object" = None,
         job_id: int = 0,
     ) -> None:
         """Execute one match job and emit its result.
@@ -112,6 +113,9 @@ class MatchWorker(QObject):
             params: Search parameters for this job.
             exclude_box: ``(x, y, w, h)`` source region to exclude from hits,
                 or ``None``.
+            examples: ``(positives, negatives)`` box lists for a multi-example
+                search (:mod:`fastmatch.examples`), or ``None`` for the plain
+                single-template search.
             job_id: Monotonic id that rides on the result for stale-drop.
         """
         # A sticky stop takes precedence over everything: a job queued behind a
@@ -140,14 +144,23 @@ class MatchWorker(QObject):
             self.progress.emit(int(pct))
 
         try:
-            matches: list[Match] = self._engine.match(
-                template,
-                params,
-                exclude_box=exclude_box,
-                mask=mask,
-                cancel=_cancel,
-                progress=_progress,
-            )
+            if examples is not None:
+                from .examples import match_examples
+
+                positives, negatives = examples
+                matches: list[Match] = match_examples(
+                    self._engine, positives, negatives, params,
+                    cancel=_cancel, progress=_progress,
+                )
+            else:
+                matches = self._engine.match(
+                    template,
+                    params,
+                    exclude_box=exclude_box,
+                    mask=mask,
+                    cancel=_cancel,
+                    progress=_progress,
+                )
             # Engine contract: returns a plain list[Match] (CPU dataclasses),
             # already moved off the GPU. Emit as-is — no tensors cross here.
             self.finished.emit(matches, job_id)

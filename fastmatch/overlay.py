@@ -29,6 +29,9 @@ _OVERLAY_Z = 10.0
 # thing you selected" versus "the things we found".
 _MATCH_COLOR = QColor(40, 220, 70)
 _SOURCE_COLOR = QColor(0, 200, 255)
+# Multi-example search: extra positive examples share the selection's cyan (they
+# are "more of what I selected"); negatives are orange-red and crossed out.
+_NEGATIVE_COLOR = QColor(255, 90, 0)
 # A semi-transparent dark casing drawn just under the coloured outline (normal
 # mode only) so the bright box edges stay legible on light backgrounds too — the
 # match/selection colours are theme-independent, the casing keeps them readable.
@@ -60,6 +63,8 @@ class MatchOverlayItem(QGraphicsItem):
         self._mask = np.empty((0,), dtype=bool)
         self._threshold = 0.85
         self._source_box: QRect | None = None
+        self._example_pos: list[QRectF] = []
+        self._example_neg: list[QRectF] = []
 
         # Configurable box appearance (set from the View menu).
         self._line_width = 1     # cosmetic pen width in DEVICE px (immune to zoom)
@@ -114,6 +119,12 @@ class MatchOverlayItem(QGraphicsItem):
         self._source_box = QRect(rect) if rect is not None else None
         self.update()
 
+    def set_examples(self, positives: "list[QRect]", negatives: "list[QRect]") -> None:
+        """Set the extra positive / negative example boxes of a multi-example search."""
+        self._example_pos = [QRectF(r) for r in positives]
+        self._example_neg = [QRectF(r) for r in negatives]
+        self.update()
+
     def set_line_width(self, px: int) -> None:
         """Set the box outline width in device px (cosmetic; zoom-independent)."""
         w = max(1, int(px))
@@ -155,6 +166,8 @@ class MatchOverlayItem(QGraphicsItem):
         self._scores = np.empty((0,), dtype=np.float32)
         self._mask = np.empty((0,), dtype=bool)
         self._source_box = None
+        self._example_pos = []
+        self._example_neg = []
         self.update()
 
     # ------------------------------------------------------------- internals
@@ -253,6 +266,16 @@ class MatchOverlayItem(QGraphicsItem):
                     for x, y, w, h in culled
                 ]
                 _draw_boxes(rects, _MATCH_COLOR)
+
+        # Example boxes (few, so no culling): positives like the selection,
+        # negatives in orange with a cross so "not this" reads at a glance.
+        if self._example_pos:
+            _draw_boxes(self._example_pos, _SOURCE_COLOR)
+        if self._example_neg:
+            _draw_boxes(self._example_neg, _NEGATIVE_COLOR)
+            for r in self._example_neg:
+                painter.drawLine(r.topLeft(), r.bottomRight())
+                painter.drawLine(r.topRight(), r.bottomLeft())
 
         # Source box on top, in its own color, if present and exposed.
         sb = self._source_box

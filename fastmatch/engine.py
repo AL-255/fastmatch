@@ -371,6 +371,10 @@ class Matcher:
         self._ycbcr: list[torch.Tensor] | None = None
         self._h: int = 0
         self._w: int = 0
+        # The staged source array itself, for the multi-example search's patch
+        # crops (fastmatch.examples). A reference to the caller's (possibly
+        # memmap) array, so it costs no memory.
+        self._host_image: np.ndarray | None = None
 
         # Compute-device image pyramid for the coarse-to-fine search (§K.1):
         # _pyr_lum[ell] is the staged luminance down-sampled by 2**ell via
@@ -418,6 +422,13 @@ class Matcher:
         """The torch device the engine actually runs on (post canary gating)."""
         return self._device
 
+    @property
+    def host_image(self) -> np.ndarray:
+        """The array passed to :meth:`set_image` (a reference, not a copy)."""
+        if self._host_image is None:
+            raise RuntimeError("Matcher.set_image() must be called before host_image")
+        return self._host_image
+
     # -- image staging -------------------------------------------------------
 
     def set_image(self, image: np.ndarray) -> None:
@@ -459,6 +470,7 @@ class Matcher:
             raise ValueError(f"image must be (H,W,3) or (H,W), got ndim={image.ndim}")
 
         self._h, self._w = int(lum.shape[0]), int(lum.shape[1])
+        self._host_image = image
         # Stage as (1,1,H,W) fp32 on the compute device once. np.ascontiguousarray
         # forces a real read of any memmap into RAM before the host->device copy
         # (a memmap row may be non-contiguous after the luminance combine).

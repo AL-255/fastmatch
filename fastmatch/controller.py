@@ -66,7 +66,8 @@ class MatchController(QObject):
     # Private queued bridge to the worker's run() slot. Declared as a signal
     # (not a direct call) so the cross-thread invocation is marshalled onto the
     # worker thread's event loop. Payload is plain CPU data only.
-    _run_requested = Signal(object, object, object, object, int)  # (template, params, exclude_box, mask, job_id)
+    # (template, params, exclude_box, mask, examples, job_id)
+    _run_requested = Signal(object, object, object, object, object, int)
 
     # Private queued bridge to staging. Emitted from the GUI thread in __init__;
     # the connected slot (_prepare_engine) runs on the *worker* thread so the
@@ -112,7 +113,7 @@ class MatchController(QObject):
         # Pending dispatch parameters, captured by request() and consumed when
         # the debounce timer fires (or when staging completes, if a request
         # raced ahead of it). None means "nothing armed".
-        self._pending: tuple[QRect, MatchParams, object] | None = None
+        self._pending: tuple[QRect, MatchParams, object, object] | None = None
         # Staging gate: the worker thread builds the engine + stages the image
         # asynchronously, so _dispatch must not emit _run_requested until that
         # has completed. A request arriving first stays armed in _pending and is
@@ -229,7 +230,8 @@ class MatchController(QObject):
     # ------------------------------------------------------------------ request
     @Slot(QRect, object)
     def request(
-        self, rect_img: QRect, params: MatchParams, mask: object = None
+        self, rect_img: QRect, params: MatchParams, mask: object = None,
+        examples: object = None,
     ) -> None:
         """Validate a selection and (re)arm a debounced search.
 
@@ -239,6 +241,10 @@ class MatchController(QObject):
             params: Parameters for this search.
             mask: Optional bbox-sized boolean template mask (rectilinear select),
                 aligned to ``rect_img``; cropped here if the rect clips the image.
+            examples: Optional ``(extra_positives, negatives)`` lists of
+                ``(x, y, w, h)`` boxes. When given, the search runs in
+                multi-example mode with ``rect_img`` as the first positive (the
+                mask is not used there).
 
         Invalid selections (after clipping to the image) emit :attr:`failed`
         with a reason and dispatch nothing. Valid ones cancel any in-flight job
@@ -264,7 +270,7 @@ class MatchController(QObject):
         if self._busy:
             self._worker.request_cancel()
 
-        self._pending = (clipped, params, mask)
+        self._pending = (clipped, params, mask, examples)
         self._debounce.start()  # (re)arm; restarts countdown if already running
 
     # ----------------------------------------------------------------- dispatch
@@ -280,7 +286,7 @@ class MatchController(QObject):
             # thread. Keep the request armed in _pending; _on_ready will dispatch
             # it once the engine is ready, so the first search is never lost.
             return
-        rect, params, mask = self._pending
+        rect, params, mask, examples = self._pending
         self._pending = None
 
         x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
@@ -295,9 +301,21 @@ class MatchController(QObject):
         self._set_busy(True)
         # exclude_box is the source region in full-image coords so the engine
         # can suppress the template's own location among the hits (§H4).
+        if examples is not None:
+            extra_pos, negatives = examples
+            # The drawn selection is the first positive; the rest are clipped
+            # to the image so every example box can be cropped.
+            examples = (
+                [(x, y, w, h)] + [self._clip_box(b) for b in extra_pos],
+                [self._clip_box(b) for b in negatives],
+            )
         self._run_requested.emit(
-            template, params, (x, y, w, h), mask_arr, self._current_job_id
+            template, params, (x, y, w, h), mask_arr, examples, self._current_job_id
         )
+
+    def _clip_box(self, box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        r = self._clip_to_image(QRect(*box))
+        return (r.x(), r.y(), max(1, r.width()), max(1, r.height()))
 
     # ------------------------------------------------------------ result slots
     def _is_superseded(self, job_id: int) -> bool:

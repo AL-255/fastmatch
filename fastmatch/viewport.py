@@ -262,6 +262,7 @@ class ImageViewport(QGraphicsView):
     zoomChanged = Signal(float, int)      # (view_scale, current_pyramid_level)
     viewChanged = Signal(QRect)           # visible image-px rect (prefetch hint)
     focusModeChanged = Signal(bool)       # focus/spotlight mode toggled (Space)
+    examplesChanged = Signal(int, int)    # (extra positives, negatives) after a Shift/Ctrl drag
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -332,6 +333,12 @@ class ImageViewport(QGraphicsView):
         self._sel_origin: QPoint | None = None
         self._rubber = QRubberBand(QRubberBand.Shape.Rectangle, self.viewport())
         self._template_rect: QRect | None = None
+        # Multi-example search: Shift+drag adds a positive example (more of the
+        # selected structure), Ctrl+drag a negative ("not this"). The selection
+        # itself is the first positive; a plain new selection starts over.
+        self._sel_kind = "select"   # "select" | "pos" | "neg" for the active drag
+        self._ex_pos: list[QRect] = []
+        self._ex_neg: list[QRect] = []
 
         # Rectilinear (orthogonal-polygon) selection state. Vertices are in IMAGE
         # px; each committed edge is axis-aligned (snapped H/V). _sel_polygon holds
@@ -415,6 +422,7 @@ class ImageViewport(QGraphicsView):
         self._measuring = False
         self._measure_p1 = None
         self._template_rect = None
+        self._ex_pos, self._ex_neg = [], []
         self._reset_rectilinear_state()
         self._sel_polygon = None
         self._selection_mask = None
@@ -511,14 +519,33 @@ class ImageViewport(QGraphicsView):
         return QRect(self._template_rect) if self._template_rect is not None else None
 
     def clear_template(self) -> None:
-        """Clear the template selection, its highlighted source box, and any mask."""
+        """Clear the template selection, its highlighted source box, any mask,
+        and the multi-example boxes that belong to it."""
         self._template_rect = None
         self._reset_rectilinear_state()
         self._sel_polygon = None
         self._selection_mask = None
+        self._set_examples([], [])
         if self._overlay is not None:
             self._overlay.set_source_box(None)
         self.viewport().update()
+
+    # ---------------------------------------------------------- examples
+    def examples(self) -> "tuple[list[tuple[int, int, int, int]], list[tuple[int, int, int, int]]]":
+        """``(extra_positives, negatives)`` as ``(x, y, w, h)`` image-px boxes."""
+        as_box = lambda r: (r.x(), r.y(), r.width(), r.height())  # noqa: E731
+        return [as_box(r) for r in self._ex_pos], [as_box(r) for r in self._ex_neg]
+
+    def clear_examples(self) -> None:
+        """Drop every extra positive / negative example (keeps the selection)."""
+        if self._ex_pos or self._ex_neg:
+            self._set_examples([], [])
+            self.examplesChanged.emit(0, 0)
+
+    def _set_examples(self, pos: "list[QRect]", neg: "list[QRect]") -> None:
+        self._ex_pos, self._ex_neg = list(pos), list(neg)
+        if self._overlay is not None:
+            self._overlay.set_examples(self._ex_pos, self._ex_neg)
 
     def set_template_rect(self, rect: QRect | None) -> None:
         """Set the template selection + its highlighted (blue) source box.
@@ -530,6 +557,7 @@ class ImageViewport(QGraphicsView):
             self.clear_template()
             return
         self._template_rect = QRect(rect)
+        self._set_examples([], [])  # a restored selection has no example set
         if self._overlay is not None:
             self._overlay.set_source_box(QRect(rect))
 
@@ -973,6 +1001,7 @@ class ImageViewport(QGraphicsView):
         self._sel_polygon = pts
         self._selection_mask = mask
         self._template_rect = rect
+        self._set_examples([], [])  # a new selection starts a new example set
         if self._overlay is not None:
             self._overlay.set_source_box(rect)
         self.viewport().update()
@@ -1032,7 +1061,16 @@ class ImageViewport(QGraphicsView):
                 self._rectilinear_click(e.position().toPoint())
                 e.accept()
                 return
-            # Start a rubber-band selection in viewport coordinates.
+            # Start a rubber-band selection in viewport coordinates. Shift / Ctrl
+            # turn the drag into a positive / negative example for the current
+            # selection (a plain drag replaces the selection).
+            mods = e.modifiers()
+            if mods & Qt.KeyboardModifier.ControlModifier:
+                self._sel_kind = "neg"
+            elif mods & Qt.KeyboardModifier.ShiftModifier and self._template_rect is not None:
+                self._sel_kind = "pos"
+            else:
+                self._sel_kind = "select"
             self._selecting = True
             self._sel_origin = e.position().toPoint()
             self._rubber.setGeometry(QRect(self._sel_origin, self._sel_origin))
@@ -1125,13 +1163,22 @@ class ImageViewport(QGraphicsView):
             rect_img = self._viewport_band_to_image_rect()
             self._sel_origin = None
             if rect_img is not None and rect_img.width() >= 1 and rect_img.height() >= 1:
-                # A plain rectangle clears any prior rectilinear polygon/mask.
-                self._sel_polygon = None
-                self._selection_mask = None
-                self._template_rect = rect_img
-                if self._overlay is not None:
-                    self._overlay.set_source_box(rect_img)
-                self.regionSelected.emit(QRect(rect_img))
+                if self._sel_kind == "pos":
+                    self._set_examples(self._ex_pos + [rect_img], self._ex_neg)
+                    self.examplesChanged.emit(len(self._ex_pos), len(self._ex_neg))
+                elif self._sel_kind == "neg":
+                    self._set_examples(self._ex_pos, self._ex_neg + [rect_img])
+                    self.examplesChanged.emit(len(self._ex_pos), len(self._ex_neg))
+                else:
+                    # A plain rectangle clears any prior rectilinear polygon/mask
+                    # and starts a new example set.
+                    self._sel_polygon = None
+                    self._selection_mask = None
+                    self._template_rect = rect_img
+                    self._set_examples([], [])
+                    if self._overlay is not None:
+                        self._overlay.set_source_box(rect_img)
+                    self.regionSelected.emit(QRect(rect_img))
             e.accept()
             return
 
