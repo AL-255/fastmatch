@@ -237,21 +237,87 @@ def _greedy_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thr: float) -> to
     return torch.stack(keep)
 
 
+def _grid_greedy_order(
+    x1: list[float], y1: list[float], x2: list[float], y2: list[float],
+    order: list[int], iou_thr: float,
+) -> list[int]:
+    """Greedy IoU NMS over boxes visited in ``order``, with a uniform-grid index.
+
+    Same result as :func:`_greedy_nms`: a box is kept iff its IoU with every
+    previously kept box is ``<= iou_thr``. But a box is only tested against the
+    kept boxes in the 3x3 grid cells around it instead of against every other
+    candidate, which makes it ~O(N) rather than O(kept x N). Cells are as large as
+    the largest box, so two intersecting boxes (the only pairs with IoU > 0) are
+    at most one cell apart. A chip image with 100k repeated cells otherwise spent
+    over ten minutes in the quadratic greedy loop after the search reached 100%.
+    """
+    n = len(order)
+    if n == 0:
+        return []
+    if iou_thr < 0.0:  # every pair (even disjoint) suppresses: only the top box survives
+        return [order[0]]
+    cell = max(1.0, max(b - a for a, b in zip(x1, x2)), max(b - a for a, b in zip(y1, y2)))
+    area = [max(0.0, b - a) * max(0.0, d - c) for a, b, c, d in zip(x1, x2, y1, y2)]
+    grid: dict[tuple[int, int], list[int]] = {}
+    kept: list[int] = []
+    for i in order:
+        ax1, ay1, ax2, ay2, aa = x1[i], y1[i], x2[i], y2[i], area[i]
+        gx, gy = int(ax1 // cell), int(ay1 // cell)
+        suppressed = False
+        for nx in (gx - 1, gx, gx + 1):
+            for ny in (gy - 1, gy, gy + 1):
+                for j in grid.get((nx, ny), ()):
+                    iw = min(ax2, x2[j]) - max(ax1, x1[j])
+                    if iw <= 0.0:
+                        continue
+                    ih = min(ay2, y2[j]) - max(ay1, y1[j])
+                    if ih <= 0.0:
+                        continue
+                    inter = iw * ih
+                    if inter / max(aa + area[j] - inter, 1e-9) > iou_thr:
+                        suppressed = True
+                        break
+                if suppressed:
+                    break
+            if suppressed:
+                break
+        if not suppressed:
+            kept.append(i)
+            grid.setdefault((gx, gy), []).append(i)
+    return kept
+
+
+def _grid_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thr: float) -> torch.Tensor:
+    """:func:`_greedy_nms` semantics on tensors, via :func:`_grid_greedy_order`."""
+    if boxes.numel() == 0:
+        return torch.empty(0, dtype=torch.long)
+    order = torch.argsort(scores, descending=True)
+    b = boxes.detach().to("cpu", torch.float64)
+    keep = _grid_greedy_order(
+        b[:, 0].tolist(), b[:, 1].tolist(), b[:, 2].tolist(), b[:, 3].tolist(),
+        order.tolist(), float(iou_thr),
+    )
+    return torch.tensor(keep, dtype=torch.long)
+
+
+#: Above this many candidates torchvision's NMS is also quadratic (its CPU loop,
+#: and an N x N/64 suppression bitmask on the GPU), so the grid NMS takes over.
+_TV_NMS_MAX = 8192
+
+
 def _run_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thr: float) -> torch.Tensor:
-    """Dispatch to torchvision NMS if available, else the bundled greedy NMS."""
+    """Dispatch to torchvision NMS for small inputs, else the bundled grid NMS."""
     if boxes.numel() == 0:
         return torch.empty(0, dtype=torch.long, device=boxes.device)
-    if _HAVE_TV_NMS:
+    if _HAVE_TV_NMS and boxes.shape[0] <= _TV_NMS_MAX:
         # torchvision.ops.nms wants float boxes/scores and returns sorted-desc
         # kept indices — identical contract to our fallback. Fused CUDA kernel,
         # so it runs in-place on the GPU.
         return _tv_nms(boxes.float(), scores.float(), float(iou_thr))
-    # Pure-torch fallback. The greedy loop is sequential with tiny per-step work
-    # — the worst case for a GPU (per-iteration kernel-launch latency dominates).
-    # Running it on the CPU over the (small) candidate set and shipping the kept
-    # indices back is dramatically faster for CUDA inputs, and a no-op transfer
-    # for CPU inputs (so the CPU path — what the tests pin — is unchanged).
-    keep = _greedy_nms(boxes.detach().to("cpu"), scores.detach().to("cpu"), iou_thr)
+    # Bundled fallback. Greedy NMS is sequential with tiny per-step work — the
+    # worst case for a GPU — so it runs on the CPU and ships the kept indices back.
+    # The grid index keeps it near-linear when there are 100k+ repeated matches.
+    keep = _grid_nms(boxes, scores, iou_thr)
     return keep.to(boxes.device)
 
 
@@ -757,19 +823,21 @@ class Matcher:
         higher-scoring box exceeds ``nms_iou`` (so the best-scoring orientation wins
         per location, carrying its tag), then cap at ``max_results``. Box IoU is
         orientation-agnostic, so an R0 and an R180 fit of the same instance overlap
-        and collapse to one. Pure python (runs on the small, post-finalize list).
+        and collapse to one. Uses the grid-indexed greedy NMS, so it stays fast
+        when each orientation returns tens of thousands of matches.
         """
         if not pooled:
             return []
         ordered = sorted(pooled, key=lambda m: m.score, reverse=True)
-        kept: list[Match] = []
-        nms_iou = float(params.nms_iou)
-        for m in ordered:
-            if all(_match_iou(m, k) <= nms_iou for k in kept):
-                kept.append(m)
-            if len(kept) >= params.max_results:
-                break
-        return kept
+        keep = _grid_greedy_order(
+            [float(m.x) for m in ordered],
+            [float(m.y) for m in ordered],
+            [float(m.x + m.w) for m in ordered],
+            [float(m.y + m.h) for m in ordered],
+            list(range(len(ordered))),
+            float(params.nms_iou),
+        )
+        return [ordered[i] for i in keep[: params.max_results]]
 
     # -- template preparation / validation -----------------------------------
 
