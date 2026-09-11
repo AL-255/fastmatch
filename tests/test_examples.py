@@ -200,3 +200,64 @@ def test_shift_and_ctrl_drags_add_examples_and_research(qapp):
         assert view.examples() == ([], []) and not w._act_clear_examples.isEnabled()
     finally:
         w.close()
+
+
+def _window(qapp, img):
+    from PySide6.QtWidgets import QRubberBand
+    from fastmatch.app import MainWindow
+    w = MainWindow(_doc(img), device="cpu")
+    w._viewport.setViewport(QWidget())
+    w._viewport._rubber = QRubberBand(QRubberBand.Shape.Rectangle, w._viewport.viewport())
+    w.resize(1600, 1000)
+    w.show()
+    qapp.processEvents()
+    w._viewport.fit_in_view()
+    w._auto_run = False  # these tests exercise the example bookkeeping only
+    return w
+
+
+def _centre(r):
+    return QPointF(r[0] + r[2] / 2, r[1] + r[3] / 2)
+
+
+def test_numbered_examples_can_be_deleted_one_by_one(qapp):
+    img, targets, decoys = _scene()
+    w = _window(qapp, img)
+    try:
+        view = w._viewport
+        sel = QRect(targets[0][0], targets[0][1], S, S)
+        view.set_template_rect(sel)
+        w._on_region_selected(sel)
+        pos = [QRect(x, y, S, S) for x, y in targets[1:4]]   # examples #2, #3, #4
+        neg = [QRect(x, y, S, S) for x, y in decoys[:2]]     # ×1, ×2
+        view._set_examples(pos, neg)
+        # Hit testing follows the on-screen numbering.
+        assert view.example_at(_centre(targets[0] + (S, S))) == ("pos", 1)
+        assert view.example_at(_centre(targets[2] + (S, S))) == ("pos", 3)
+        assert view.example_at(_centre(decoys[1] + (S, S))) == ("neg", 2)
+        assert view.example_at(QPointF(1, 1)) is None
+        # Delete #3: #4 becomes #3.
+        view.remove_example("pos", 3)
+        assert view.examples()[0] == [(*targets[1], S, S), (*targets[3], S, S)]
+        assert view.example_at(_centre(targets[3] + (S, S))) == ("pos", 3)
+        # Delete negative ×1 through the right-click menu (first action).
+        w._exec_menu = lambda menu, _pos: menu.actions()[0]
+        w._on_example_menu("neg", 1, QPointF(0, 0).toPoint())
+        assert view.examples()[1] == [(*decoys[1], S, S)]
+        assert "2" in w._examples_label.text() or "3" in w._examples_label.text()
+        # Delete #1 (the selection): #2 is promoted to be the selection.
+        view.remove_example("pos", 1)
+        assert view.template_rect() == QRect(targets[1][0], targets[1][1], S, S)
+        assert w._last_rect == view.template_rect()
+        assert view.examples() == ([(*targets[3], S, S)], [(*decoys[1], S, S)])
+        view.viewport().grab()  # numbered tags paint without error
+        # Down to the selection alone, deleting it clears the whole selection.
+        view.remove_example("pos", 2)
+        view.remove_example("neg", 1)
+        assert view.example_at(_centre(targets[1] + (S, S))) is None  # unnumbered now
+        view._set_examples([], [QRect(decoys[0][0], decoys[0][1], S, S)])
+        view.remove_example("pos", 1)
+        assert view.template_rect() is None and w._last_rect is None
+        assert view.examples() == ([], [])
+    finally:
+        w.close()

@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QToolBar,
@@ -62,7 +63,7 @@ _RECENT_MAX = 10
 _SELECT_TOOLTIP = (
     "Toggle between Select (draw region) and Pan (drag to move). While selecting: "
     "Shift+drag adds another example of the same structure, Ctrl+drag marks "
-    "something that must not match."
+    "something that must not match. Right-click a numbered example to delete it."
 )
 
 
@@ -573,8 +574,11 @@ class MainWindow(QMainWindow):
         self._viewport.measurePicked.connect(self._on_measure_picked)
         # Focus mode (Space): show a left-aligned status-bar hint while active.
         self._viewport.focusModeChanged.connect(self._on_focus_mode_changed)
-        # Multi-example search: Shift/Ctrl+drag example boxes.
+        # Multi-example search: Shift/Ctrl+drag example boxes; right-click one
+        # to delete it.
         self._viewport.examplesChanged.connect(self._on_examples_changed)
+        self._viewport.exampleMenuRequested.connect(self._on_example_menu)
+        self._viewport.selectionRemoved.connect(self._on_clear_matches)
 
         # Controller results / state. With no image at startup there is no
         # controller yet; _install_new_controller wires these when one is opened.
@@ -967,6 +971,24 @@ class MainWindow(QMainWindow):
             self._request_search()
         else:
             self.statusBar().showMessage("Selection set — press Run to search.", 4000)
+
+    def _on_example_menu(self, kind: str, number: int, global_pos) -> None:
+        """Right-click menu on a numbered example box: delete it, or all."""
+        menu = QMenu(self)
+        text = (f"Delete example #{number}" if kind == "pos"
+                else f"Delete negative example ×{number}")
+        act_delete = menu.addAction(text)
+        act_all = menu.addAction("Clear examples")
+        chosen = self._exec_menu(menu, global_pos)
+        if chosen is act_delete:
+            self._viewport.remove_example(kind, number)
+        elif chosen is act_all:
+            self._viewport.clear_examples()
+
+    @staticmethod
+    def _exec_menu(menu: "QMenu", global_pos):
+        """``menu.exec`` (a seam so tests can pick an action without a modal loop)."""
+        return menu.exec(global_pos)
 
     def _update_examples_label(self) -> None:
         pos, neg = self._viewport.examples()

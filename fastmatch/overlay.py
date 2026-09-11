@@ -288,6 +288,39 @@ class MatchOverlayItem(QGraphicsItem):
             ):
                 _draw_boxes([QRectF(sb)], _SOURCE_COLOR)
 
+        # Number the examples (the selection is positive #1) so a specific one
+        # can be picked out and deleted from its right-click menu.
+        if self._example_pos or self._example_neg:
+            tags: list[tuple[QRectF, str, QColor]] = []
+            if sb is not None and not sb.isNull():
+                tags.append((QRectF(sb), "1", _SOURCE_COLOR))
+            tags += [(r, str(i + 2), _SOURCE_COLOR) for i, r in enumerate(self._example_pos)]
+            tags += [(r, f"×{i + 1}", _NEGATIVE_COLOR) for i, r in enumerate(self._example_neg)]
+            self._draw_tags(painter, tags)
+
+        painter.restore()
+
+    @staticmethod
+    def _draw_tags(painter, tags: "list[tuple[QRectF, str, QColor]]") -> None:
+        """Draw each label just above its box's top-left corner, in device px
+        (constant on-screen size at any zoom), on a dark plate for contrast."""
+        xf = painter.worldTransform()
+        painter.save()
+        painter.resetTransform()
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        fm = painter.fontMetrics()
+        for rect, text, color in tags:
+            anchor = xf.map(rect.topLeft())
+            plate = fm.boundingRect(text).adjusted(-3, -1, 3, 1)
+            y = int(anchor.y()) - plate.height() - 1
+            if y < 0:  # no room above (image top edge): hang it below the box
+                y = int(xf.map(rect.bottomLeft()).y()) + 1
+            plate.moveTo(int(anchor.x()), y)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 180))
+            painter.drawRect(plate)
+            painter.setPen(color)
+            painter.drawText(plate, Qt.AlignmentFlag.AlignCenter, text)
         painter.restore()
 
 

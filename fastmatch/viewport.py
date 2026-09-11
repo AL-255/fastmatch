@@ -263,6 +263,10 @@ class ImageViewport(QGraphicsView):
     viewChanged = Signal(QRect)           # visible image-px rect (prefetch hint)
     focusModeChanged = Signal(bool)       # focus/spotlight mode toggled (Space)
     examplesChanged = Signal(int, int)    # (extra positives, negatives) after a Shift/Ctrl drag
+    # Right-click on a numbered example box: ("pos" | "neg", its number, global
+    # pos). Positives are numbered from 1 (the selection itself); negatives too.
+    exampleMenuRequested = Signal(str, int, QPoint)
+    selectionRemoved = Signal()           # the last positive (the selection) was deleted
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -546,6 +550,66 @@ class ImageViewport(QGraphicsView):
         self._ex_pos, self._ex_neg = list(pos), list(neg)
         if self._overlay is not None:
             self._overlay.set_examples(self._ex_pos, self._ex_neg)
+
+    def example_at(self, scene_pt: QPointF) -> "tuple[str, int] | None":
+        """The numbered example box under ``scene_pt`` as ``(kind, number)``.
+
+        Positive #1 is the selection itself (only numbered while there are other
+        examples). When boxes overlap, the smallest one under the point wins.
+        """
+        hits: list[tuple[int, str, int]] = []
+        for i, r in enumerate(self._ex_neg):
+            if QRectF(r).contains(scene_pt):
+                hits.append((r.width() * r.height(), "neg", i + 1))
+        for i, r in enumerate(self._ex_pos):
+            if QRectF(r).contains(scene_pt):
+                hits.append((r.width() * r.height(), "pos", i + 2))
+        t = self._template_rect
+        if t is not None and (self._ex_pos or self._ex_neg) and QRectF(t).contains(scene_pt):
+            hits.append((t.width() * t.height(), "pos", 1))
+        if not hits:
+            return None
+        _, kind, number = min(hits)
+        return kind, number
+
+    def remove_example(self, kind: str, number: int) -> None:
+        """Delete example ``number`` (1-based, as labelled) of ``kind``.
+
+        Deleting positive #1 (the selection) promotes #2 to be the selection;
+        with no other positive left the whole selection is cleared.
+        """
+        if kind == "neg":
+            del self._ex_neg[number - 1]
+        elif number >= 2:
+            del self._ex_pos[number - 2]
+        elif self._ex_pos:
+            promoted = self._ex_pos.pop(0)
+            self._reset_rectilinear_state()
+            self._sel_polygon = None
+            self._selection_mask = None
+            self._template_rect = QRect(promoted)
+            self._set_examples(self._ex_pos, self._ex_neg)
+            if self._overlay is not None:
+                self._overlay.set_source_box(QRect(promoted))
+            self.viewport().update()
+            self.regionSelected.emit(QRect(promoted))
+            return
+        else:
+            self.clear_template()
+            self.selectionRemoved.emit()
+            return
+        self._set_examples(self._ex_pos, self._ex_neg)
+        self.examplesChanged.emit(len(self._ex_pos), len(self._ex_neg))
+
+    def contextMenuEvent(self, e) -> None:
+        """Right-click on a numbered example box offers to delete it."""
+        if self._doc is not None and not self._selecting:
+            hit = self.example_at(self.mapToScene(e.pos()))
+            if hit is not None:
+                self.exampleMenuRequested.emit(hit[0], hit[1], e.globalPos())
+                e.accept()
+                return
+        super().contextMenuEvent(e)
 
     def set_template_rect(self, rect: QRect | None) -> None:
         """Set the template selection + its highlighted (blue) source box.
