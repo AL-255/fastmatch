@@ -394,7 +394,9 @@ def _grid_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thr: float) -> torc
     if boxes.numel() == 0:
         return torch.empty(0, dtype=torch.long)
     order = torch.argsort(scores, descending=True)
-    b = boxes.detach().to("cpu", torch.float64).numpy()
+    # MPS cannot cast to float64, even when a combined .to() also requests CPU.
+    # Transfer first, then convert on the CPU for precise IoU arithmetic.
+    b = boxes.detach().cpu().to(torch.float64).numpy()
     keep = _greedy_order(b[:, 0], b[:, 1], b[:, 2], b[:, 3], order.cpu().numpy(), float(iou_thr))
     return torch.as_tensor(keep, dtype=torch.long)
 
@@ -2647,7 +2649,9 @@ class Matcher:
 
         # Move to CPU once, build the plain-data Match list (no tensors cross out).
         boxes_c = boxes.cpu().numpy()
-        scores_c = scores.cpu().numpy()
+        # Different FFT/vectorization backends can overshoot 1 by a few ulps.
+        # Preserve score ordering for NMS, but honor the public [0, 1] contract.
+        scores_c = scores.cpu().clamp(0.0, 1.0).numpy()
         scale_c = scale.cpu().numpy()
 
         # Round on the arrays, then build the Matches from plain python lists:
