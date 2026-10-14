@@ -114,6 +114,28 @@ def test_grayscale_semantic_search_converts_only_windows(monkeypatch):
     assert len(hits) == 3
 
 
+def test_frozen_models_prefer_complete_user_cache_then_bundle(tmp_path, monkeypatch):
+    import sys
+    from fastmatch.semantic_matcher import model_directory
+
+    bundled = tmp_path / "bundle" / "models" / "dinov2-small"
+    bundled.mkdir(parents=True)
+    (bundled / "model.safetensors").write_bytes(b"bundled")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.delenv("FASTMATCH_SEMANTIC_MODEL", raising=False)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path / "bundle"), raising=False)
+    monkeypatch.setattr("fastmatch.semantic_matcher.user_model_directory", lambda: cache)
+    assert model_directory() == bundled
+    (cache / "model.safetensors").write_bytes(b"partial")
+    assert model_directory() == bundled
+    (cache / "config.json").write_text('{}')
+    assert model_directory() == cache
+    monkeypatch.setenv("FASTMATCH_SEMANTIC_MODEL", str(tmp_path / "override"))
+    assert model_directory() == tmp_path / "override"
+
+
 @pytest.mark.skipif(os.environ.get("FASTMATCH_TEST_SEMANTIC_MODEL") != "1",
                     reason="opt-in smoke with locally downloaded pretrained weights")
 def test_pretrained_dinov2_offline_embeddings():

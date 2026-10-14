@@ -1,65 +1,26 @@
-# FastMatch runtime dependencies.
+# FastMatch source runtime (Python 3.13).
+# Install your intended PyTorch runtime FIRST, then this file. PyPI's default
+# torch wheel varies by platform; using an explicit index avoids ambiguity.
 #
-# Install everything for the CPU quickstart with:
-#     pip install -r requirements.txt
-#
-# Tested on Python 3.13.
-
+# CPU (macOS also includes Apple MPS):
+#   pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+# NVIDIA CUDA 12.8:
+#   pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+# AMD ROCm 7.2 (Linux):
+#   pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/rocm7.2
+# When replacing an installed runtime, add --force-reinstall.
+# Availability plus a real canary kernel determine whether GPU execution is
+# usable; unsupported drivers/hardware fall back to CPU at launch.
 PySide6==6.11.*
 numpy>=2.4
 Pillow>=12.1
-
-# ---------------------------------------------------------------------------
-# PyTorch — read this before relying on `pip install -r requirements.txt`.
-# ---------------------------------------------------------------------------
-# (a) A plain `pip install` (what the line below does) pulls the CPU-only
-#     wheel from PyPI. FastMatch runs correctly on it — every code path,
-#     including the engine, is device-agnostic and falls back to CPU — it is
-#     just slower for large searches. No GPU is required to use the app.
-#
-# (b) For the RTX 5060 / Blackwell (compute capability sm_120) GPU, the PyPI
-#     wheel ships NO sm_120 kernels: `torch.cuda.is_available()` may report
-#     True, yet the first real kernel raises
-#         CUDA error: no kernel image is available for execution
-#     (FastMatch detects this with a launch-time canary and auto-falls back to
-#     CPU). To get true GPU acceleration you must install a CUDA build from the
-#     PyTorch CUDA index *separately*, AFTER installing this file:
-#
-#         pip install torch --index-url https://download.pytorch.org/whl/cu128
-#
-#     If cu128 is unavailable for your platform, cu129 is an alternative:
-#
-#         pip install torch --index-url https://download.pytorch.org/whl/cu129
-#
-#     Verify the GPU build is active with:
-#
-#         python -c "import torch; print(torch.cuda.is_available())"
-#
-#     This prints `True` on a working CUDA build and `False` on the CPU build.
-#
-# The `pip install -r requirements.txt` default deliberately requests the CPU
-# wheel so a fresh checkout always works without a GPU.
 torch>=2.11
 
-# torchvision is OPTIONAL — not required, not installed by this file. The
-# engine uses `torchvision.ops.nms` for a faster non-maximum suppression when
-# importable, and otherwise ships a pure-torch NMS fallback that produces
-# identical results. Install it only if you want the faster path:
-#     pip install torchvision   (match the torch build / CUDA index used above)
-
-# ---------------------------------------------------------------------------
-# OpenCV — powers strict feature matching and fuzzy instance retrieval.
-# ---------------------------------------------------------------------------
-# The convolution methods (ncc / ssd / ccorr) never import cv2; only the
-# `method="features"` path (ORB keypoints + RANSAC homography, for rotated /
-# scaled / warped instances), and fuzzy RootSIFT retrieval use it. If cv2 is absent the feature methods raise
-# a documented RuntimeError and the UI greys the option out — the rest of the
-# app is unaffected.
-#
-# Use the `-headless` build: it omits OpenCV's own Qt/GUI backend, which would
-# otherwise ship a second set of Qt plugins that clash with PySide6's at import
-# time (duplicate `xcb`/platform plugins, `QApplication`-already-running errors).
+# torchvision is optional (faster NMS); a pure-torch fallback is included.
+# OpenCV supports strict feature matching and fuzzy RootSIFT retrieval.
+# Its headless build avoids bundling a second Qt GUI implementation.
 opencv-python-headless>=4.13
 
-# Semantic similarity is optional: install requirements-semantic.txt and run
-# python -m fastmatch --download-semantic-model once to enable offline DINOv2.
+# Semantic search: install requirements-semantic.txt and explicitly download
+# the model once with python -m fastmatch --download-semantic-model.
+# Standalone releases bundle both the semantic dependencies and model weights.

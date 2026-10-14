@@ -394,7 +394,9 @@ def _grid_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thr: float) -> torc
     if boxes.numel() == 0:
         return torch.empty(0, dtype=torch.long)
     order = torch.argsort(scores, descending=True)
-    b = boxes.detach().to("cpu", torch.float64).numpy()
+    # MPS cannot cast to float64, even when a combined .to() also requests CPU.
+    # Transfer first, then convert on the CPU for precise IoU arithmetic.
+    b = boxes.detach().cpu().to(torch.float64).numpy()
     keep = _greedy_order(b[:, 0], b[:, 1], b[:, 2], b[:, 3], order.cpu().numpy(), float(iou_thr))
     return torch.as_tensor(keep, dtype=torch.long)
 
@@ -1846,6 +1848,9 @@ class Matcher:
         if self._forced_core_tile is not None:
             return max(1, int(self._forced_core_tile))
 
+        if self._device.type == "mps":
+            return 512  # conservative shared-memory tiles, cancellable between slabs
+
         if self._device.type == "cuda":
             try:
                 free, _ = torch.cuda.mem_get_info()
@@ -1884,6 +1889,8 @@ class Matcher:
         many coarse candidates refines in several passes instead of OOM-/cuFFT-
         failing onto the slow full-resolution search. CPU runs in a single pass.
         """
+        if self._device.type == "mps":
+            return 16
         if self._device.type != "cuda":
             return 1 << 30  # effectively "no chunking" on CPU
         try:
@@ -1941,6 +1948,9 @@ class Matcher:
 
     def _cross_backend(self, sth: int, stw: int) -> str:
         """Resolve the cross-correlation backend for a template size (§D.2)."""
+        if self._device.type == "mps":
+            # Avoid complex FFT tensors on Metal; score using native conv2d.
+            return "spatial"
         if self._conv_backend == "spatial":
             return "spatial"
         if self._conv_backend == "fft":
@@ -2639,7 +2649,9 @@ class Matcher:
 
         # Move to CPU once, build the plain-data Match list (no tensors cross out).
         boxes_c = boxes.cpu().numpy()
-        scores_c = scores.cpu().numpy()
+        # Different FFT/vectorization backends can overshoot 1 by a few ulps.
+        # Preserve score ordering for NMS, but honor the public [0, 1] contract.
+        scores_c = scores.cpu().clamp(0.0, 1.0).numpy()
         scale_c = scale.cpu().numpy()
 
         # Round on the arrays, then build the Matches from plain python lists:

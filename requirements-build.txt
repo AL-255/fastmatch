@@ -1,0 +1,13 @@
+# Reproduce the runtime that was validated before release. Install the desired
+# torch wheel from its CPU/CUDA/ROCm index FIRST; this constraint preserves it.
+torch==2.11.0
+PySide6==6.11.1
+numpy==2.4.6
+Pillow==12.1.0
+opencv-python-headless==4.13.0.92
+transformers==5.13.1
+huggingface-hub==1.23.0
+safetensors==0.8.0
+PyInstaller==6.22.3
+pyinstaller-hooks-contrib==2026.8
+pytest==9.0.3

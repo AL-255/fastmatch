@@ -96,7 +96,7 @@ class MainWindow(QMainWindow):
         # Resolve the device once for the banner + the params panel. The
         # controller resolves it again internally for the engine; both go through
         # the same canary-gated resolve_device, so they agree.
-        self._device_pref = device
+        self._device_pref = "cuda" if device == "rocm" else device
         self._resolved_device = resolve_device(device)
 
         # Seed params so the first request is well-formed AND carries the device
@@ -522,13 +522,17 @@ class MainWindow(QMainWindow):
         self._engine_group.setExclusive(True)
 
         cuda_available = resolve_device("cuda").type == "cuda"
+        mps_available = resolve_device("mps").type == "mps"
+        cuda_label = "&ROCm (AMD GPU)" if gpu_backend() == "rocm" else "&CUDA (NVIDIA GPU)"
         # (preference-string, label, tooltip, enabled).
         specs = (
             ("auto", "&Auto (prefer GPU)",
              "Use the GPU when available, otherwise fall back to the CPU."),
-            ("cuda", "&CUDA (GPU)",
-             "Force the CUDA GPU backend." if cuda_available
-             else "No working CUDA device was detected on this machine."),
+            ("cuda", cuda_label,
+             "Use the installed CUDA/ROCm GPU backend." if cuda_available
+             else "No working CUDA/ROCm device was detected on this machine."),
+            ("mps", "&MPS (Apple GPU)",
+             "Use the Apple GPU." if mps_available else "No working Apple MPS device was detected."),
             ("cpu", "C&PU",
              "Force the CPU backend (slower, but always available)."),
         )
@@ -537,6 +541,8 @@ class MainWindow(QMainWindow):
             act = QAction(label, self, checkable=True)
             act.setToolTip(tip)
             if key == "cuda" and not cuda_available:
+                act.setEnabled(False)
+            if key == "mps" and not mps_available:
                 act.setEnabled(False)
             act.setChecked(key == self._device_pref)
             act.triggered.connect(lambda _checked, k=key: self._on_select_engine(k))

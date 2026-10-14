@@ -11,7 +11,8 @@ FastMatch 是一个基于 PySide6 的单进程桌面应用，用于浏览**十�
 默认匹配算法为**归一化互相关（NCC）**，也可以在下拉菜单中选择其他**匹配方法**：
 SSD 适用于平坦或纹理较少的区域，CCORR 提供另一种相关性度量，特征匹配则适用于
 旋转、缩放或变形后的实例（参见[匹配方法](#匹配方法)）。
-相关性匹配方法基于 PyTorch；安装合适的 CUDA 构建版本后会使用 GPU，否则自动回退到 CPU。
+相关性匹配方法基于 PyTorch，支持 NVIDIA CUDA、AMD ROCm 和 Apple MPS；
+加速器不可用时会回退到 CPU。
 如果需要类似图像搜索引擎的相似性搜索，可选择 **Fuzzy instance search**（模糊实例搜索）
 查找外观改变的副本，或选择 **Semantic similarity**（语义相似度）查找视觉上相关的对象。
 参见[模糊与语义搜索](#模糊与语义搜索)。
@@ -19,6 +20,42 @@ SSD 适用于平坦或纹理较少的区域，CCORR 提供另一种相关性度�
 ---
 
 ## 安装
+
+### 下载可执行程序
+
+带版本标签的提交会在 [GitHub Releases](https://github.com/AL-255/fastmatch/releases)
+生成独立应用。解压后运行应用无需安装 Python。
+
+| 平台 | 构建版本 |
+|---|---|
+| Windows x64 | CPU、NVIDIA CUDA 12.8 |
+| Linux x64（Ubuntu 22.04 或更新版本 / 兼容的桌面系统） | CPU、NVIDIA CUDA 12.8、AMD ROCm 7.2 |
+| macOS Apple Silicon | Apple MPS GPU，不可用时回退到 CPU |
+
+选择适合硬件的版本，解压并保留完整文件夹。Windows 启动 `FastMatch.exe`，
+macOS 启动 `FastMatch.app`，Linux 启动 `FastMatch/FastMatch`。
+**Auto** 自动选择可用的加速器；**Engine** 菜单也提供 CPU、CUDA/ROCm 和 Apple MPS。
+CUDA/ROCm 版本需要兼容的 GPU 驱动。macOS 版本采用临时签名，尚未公证；Windows 版本未签名。
+语义模型已包含在应用中，可离线使用。
+
+较大的 GPU 压缩包会分为 `.part001`、`.part002` 等文件。
+请将所选版本的**全部**分片及 `.parts.json` 清单下载到同一文件夹。
+发布页面提供合并分片并验证 SHA256 的脚本：
+
+```bash
+python assemble_release.py FastMatch-vX.Y.Z-linux-x64-rocm7.2.tar.gz.parts.json
+```
+
+Windows 可使用 PowerShell 脚本，无需 Python：
+
+```powershell
+./assemble_release.ps1 -Manifest FastMatch-vX.Y.Z-windows-x64-cuda-cu128.zip.parts.json
+```
+
+合并后再解压。每个构建还附带 `.sha256` 校验文件和打包应用的冒烟测试报告。
+本地构建及版本标签触发的工作流程参见[发布构建](docs/RELEASING.md)。
+
+### 从源码运行
 
 FastMatch 需要 PySide6、NumPy、Pillow 和 PyTorch。**torchvision 是可选依赖**
 （仅用于稍快一些的非极大值抑制；引擎自带纯 PyTorch 实现作为备用），
@@ -29,22 +66,21 @@ FastMatch 需要 PySide6、NumPy、Pillow 和 PyTorch。**torchvision 是可选�
 ### CPU 快速安装
 
 ```bash
+pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
 ```
 
-此命令会安装全部依赖，包括**仅支持 CPU** 的 PyTorch wheel 包。
+先从 PyTorch CPU 索引安装，可以在 Windows/Linux 上明确选择**仅支持 CPU** 的运行时
+（macOS wheel 也包含 MPS 支持），再安装其他依赖。
 应用在 CPU 上具备完整功能，所有代码路径均兼容不同计算设备，只是在大规模多尺度搜索时速度较慢。
 
 ### GPU 升级（CUDA / cu128）
 
-PyPI 上的 PyTorch wheel 包**不包含 sm_120（Blackwell，例如 RTX 5060）的内核**，
-因此即使 `torch.cuda.is_available()` 返回 `True`，第一次执行实际内核时也会失败。
-要启用 GPU 加速，请在完成上述快速安装**之后**，从 PyTorch CUDA 索引安装 CUDA 构建版本：
+如需 NVIDIA 加速，请将 CPU 运行时替换为已测试的 CUDA 12.8 版本。
+CUDA 可用标志不能单独保证驱动和 GPU 架构兼容；FastMatch 启动时还会执行探测内核。
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu128
-# 如果你的平台无法使用 cu128，可以尝试 cu129：
-# pip install torch --index-url https://download.pytorch.org/whl/cu129
+pip install --force-reinstall torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
 验证 GPU 构建版本是否已启用：
@@ -59,6 +95,13 @@ python -c "import torch; print(torch.cuda.is_available())"
 
 FastMatch 会在运行时通过 `torch.cuda.is_available()` 和启动时的**探测内核**共同检测设备。
 如果 CUDA wheel 包损坏或不匹配，应用会自动回退到 CPU，避免崩溃。
+
+Linux 上的 AMD GPU 可安装 ROCm 运行时。Apple Silicon 使用普通 macOS PyTorch
+wheel 中的 MPS 支持，并通过独立的探测内核检查：
+
+```bash
+pip install --force-reinstall torch==2.11.0 --index-url https://download.pytorch.org/whl/rocm7.2
+```
 
 ---
 
@@ -76,14 +119,17 @@ python -m fastmatch
 python -m fastmatch --generate-sample sample.png --w 12000 --h 12000
 python -m fastmatch sample.png
 
-# 指定计算设备（默认为 "auto"：CUDA 可用时使用 CUDA，否则使用 CPU）
+# 指定设备（auto 依次尝试 CUDA/ROCm、Apple MPS、CPU）
 python -m fastmatch path/to/image.png --device cpu
 python -m fastmatch path/to/image.png --device cuda
+python -m fastmatch path/to/image.png --device rocm
+python -m fastmatch path/to/image.png --device mps
 python -m fastmatch path/to/image.png --device auto
 ```
 
 不提供图像路径时，FastMatch 会显示**空白画布**（不会自动生成演示图像），
-可通过 *File ▸ Open Image…* 加载图像。`--device` 接受 `auto`、`cuda` 或 `cpu`。
+可通过 *File ▸ Open Image…* 加载图像。`--device` 接受 `auto`、`cuda`、`rocm`、`mps` 或 `cpu`。
+CUDA/ROCm 和 Apple MPS 均通过实际内核探测后启用；不可用的加速器会回退到 CPU。
 即使指定 `cuda`，探测内核失败时仍会回退到 CPU。
 `--generate-sample <path>` 会生成包含一组已知图案的合成图像并退出
 （默认尺寸为 `12000x12000`，可通过 `--w` / `--h` 修改）；需要另行加载该文件进行搜索。
@@ -105,7 +151,7 @@ python -m fastmatch path/to/image.png --device auto
 | **Rotation / Flipping 复选框** | 额外搜索模板的 90° 整数倍旋转和/或镜像版本。修改任一选项都会**重新搜索**。参见[方向搜索](#方向搜索)。 |
 | **Threshold 滑块** | **实时筛选**显示结果，无需重新搜索，适用于所有方法。 |
 | **View ▸ Match boxes 菜单** | 配置匹配框轮廓：**Line width**（线宽，1–6 像素，不随缩放变化）和 **XOR with background**（对背景进行异或反色，使轮廓在任何背景上都清晰可见）。 |
-| **Engine 菜单** | 随时切换计算后端：**Auto (prefer GPU)**、**CUDA (GPU)** 或 **CPU**。未检测到可用 GPU 时，CUDA 选项置灰。切换会在新设备上重建引擎、更新状态提示、重新判断是否启用仅限 GPU 的多尺度搜索，并重新搜索当前选区。 |
+| **Engine 菜单** | 切换 **Auto (prefer GPU)**、按已安装运行时显示的 **CUDA (NVIDIA GPU)** 或 **ROCm (AMD GPU)**、**MPS (Apple GPU)** 和 **CPU**。不可用的加速器会置灰。切换会重建引擎、更新状态提示和多尺度控制项，并重新搜索当前选区。 |
 | **Theme 菜单** | 切换外观：**System**（跟随桌面）、**Light** 或 **Dark**。界面和图像画布会立即更新主题，并记住选择供下次启动使用。 |
 | **Tools 菜单** | **Calibrate scale**（标定比例）和 **Measure distance**（以物理单位测量距离）。参见[测量与标定](#测量与标定)。 |
 | **Add to Memory** | 将当前选区及全部当前匹配结果保存为 Memory 列表中的条目。参见[匹配结果存档（Memory）](#匹配结果存档memory)。 |

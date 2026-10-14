@@ -12,6 +12,7 @@ from collections import OrderedDict
 from importlib.util import find_spec
 import os
 from pathlib import Path
+import sys
 
 import numpy as np
 from PIL import Image
@@ -26,7 +27,26 @@ SETUP_HINT = "pip install -r requirements-semantic.txt && python -m fastmatch --
 
 
 def model_directory() -> Path:
-    return Path(os.environ.get("FASTMATCH_SEMANTIC_MODEL", str(DEFAULT_MODEL_DIR))).expanduser()
+    override = os.environ.get("FASTMATCH_SEMANTIC_MODEL")
+    if override:
+        return Path(override).expanduser()
+    if getattr(sys, "frozen", False):
+        cached = user_model_directory()
+        if (cached / "model.safetensors").is_file() and (cached / "config.json").is_file():
+            return cached
+        bundled = Path(sys._MEIPASS) / "models" / "dinov2-small"
+        return bundled if (bundled / "model.safetensors").is_file() else cached
+    return DEFAULT_MODEL_DIR
+
+
+def user_model_directory() -> Path:
+    if sys.platform == "win32":
+        root = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    elif sys.platform == "darwin":
+        root = Path.home() / "Library" / "Application Support"
+    else:
+        root = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    return root / "FastMatch" / "models" / "dinov2-small"
 
 
 def semantic_available() -> tuple[bool, str]:
@@ -44,7 +64,8 @@ def download_semantic_model(path: str | Path | None = None) -> Path:
         from huggingface_hub import snapshot_download
     except ImportError as exc:
         raise RuntimeError(f"Install semantic dependencies first: {SETUP_HINT}") from exc
-    target = Path(path) if path is not None else model_directory()
+    target = Path(path) if path is not None else (
+        user_model_directory() if getattr(sys, "frozen", False) else model_directory())
     snapshot_download(MODEL_ID, local_dir=str(target), token=False,
                       allow_patterns=["config.json", "model.safetensors", "README.md", "LICENSE"])
     return target.resolve()

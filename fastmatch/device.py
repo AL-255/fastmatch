@@ -33,17 +33,37 @@ def canary_kernel_ok() -> bool:
         return False
 
 
+def mps_canary_kernel_ok() -> bool:
+    """Gate Apple acceleration on real matmul and convolution execution."""
+    try:
+        a = torch.ones(8, 8, device="mps")
+        _ = (a @ a).sum().item()
+        image = a.reshape(1, 1, 8, 8)
+        kernel = torch.ones(1, 1, 3, 3, device="mps")
+        _ = torch.nn.functional.conv2d(image, kernel).sum().item()
+        return True
+    except Exception:
+        return False
+
+
 def resolve_device(pref: str = "auto") -> torch.device:
     """Resolve a usable torch device.
 
     Args:
-        pref: ``"auto"`` (CUDA if usable else CPU), ``"cuda"`` (try CUDA, still
-            fall back to CPU if the canary fails), or ``"cpu"`` (force CPU).
+        pref: ``auto`` tries CUDA/ROCm, then Apple MPS, then CPU. Explicit
+            ``cuda``, ``rocm`` or ``mps`` falls back to CPU if unavailable;
+            ``cpu`` always forces CPU.
     """
+    if pref not in ("auto", "cpu", "cuda", "rocm", "mps"):
+        raise ValueError(f"Unknown device preference: {pref}")
     if pref == "cpu":
         return torch.device("cpu")
-    if torch.cuda.is_available() and canary_kernel_ok():
+    if (pref in ("auto", "cuda", "rocm")
+            and (pref != "rocm" or gpu_backend() == "rocm")
+            and torch.cuda.is_available() and canary_kernel_ok()):
         return torch.device("cuda")
+    if pref in ("auto", "mps") and torch.backends.mps.is_available() and mps_canary_kernel_ok():
+        return torch.device("mps")
     return torch.device("cpu")
 
 
@@ -54,5 +74,7 @@ def device_banner_text(dev: torch.device) -> str:
             name = torch.cuda.get_device_name(dev)
         except Exception:
             name = "CUDA"
-        return f"Engine: CUDA ({name})"
-    return "Engine: CPU (slow) — install the cu128 PyTorch build for GPU acceleration"
+        return f"Engine: {'ROCm' if gpu_backend() == 'rocm' else 'CUDA'} ({name})"
+    if dev.type == "mps":
+        return "Engine: MPS (Apple GPU)"
+    return "Engine: CPU (slow) — use a CUDA, ROCm, or Apple Silicon build for GPU acceleration"
