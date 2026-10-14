@@ -1,5 +1,7 @@
 # FastMatch
 
+[English](README.md) | [简体中文](readme_cn.md)
+
 ![FastMatch](docs/top.png)
 
 FastMatch is a single-process PySide6 desktop app for exploring **gigapixel
