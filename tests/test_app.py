@@ -66,6 +66,7 @@ def window(qapp):
 
 
 CUDA_AVAILABLE = resolve_device("cuda").type == "cuda"
+MPS_AVAILABLE = resolve_device("mps").type == "mps"
 
 
 def _checked_keys(w: MainWindow) -> list[str]:
@@ -75,10 +76,11 @@ def _checked_keys(w: MainWindow) -> list[str]:
 def test_engine_menu_structure(window) -> None:
     """Three exclusive radios; CPU checked at start; CUDA gated on availability."""
     assert window._engine_menu.title() == "&Engine"
-    assert set(window._engine_actions) == {"auto", "cuda", "cpu"}
+    assert set(window._engine_actions) == {"auto", "cuda", "mps", "cpu"}
     assert window._engine_group.isExclusive()
     assert _checked_keys(window) == ["cpu"]  # constructed with device="cpu"
     assert window._engine_actions["cuda"].isEnabled() == CUDA_AVAILABLE
+    assert window._engine_actions["mps"].isEnabled() == MPS_AVAILABLE
     assert window._engine_actions["cpu"].isEnabled()
     assert window._engine_actions["auto"].isEnabled()
 
@@ -104,9 +106,9 @@ def test_switch_engine_rebuilds_controller_and_updates_ui(window) -> None:
     assert not window._orphaned_controllers  # old controller joined, none parked
 
     resolved = window._resolved_device.type
-    assert resolved == ("cuda" if CUDA_AVAILABLE else "cpu")
+    assert resolved == ("cuda" if CUDA_AVAILABLE else "mps" if MPS_AVAILABLE else "cpu")
     # Multi-scale is GPU-only: enabled exactly when the resolved device is CUDA.
-    assert window._params_panel._multiscale.isEnabled() == (resolved == "cuda")
+    assert window._params_panel._multiscale.isEnabled() == (resolved in ("cuda", "mps"))
 
 
 def test_switch_to_cpu_locks_multiscale(window) -> None:

@@ -1,0 +1,137 @@
+name: Build executables
+
+on:
+  push:
+    tags: ['v[0-9]*']
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'packaging/**'
+      - 'scripts/*release*'
+      - 'requirements-build.txt'
+      - 'fastmatch/**'
+      - 'tests/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: executables-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: ${{ matrix.platform }} / ${{ matrix.backend }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: windows-2025, platform: windows-x64, backend: cpu, index: cpu}
+          - {os: windows-2025, platform: windows-x64, backend: cuda-cu128, index: cu128}
+          - {os: ubuntu-22.04, platform: linux-x64, backend: cpu, index: cpu}
+          - {os: ubuntu-22.04, platform: linux-x64, backend: cuda-cu128, index: cu128}
+          - {os: ubuntu-22.04, platform: linux-x64, backend: rocm7.2, index: rocm7.2}
+          - {os: macos-15, platform: macos-arm64, backend: mps, index: cpu}
+    env:
+      QT_QPA_PLATFORM: offscreen
+      OMP_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+      HF_HUB_DISABLE_PROGRESS_BARS: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Free Linux runner space for GPU runtimes
+        if: runner.os == 'Linux' && matrix.backend != 'cpu'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/local/share/powershell /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/boost
+          docker image prune --all --force
+          df -h .
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Configure build caches
+        env:
+          BUILD_TEMP: ${{ runner.temp }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as output:
+              root = Path(os.environ['BUILD_TEMP'])
+              output.write(f"HF_HOME={root / 'huggingface'}\n")
+              output.write(f"PYINSTALLER_CONFIG_DIR={root / 'pyinstaller'}\n")
+          PY
+      - name: Linux GUI libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libopengl0 libxcb-cursor0 libxkbcommon-x11-0 pigz
+      - name: Install the selected accelerator runtime
+        env:
+          TORCH_INDEX: ${{ matrix.index }}
+        run: python -m pip install --no-cache-dir torch==2.11.0 --index-url "https://download.pytorch.org/whl/$TORCH_INDEX"
+      - name: Install pinned application and packaging dependencies
+        run: python -m pip install --no-cache-dir -r requirements-build.txt
+      - name: Download semantic model for the standalone app
+        run: python -m fastmatch --download-semantic-model
+      - name: Test source
+        env:
+          HF_HUB_OFFLINE: '1'
+          FASTMATCH_TEST_SEMANTIC_MODEL: '1'
+        run: python -m pytest -q -rs
+      - name: Build, smoke-test and archive the executable
+        env:
+          BUILD_REF: ${{ github.ref_name }}
+          BUILD_EVENT: ${{ github.event_name }}
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          if [[ "$BUILD_EVENT" == push && "$GITHUB_REF" == refs/tags/* ]]; then
+            label="$BUILD_REF"
+          else
+            label="dev-${GITHUB_SHA:0:7}"
+          fi
+          python scripts/build_release.py --label "$label" --backend "$BACKEND"
+      - name: Upload executable and checksums
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: FastMatch-${{ matrix.platform }}-${{ matrix.backend }}
+          path: release-assets/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: Upload packaging diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: diagnostics-${{ matrix.platform }}-${{ matrix.backend }}
+          path: |
+            build/*.json
+            build/FastMatch/warn-FastMatch.txt
+          if-no-files-found: ignore
+
+  publish:
+    name: Publish tagged release
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Publish every validated platform build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 scripts/publish_release.py --repo "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" --run-id "$GITHUB_RUN_ID"

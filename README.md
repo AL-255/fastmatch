@@ -13,8 +13,8 @@ The default matcher is **normalized cross-correlation (NCC)**, but you can pick 
 different **matching method** from a dropdown — SSD for flat / low-texture
 regions, CCORR for an alternate correlation measure, or Feature matching for
 rotated / scaled / warped instances (see [Matching methods](#matching-methods)).
-The correlation methods are built on PyTorch and run on the GPU when a suitable
-CUDA build is installed, falling back transparently to CPU otherwise.
+The correlation methods are built on PyTorch and support NVIDIA CUDA, AMD ROCm,
+and Apple MPS, falling back to CPU when an accelerator is unavailable.
 For image-search-style similarity, choose **Fuzzy instance search** to find
 altered copies, or **Semantic similarity** to find visually related objects.
 See [Fuzzy and semantic search](#fuzzy-and-semantic-search).
@@ -22,6 +22,44 @@ See [Fuzzy and semantic search](#fuzzy-and-semantic-search).
 ---
 
 ## Install
+
+### Download an executable
+
+Tagged versions build standalone applications on [GitHub Releases](https://github.com/AL-255/fastmatch/releases).
+No Python installation is needed to run an extracted application.
+
+| Platform | Builds |
+|---|---|
+| Windows x64 | CPU, NVIDIA CUDA 12.8 |
+| Linux x64 (Ubuntu 22.04 or newer / compatible desktop) | CPU, NVIDIA CUDA 12.8, AMD ROCm 7.2 |
+| macOS Apple Silicon | Apple MPS GPU, with CPU fallback |
+
+Choose the runtime for your hardware, extract the archive, and keep the complete
+folder together. Launch `FastMatch.exe` on Windows, `FastMatch.app` on macOS, or
+`FastMatch/FastMatch` on Linux. **Auto** selects a working accelerator; **Engine**
+also offers CPU, CUDA/ROCm, and Apple MPS. CUDA/ROCm builds require compatible GPU
+drivers. macOS builds are ad-hoc signed, not notarized; Windows builds are unsigned.
+The semantic model is included and works offline.
+
+Large GPU archives are split into `.part001`, `.part002`, etc. Download **all**
+parts for your chosen build and its `.parts.json` manifest into one folder.
+The release includes helpers that join the parts and verify SHA256:
+
+```bash
+python assemble_release.py FastMatch-vX.Y.Z-linux-x64-rocm7.2.tar.gz.parts.json
+```
+
+On Windows, use the PowerShell helper without Python:
+
+```powershell
+./assemble_release.ps1 -Manifest FastMatch-vX.Y.Z-windows-x64-cuda-cu128.zip.parts.json
+```
+
+Extract the reconstructed archive afterward. Each build also includes a `.sha256`
+checksum file and its packaged-app smoke-test report. See [Release builds](docs/RELEASING.md)
+for local builds and the tag-triggered workflow.
+
+### Run from source
 
 FastMatch needs PySide6, NumPy, Pillow, and PyTorch. **torchvision is optional**
 (used only for a slightly faster NMS; a pure-torch fallback ships in the engine),
@@ -33,24 +71,23 @@ build so it does not clash with PySide6's Qt plugins.
 ### CPU quickstart
 
 ```bash
+pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
 ```
 
-This installs everything, including the **CPU-only** PyTorch wheel. The app is
+Installing PyTorch from its CPU index first explicitly selects the **CPU-only**
+runtime on Windows/Linux (the macOS wheel also includes MPS). The app is
 fully functional on CPU — every code path is device-agnostic — it is just
 slower for large multi-scale searches.
 
 ### GPU upgrade (CUDA / cu128)
 
-The PyPI PyTorch wheel ships **no sm_120 (Blackwell, e.g. RTX 5060) kernels**,
-so even when `torch.cuda.is_available()` returns `True` the first real kernel
-fails. To get genuine GPU acceleration, install a CUDA build from the PyTorch
-CUDA index *after* the quickstart above:
+For NVIDIA acceleration, replace the CPU runtime with the tested CUDA 12.8 build.
+A CUDA availability flag alone does not guarantee that the driver and GPU
+architecture are supported; FastMatch also executes a canary kernel at launch.
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu128
-# cu129 is an alternative if cu128 is unavailable for your platform:
-# pip install torch --index-url https://download.pytorch.org/whl/cu129
+pip install --force-reinstall torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
 Verify the GPU build is active:
@@ -66,6 +103,13 @@ python -c "import torch; print(torch.cuda.is_available())"
 FastMatch never assumes CUDA exists: it detects the device at runtime with both
 `torch.cuda.is_available()` and a launch-time **canary kernel**, so a broken or
 mismatched CUDA wheel cleanly degrades to CPU rather than crashing.
+
+For AMD on Linux, install the ROCm runtime. Apple Silicon uses MPS from the
+normal macOS PyTorch wheel, with a separate canary probe:
+
+```bash
+pip install --force-reinstall torch==2.11.0 --index-url https://download.pytorch.org/whl/rocm7.2
+```
 
 ---
 
@@ -84,15 +128,19 @@ python -m fastmatch
 python -m fastmatch --generate-sample sample.png --w 12000 --h 12000
 python -m fastmatch sample.png
 
-# Force a specific device (default is "auto": CUDA if usable, else CPU)
+# Force a device (auto tries CUDA/ROCm, then Apple MPS, then CPU)
 python -m fastmatch path/to/image.png --device cpu
 python -m fastmatch path/to/image.png --device cuda
+python -m fastmatch path/to/image.png --device rocm
+python -m fastmatch path/to/image.png --device mps
 python -m fastmatch path/to/image.png --device auto
 ```
 
 If no image path is given, FastMatch opens with an **empty canvas** (no
 auto-generated demo) — load an image from *File ▸ Open Image…*. `--device`
-accepts `auto`, `cuda`, or `cpu`. `cuda` still falls back to CPU if the canary
+accepts `auto`, `cuda`, `rocm`, `mps`, or `cpu`. CUDA/ROCm and Apple MPS are probed
+with real kernels before use; an unavailable accelerator falls back to CPU.
+`cuda` still falls back to CPU if the canary
 kernel fails. `--generate-sample <path>` writes a synthetic image (default
 `12000x12000`, override with `--w` / `--h`) with a set of known motif stamps and
 exits; load that file separately to search it.
@@ -114,7 +162,7 @@ exits; load that file separately to search it.
 | **Rotation / Flipping checkboxes** | Also search the template under quarter-turn rotations and/or mirror reflections. Changing either **re-runs** the search. See [Orientation search](#orientation-search). |
 | **Threshold slider** | **Live-filters** the displayed results — no re-run (works for every method). |
 | **View ▸ Match boxes** menu | Configure the overlay box outlines: **Line width** (1–6 px, zoom-independent) and **XOR with background** (invert the outline against whatever is underneath so it stays visible on any background). |
-| **Engine** menu | Switch the compute backend on the fly: **Auto (prefer GPU)**, **CUDA (GPU)**, or **CPU**. CUDA is greyed out when no working GPU is detected. Switching rebuilds the engine on the new device, updates the status banner, re-gates the GPU-only multi-scale search, and re-runs the current selection. |
+| **Engine** menu | Switch between **Auto (prefer GPU)**, **CUDA (NVIDIA GPU)** or **ROCm (AMD GPU)** according to the installed runtime, **MPS (Apple GPU)**, and **CPU**. Unavailable accelerators are greyed out. Switching rebuilds the engine, updates the status banner and multi-scale controls, and re-runs the current selection. |
 | **Theme** menu | Switch the application look: **System** (follow the desktop), **Light**, or **Dark**. The whole UI and the image canvas re-theme instantly, and the choice is remembered for next launch. |
 | **Tools** menu | **Calibrate scale** and **Measure distance** (physical units). See [Measurement & calibration](#measurement--calibration). |
 | **Add to Memory** | Save the current selection + all current matches as an entry in the Memory list. See [Saved-match Memory](#saved-match-memory). |

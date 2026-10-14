@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
+from .build_info import bundled_build_info
 
 #: Author shown in the dialog (the project maintainer).
 AUTHOR = "Anhang Li (AL-255)"
@@ -38,6 +39,9 @@ def build_id() -> str:
     Falls back to reading ``.git/HEAD`` directly (no git binary needed), then to
     ``"unknown"`` when the source isn't a git checkout (e.g. an installed wheel).
     """
+    embedded = bundled_build_info().get("commit")
+    if embedded:
+        return str(embedded)[:12]
     try:
         out = subprocess.run(
             ["git", "describe", "--always", "--dirty", "--abbrev=12"],

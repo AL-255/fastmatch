@@ -289,7 +289,7 @@ class ParamsPanel(QWidget):
         super().__init__(parent)
         # Normalize: a torch.device prints as e.g. "cuda:0"; accept that too.
         self._device = str(effective_device).lower()
-        self._is_cuda = self._device.startswith("cuda")
+        self._is_cuda = self._device.startswith(("cuda", "mps"))
 
         # Whether the optional OpenCV backend is present (gates the "features"
         # method item). Probed exactly once, here, at construction.
@@ -903,7 +903,7 @@ class ParamsPanel(QWidget):
         :meth:`current_params` after switching the engine.
         """
         self._device = str(effective_device).lower()
-        new_is_cuda = self._device.startswith("cuda")
+        new_is_cuda = self._device.startswith(("cuda", "mps"))
         if new_is_cuda == self._is_cuda:
             return
         self._is_cuda = new_is_cuda

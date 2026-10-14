@@ -33,9 +33,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--device",
-        choices=["auto", "cuda", "cpu"],
+        choices=["auto", "cuda", "rocm", "mps", "cpu"],
         default="auto",
         help="Engine device preference (default: auto; canary-gated, CPU fallback).",
+    )
+    p.add_argument(
+        "--smoke-test",
+        metavar="REPORT",
+        default=None,
+        help="Verify the packaged GUI, matching engines and semantic model; write JSON to REPORT and exit.",
     )
     p.add_argument(
         "--download-semantic-model",
@@ -92,6 +98,10 @@ def main(argv: list[str] | None = None) -> int:
         argv: Optional argument vector (defaults to ``sys.argv[1:]``).
     """
     args = _build_parser().parse_args(argv)
+
+    if args.smoke_test is not None:
+        from .smoke_test import run_smoke_test
+        return run_smoke_test(args.smoke_test, args.device)
 
     if args.download_semantic_model is not None:
         from .semantic_matcher import download_semantic_model

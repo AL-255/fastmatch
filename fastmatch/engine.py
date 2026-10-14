@@ -1846,6 +1846,9 @@ class Matcher:
         if self._forced_core_tile is not None:
             return max(1, int(self._forced_core_tile))
 
+        if self._device.type == "mps":
+            return 512  # conservative shared-memory tiles, cancellable between slabs
+
         if self._device.type == "cuda":
             try:
                 free, _ = torch.cuda.mem_get_info()
@@ -1884,6 +1887,8 @@ class Matcher:
         many coarse candidates refines in several passes instead of OOM-/cuFFT-
         failing onto the slow full-resolution search. CPU runs in a single pass.
         """
+        if self._device.type == "mps":
+            return 16
         if self._device.type != "cuda":
             return 1 << 30  # effectively "no chunking" on CPU
         try:
@@ -1941,6 +1946,9 @@ class Matcher:
 
     def _cross_backend(self, sth: int, stw: int) -> str:
         """Resolve the cross-correlation backend for a template size (§D.2)."""
+        if self._device.type == "mps":
+            # Avoid complex FFT tensors on Metal; score using native conv2d.
+            return "spatial"
         if self._conv_backend == "spatial":
             return "spatial"
         if self._conv_backend == "fft":

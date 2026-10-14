@@ -38,3 +38,4 @@ scripts/gui_shots_out/
 
 # Optional downloaded semantic model weights
 /models/
+/release-assets/
