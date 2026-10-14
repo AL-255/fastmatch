@@ -1,0 +1,4 @@
+# Optional, offline DINOv2 semantic region search. Install after requirements.txt.
+transformers>=4.46,<6
+huggingface-hub>=0.26,<2
+safetensors>=0.4

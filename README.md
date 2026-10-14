@@ -1,5 +1,7 @@
 # FastMatch
 
+[English](README.md) | [简体中文](readme_cn.md)
+
 ![FastMatch](docs/top.png)
 
 FastMatch is a single-process PySide6 desktop app for exploring **gigapixel
@@ -13,6 +15,9 @@ regions, CCORR for an alternate correlation measure, or Feature matching for
 rotated / scaled / warped instances (see [Matching methods](#matching-methods)).
 The correlation methods are built on PyTorch and run on the GPU when a suitable
 CUDA build is installed, falling back transparently to CPU otherwise.
+For image-search-style similarity, choose **Fuzzy instance search** to find
+altered copies, or **Semantic similarity** to find visually related objects.
+See [Fuzzy and semantic search](#fuzzy-and-semantic-search).
 
 ---
 
@@ -20,8 +25,8 @@ CUDA build is installed, falling back transparently to CPU otherwise.
 
 FastMatch needs PySide6, NumPy, Pillow, and PyTorch. **torchvision is optional**
 (used only for a slightly faster NMS; a pure-torch fallback ships in the engine),
-and **OpenCV is optional too** — it is required *only* for the "Feature matching"
-method (see [Matching methods](#matching-methods)); the NCC / SSD / CCORR methods
+and **OpenCV is optional too** — it is required for strict feature matching and
+fuzzy instance search (see [Matching methods](#matching-methods)); the NCC / SSD / CCORR methods
 never touch it. The `requirements.txt` quickstart installs the `-headless` OpenCV
 build so it does not clash with PySide6's Qt plugins.
 
@@ -105,7 +110,7 @@ exits; load that file separately to search it.
 | **Run** button / **Auto Run** checkbox | With *Auto Run* on (default) the search runs whenever you draw a selection or change a setting. Turn it off to stage the selection + parameters and trigger a single search with **Run** (handy when each run is expensive). |
 | **Channel dropdown** | The colour space the matcher scores in: `luminance` (a single BT.601 luma plane), `rgb`, or `ycbcr`. The two colour modes are **multi-channel** (each channel correlated separately) and expose **per-channel weight sliders** (R,G,B or Y,Cb,Cr) — see [Channel modes & weights](#channel-modes--weights). |
 | Release a new selection | Runs the search (if Auto Run is on); any in-flight search is **auto-cancelled** (latest-wins). |
-| **Method dropdown** | Pick the matching method (NCC / SSD / CCORR / Feature matching). Changing it **re-runs** the search on the current selection. See [Matching methods](#matching-methods). |
+| **Method dropdown** | Pick NCC / SSD / CCORR, Fuzzy instance search, Semantic similarity, or Strict feature matching. Changing it **re-runs** the search on the current selection. See [Matching methods](#matching-methods). |
 | **Rotation / Flipping checkboxes** | Also search the template under quarter-turn rotations and/or mirror reflections. Changing either **re-runs** the search. See [Orientation search](#orientation-search). |
 | **Threshold slider** | **Live-filters** the displayed results — no re-run (works for every method). |
 | **View ▸ Match boxes** menu | Configure the overlay box outlines: **Line width** (1–6 px, zoom-independent) and **XOR with background** (invert the outline against whatever is underneath so it stays visible on any background). |
@@ -155,7 +160,9 @@ slider stays a live, no-re-run client-side filter for every method.
 | **NCC** (default) | Normalized cross-correlation (CCOEFF). Subtracts the mean and divides by per-window variance, so it is **illumination-robust**. | **Textured, aligned, same-scale** instances — the general default. Needs some internal texture to normalize against. | **GPU** (CPU fallback) |
 | **SSD** | Normalized squared difference: `1 − RMSE` of the pixel-wise difference. | **Flat / low-texture / exact-appearance** regions, where NCC's variance normalization is unstable (or rejects the template outright). **Not** illumination-invariant — use it when brightness is consistent. | **GPU** (CPU fallback) |
 | **CCORR** | Cosine cross-correlation (CCORR_NORMED) — an alternate correlation measure that does not subtract the mean. | A correlation alternative to NCC; useful as a cross-check when NCC behaves oddly. | **GPU** (CPU fallback) |
-| **Feature matching** | Dense ORB/AKAZE/SIFT keypoints **propose** a candidate at every repeated copy (one correspondence per copy — not the Lowe ratio test), and each candidate is **verified by appearance** (normalized cross-correlation). | **Rotated / scaled / perspective-warped** instances that the template (window-based) methods miss — and a feature-driven way to **reproduce the correlation methods' matches** on repetitive content. | **CPU**, via OpenCV |
+| **Fuzzy instance search** | RootSIFT descriptors, repeated-instance retrieval, and per-instance RANSAC geometric verification. Scores descriptor similarity, keypoint coverage, and geometric consistency, without a pixel-correlation gate. | **Blurred / compressed / recoloured / partly occluded** copies with distinctive local details, including rotation, scale and perspective changes. | **CPU**, via OpenCV |
+| **Semantic similarity** | Pretrained DINOv2 embeddings and cosine similarity over overlapping image windows, with local refinement. | **Visually related objects with different appearances**, including regions that have no matching keypoints. | **GPU or CPU**, via PyTorch; optional local model |
+| **Strict feature matching** | Dense ORB/AKAZE/SIFT keypoints **propose** a candidate at every repeated copy (one correspondence per copy — not the Lowe ratio test), and each candidate is **verified by appearance** (normalized cross-correlation). | **Rotated / scaled / perspective-warped** copies whose pixels still correlate strongly after alignment. | **CPU**, via OpenCV |
 
 Notes:
 
@@ -186,8 +193,9 @@ Notes:
 
 ## Channel modes & weights
 
-The **Channel mode** dropdown chooses the colour space every method scores in,
-and applies to **all four methods**:
+The **Channel mode** dropdown chooses the matching colour space,
+and applies to **NCC / SSD / CCORR, strict feature matching, and fuzzy instance search**.
+Semantic similarity always uses RGB learned features and disables these controls.
 
 | Mode | What it matches on |
 |---|---|
@@ -232,7 +240,7 @@ orientation only. Two checkboxes in the params panel widen the search to the
 | off | on  | upright + horizontal / vertical mirror |
 | on  | on  | all 8 (rotations, mirrors, and diagonal reflections) |
 
-**All four methods honor these checkboxes.** The correlation methods
+**All methods honor these checkboxes.** The correlation methods
 (NCC / SSD / CCORR) re-run their score-map search once per active orientation
 and keep the best one per location; feature matching proposes the template under
 each active orientation, appearance-verifies each instance, and classifies the
@@ -241,6 +249,65 @@ under, so a hit can be a rotated or mirrored copy of your selection. With both
 boxes off, behaviour is exactly the upright-only search described above (no
 extra cost). Changing either checkbox re-runs the search on your current
 selection; the threshold slider stays a live, no-re-run filter.
+Fuzzy search classifies the recovered geometric transform; semantic search
+compares embeddings of the selected template orientations and adjusts window
+aspect ratios for quarter turns.
+
+---
+
+## Fuzzy and semantic search
+
+These are separate retrieval modes: finding an altered copy and finding a
+different but visually related object need different evidence.
+
+- **Fuzzy instance search** uses [RootSIFT](https://www.robots.ox.ac.uk/~vgg/publications/2012/Arandjelovic12/arandjelovic12.pdf)
+  with geometric verification. Image descriptors query the template index, so
+  repeated copies do not compete for a fixed nearest-neighbour quota. **Min matches**
+  controls independent keypoint support; the threshold filters a combined
+  descriptor/geometry score. Use luminance when recolouring should be tolerated;
+  RGB/YCbCr weights add colour-histogram similarity. It infers scale and needs
+  distinctive details; plain, textureless shapes may yield no matches.
+- **Semantic similarity** uses local [DINOv2-small](https://github.com/facebookresearch/dinov2)
+  weights. It ranks overlapping windows, refines promising positions, and
+  merges overlaps. Multi-scale search also works on CPU. Results are approximate
+  regions based on the selection's size and aspect ratio, rather than object
+  segmentations. Very large images with small selections require many encoder
+  calls and can be slow; cancellation and progress remain available. Domain
+  performance depends on the pretrained features.
+- Scores are similarities, **not probabilities**, and differ between methods.
+  Start around `0.5` and adjust the threshold. Positive examples are searched
+  separately; negative examples use the chosen retrieval evidence rather than
+  a pixel-correlation filter. Both modes support selection masks, source
+  exclusion, result limits, orientation search, and saved Memory entries.
+
+Fuzzy search works with the normal quickstart. To enable semantic search:
+
+```bash
+pip install -r requirements-semantic.txt
+python -m fastmatch --download-semantic-model
+```
+
+The explicit download stores model data in `models/dinov2-small` (ignored by Git).
+Searches then run **offline**; no image is uploaded and searching never downloads
+weights. The method is greyed out until dependencies and weights are present.
+Restart the app after setup. For another location, download and launch with:
+
+```bash
+python -m fastmatch --download-semantic-model /path/to/dinov2-small
+FASTMATCH_SEMANTIC_MODEL=/path/to/dinov2-small python -m fastmatch
+```
+
+Reproducible CPU comparisons:
+
+```bash
+python scripts/fuzzy_eval.py
+python scripts/feature_eval.py --method fuzzy
+```
+
+The default synthetic altered-copy scene recovers **4/4 copies with no false
+positives** (the strict matcher recovers 3/4, missing 50% occlusion). The separate
+rotation/scale scene recovers **36/36 with no false positives**. These controlled
+scenes are regression checks, not guarantees for arbitrary images.
 
 ---
 
@@ -355,7 +422,7 @@ FastMatch ships a built-in correctness check:
   Truly oversized images are refused up front with a dialog rather than being
   allowed to OOM-kill the process.
 
-- **Out of memory on the GPU** — the engine starts conservatively (1024x1024
+- **Out of memory on the GPU** — the correlation engine starts conservatively (1024x1024
   compute tiles) and, on `OutOfMemoryError`, **auto-degrades** along a ladder:
   1024 → 512 tile → fewer scales → CPU fallback, surfacing a message at each
   rung. You do not need to tune anything manually.

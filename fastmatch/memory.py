@@ -55,7 +55,7 @@ class MemoryEntry:
     # -- settings delegates (read-only views onto params) --------------------
     @property
     def method(self) -> str:
-        """Matching method used ("ncc" | "ssd" | "ccorr" | "features")."""
+        """Matching method key, including fuzzy and semantic retrieval."""
         return self.params.method
 
     @property

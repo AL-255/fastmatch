@@ -7,7 +7,7 @@ textured background, runs method="features" (rotation+flip enabled), and reports
 recall per angle, per scale, overall, plus false positives — so we can see where
 feature matching is poor.
 
-Usage: python scripts/feature_eval.py [--detector orb|akaze|sift] [--seed N]
+Usage: python scripts/feature_eval.py [--method features|fuzzy] [--detector orb|akaze|sift] [--seed N]
 """
 from __future__ import annotations
 import argparse, sys, time
@@ -78,6 +78,7 @@ def _iou(a, b):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--detector", default="orb")
+    ap.add_argument("--method", choices=("features", "fuzzy"), default="features")
     ap.add_argument("--seed", type=int, default=5)
     args = ap.parse_args(argv)
     rng = np.random.default_rng(args.seed)
@@ -102,7 +103,7 @@ def main(argv=None):
     m.set_image(canvas)
     template = np.ascontiguousarray(canvas[src_box[1]:src_box[1] + src_box[3],
                                            src_box[0]:src_box[0] + src_box[2]])
-    params = MatchParams(method="features", channel_mode="luminance",
+    params = MatchParams(method=args.method, channel_mode="luminance",
                          enable_rotation=True, enable_flipping=True,
                          threshold_floor=0.0, feature_min_inliers=8,
                          feature_max_instances=300, feature_detector=args.detector)
@@ -128,7 +129,8 @@ def main(argv=None):
         found[(a, s)] = hit
     fp = sum(1 for u in used if not u)
 
-    print(f"detector={args.detector}  planted={len(planted)}  detections={len(det)}  "
+    detector_label = "RootSIFT" if args.method == "fuzzy" else args.detector
+    print(f"method={args.method} detector={detector_label}  planted={len(planted)}  detections={len(det)}  "
           f"false_pos={fp}  ({dt:.1f}s)")
     overall = sum(found.values())
     print(f"OVERALL recall: {overall}/{len(planted)} ({100*overall/len(planted):.0f}%)")

@@ -65,6 +65,7 @@ _SELECT_TOOLTIP = (
     "Toggle between Select (draw region) and Pan (drag to move). While selecting: "
     "Shift+drag adds another example of the same structure, Ctrl+drag marks "
     "something that must not match. Right-click a numbered example to delete it."
+)
 _ROCM_COMPILE_HINT = (
     "ROCm is compiling GPU kernels for this selection size; the first search "
     "can take a while, later ones are fast. Please wait."
@@ -1343,7 +1344,12 @@ class MainWindow(QMainWindow):
         the convolution methods run on the resolved engine device. Non-blocking
         (status-bar message), never modal.
         """
-        if method not in CONV_METHODS:  # i.e. "features"
+        if method == "semantic":
+            self.statusBar().showMessage(
+                f"Semantic similarity uses local DINOv2 features — {device_banner_text(self._resolved_device)}.",
+                10000,
+            )
+        elif method not in CONV_METHODS:
             self.statusBar().showMessage(
                 "Feature matching runs on the CPU via OpenCV (independent of the "
                 "engine GPU device).",

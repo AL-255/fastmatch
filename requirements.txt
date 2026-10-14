@@ -48,11 +48,11 @@ torch>=2.11
 #     pip install torchvision   (match the torch build / CUDA index used above)
 
 # ---------------------------------------------------------------------------
-# OpenCV — powers the "features" matching method ONLY.
+# OpenCV — powers strict feature matching and fuzzy instance retrieval.
 # ---------------------------------------------------------------------------
 # The convolution methods (ncc / ssd / ccorr) never import cv2; only the
 # `method="features"` path (ORB keypoints + RANSAC homography, for rotated /
-# scaled / warped instances) uses it. If cv2 is absent the feature method raises
+# scaled / warped instances), and fuzzy RootSIFT retrieval use it. If cv2 is absent the feature methods raise
 # a documented RuntimeError and the UI greys the option out — the rest of the
 # app is unaffected.
 #
@@ -60,3 +60,6 @@ torch>=2.11
 # otherwise ship a second set of Qt plugins that clash with PySide6's at import
 # time (duplicate `xcb`/platform plugins, `QApplication`-already-running errors).
 opencv-python-headless>=4.13
+
+# Semantic similarity is optional: install requirements-semantic.txt and run
+# python -m fastmatch --download-semantic-model once to enable offline DINOv2.
