@@ -28,7 +28,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .types import ORIENTATIONS, Match, MatchParams, apply_orientation
+from .types import ORIENTATIONS, Match, MatchParams, active_orientations, apply_orientation
 
 Box = tuple[int, int, int, int]  # (x, y, w, h), half-open image px
 
@@ -223,6 +223,9 @@ def match_examples(
         ``params.max_results`` (0 = unlimited).
     """
     image = matcher.host_image
+    if params.method in ("fuzzy", "semantic"):
+        return _match_retrieval_examples(matcher, image, positives, negatives, params,
+                                         cancel=cancel, progress=progress)
     mean, pos, neg, pos_boxes, neg_boxes = prepare_examples(image, positives, negatives)
     cands = matcher.match(mean, replace(params, max_results=_UNCAPPED), exclude_box=None,
                           cancel=cancel, progress=progress)
@@ -253,3 +256,88 @@ def match_examples(
     if params.max_results > 0:
         cands = cands[: params.max_results]
     return cands
+
+
+def _match_retrieval_examples(matcher, image, positives, negatives, params, *, cancel, progress):
+    """Retrieve each example independently; never average pixels or gate on NCC."""
+    from .feature_matcher import FeatureMatcher
+
+    if not positives:
+        return []
+
+    def crop_examples(boxes):
+        patches, clipped = [], []
+        ih, iw = image.shape[:2]
+        for x, y, w, h in boxes:
+            x0, y0 = max(0, x), max(0, y)
+            x1, y1 = min(iw, x + w), min(ih, y + h)
+            if x1 - x0 >= 8 and y1 - y0 >= 8:
+                patches.append(np.ascontiguousarray(image[y0:y1, x0:x1]))
+                clipped.append((x0, y0, x1 - x0, y1 - y0))
+        return patches, clipped
+
+    # Keep each example's appearance and size. Pixel alignment/averaging would
+    # destroy the very variation that retrieval is intended to tolerate.
+    pos, pos_boxes = crop_examples(positives)
+    neg, neg_boxes = crop_examples(negatives)
+    if not pos:
+        return []
+    # Semantic windows need a bounded shortlist even on a gigapixel image.
+    # Oversample each query before combining exemplars and applying negatives.
+    search_limit = max(500, params.max_results * 4) if params.method == "semantic" else _UNCAPPED
+    search_params = replace(params, max_results=search_limit, feature_max_instances=_UNCAPPED)
+    pooled = []
+    total = len(pos) + (len(neg) if params.method == "fuzzy" else 0)
+    for index, template in enumerate(pos):
+        def report(value, index=index):
+            if progress is not None:
+                progress(int(90 * (index + value / 100) / max(1, total)))
+        pooled.extend(matcher.match(template, search_params, cancel=cancel, progress=report))
+        if cancel is not None and cancel():
+            return []
+    pooled.sort(key=lambda r: -r.score)
+    pooled = FeatureMatcher._nms(pooled, params.nms_iou)
+    if neg_boxes:
+        pooled = [r for r in pooled if not any(
+            FeatureMatcher._excluded(r, box, params.exclude_iou) for box in neg_boxes)]
+    if neg and pooled and params.method == "fuzzy":
+        # Negative instances use the same descriptor/geometry evidence as
+        # positives. Query the cached whole-image index, not a pixel classifier.
+        negative_hits = []
+        for template in neg:
+            negative_hits.extend(matcher.match(template, search_params, cancel=cancel))
+            if cancel is not None and cancel():
+                return []
+        pooled = [r for r in pooled if not any(
+            FeatureMatcher._box_iou(r, other) > params.nms_iou and other.score >= r.score
+            for other in negative_hits)]
+    elif neg and pooled:
+        # Compare every candidate directly with positive and negative exemplars
+        # in learned feature space; a negative wins only when more similar.
+        backend = matcher._semantic_matcher
+        queries = []
+        for templates in (pos, neg):
+            crops = [np.ascontiguousarray(apply_orientation(t, code)) for t in templates
+                     for code in active_orientations(params.enable_rotation, params.enable_flipping)]
+            queries.append(backend._encode(crops))
+        kept = []
+        for start in range(0, len(pooled), 4):
+            if cancel is not None and cancel():
+                return []
+            batch = pooled[start:start + 4]
+            crops = [image[r.y:r.y + r.h, r.x:r.x + r.w] for r in batch]
+            if image.ndim == 2:
+                crops = [np.repeat(c[:, :, None], 3, axis=2) for c in crops]
+            features = backend._encode(crops)
+            positive_scores = (features @ queries[0].T).max(dim=1).values
+            negative_scores = (features @ queries[1].T).max(dim=1).values
+            kept.extend(r for r, p, n in zip(batch, positive_scores, negative_scores) if p >= n)
+        pooled = kept
+    # Explicitly marked positives stay present, matching the existing UX.
+    for box in pos_boxes:
+        if not any(_iou_many(_boxes([r]), box)[0] > params.nms_iou for r in pooled):
+            pooled.append(Match(*box, score=1.0, scale=1.0))
+    pooled.sort(key=lambda r: -r.score)
+    if progress is not None:
+        progress(100)
+    return pooled[:params.max_results] if params.max_results > 0 else pooled

@@ -17,6 +17,9 @@ match-count control. Those method-specific sets are swapped with a
 (luminance/rgb) is common to all methods — it lives in the always-visible params
 box (conv methods combine the channels before normalizing; the feature method's
 appearance verification becomes colour-aware while detection stays grayscale).
+Fuzzy instance retrieval uses RootSIFT and independent geometric support;
+semantic retrieval uses optional local DINOv2 weights, separate CPU/GPU scale
+controls, and RGB features (channel weights are disabled for this method).
 The ``features`` option is disabled (greyed, with an install hint) when OpenCV is
 not importable; we probe ``import cv2`` once at construction and *never*
 hard-depend on it.
@@ -27,7 +30,7 @@ re-run), so the main window can route threshold changes straight to the viewport
 while routing every other change to a fresh engine request. We still emit the
 full ``MatchParams`` on a threshold change so a single signal carries everything.
 The threshold *default* tracks the method (conv methods favour a strict ``0.85``;
-feature matching's inlier-ratio score is softer, so it defaults to ``0.5``), but
+retrieval similarity scores use a softer ``0.5``), but
 we only nudge the default on a method switch and otherwise respect manual edits.
 """
 
@@ -96,7 +99,7 @@ _HIST_BIN_PRESETS: tuple[int, ...] = (50, 100, 200, 400)
 
 # Per-method default for the threshold *slider* (DESIGN.md §J.5). Conv methods
 # want a strict cutoff against repetitive-texture floods; the feature path scores
-# by inlier ratio and so reads lower for genuine instances, hence a softer 0.5.
+# in a different feature space, hence a softer starting threshold of 0.5.
 _THRESH_DEFAULT_CONV = 0.85
 _THRESH_DEFAULT_FEATURES = 0.50
 
@@ -344,7 +347,7 @@ class ParamsPanel(QWidget):
             self._method.addItem(METHOD_LABELS.get(key, key), userData=key)
             idx = self._method.count() - 1
             self._method.setItemData(idx, METHOD_LABELS.get(key, key), Qt.ItemDataRole.ToolTipRole)
-            if key == "features" and not self._features_available:
+            if key in ("features", "fuzzy") and not self._features_available:
                 # Grey out + explain how to enable it, without hard-depending on cv2.
                 self._set_combo_item_enabled(self._method, idx, False)
                 self._method.setItemData(
@@ -352,6 +355,11 @@ class ParamsPanel(QWidget):
                     "Install opencv-python-headless",
                     Qt.ItemDataRole.ToolTipRole,
                 )
+            if key == "semantic":
+                from .semantic_matcher import semantic_available
+                ready, hint = semantic_available()
+                self._set_combo_item_enabled(self._method, idx, ready)
+                self._method.setItemData(idx, hint, Qt.ItemDataRole.ToolTipRole)
         # Default to the MatchParams default method ("ncc"); fall back to the
         # first enabled item if that key is somehow absent.
         self._select_method(MatchParams.method)
@@ -503,6 +511,35 @@ class ParamsPanel(QWidget):
         feature_form.addRow(self._form_label("Min matches"), self._feature_min_inliers)
         self._method_stack.addWidget(feature_box)  # index 1
 
+        fuzzy_box = QGroupBox("Fuzzy instance search", self)
+        fuzzy_form = QFormLayout(fuzzy_box)
+        fuzzy_hint = QLabel("Find altered copies with RootSIFT and geometric consistency. "
+                            "Tolerates appearance changes and partial occlusion; "
+                            "requires distinctive local details. Runs on CPU.", self)
+        fuzzy_hint.setWordWrap(True)
+        fuzzy_form.addRow(fuzzy_hint)
+        self._fuzzy_min_inliers = QSpinBox(self)
+        self._fuzzy_min_inliers.setRange(4, 10_000)
+        self._fuzzy_min_inliers.setValue(MatchParams.feature_min_inliers)
+        self._fuzzy_min_inliers.setToolTip("Minimum independent, geometrically consistent keypoints. "
+                                         "Lower finds weaker copies; higher reduces false matches.")
+        self._fuzzy_min_inliers.valueChanged.connect(self._on_param_changed)
+        fuzzy_form.addRow(self._form_label("Min matches"), self._fuzzy_min_inliers)
+        self._method_stack.addWidget(fuzzy_box)  # index 2
+
+        semantic_box = QGroupBox("Semantic similarity", self)
+        semantic_layout = QVBoxLayout(semantic_box)
+        semantic_hint = QLabel("Find visually related objects using local DINOv2 features. "
+                               "Results are approximate regions with the selected aspect ratio. "
+                               "Uses RGB and the selected engine device. Large images can take time.", self)
+        semantic_hint.setWordWrap(True)
+        semantic_layout.addWidget(semantic_hint)
+        self._semantic_multiscale = QCheckBox("Search multiple scales (0.75×, 1×, 1.5×)", self)
+        self._semantic_multiscale.setChecked(True)
+        self._semantic_multiscale.toggled.connect(self._on_param_changed)
+        semantic_layout.addWidget(self._semantic_multiscale)
+        self._method_stack.addWidget(semantic_box)  # index 3
+
         root.addWidget(self._method_stack)
 
         # --- Orientation (dihedral D4) search ------------------------------
@@ -602,6 +639,8 @@ class ParamsPanel(QWidget):
         Feature matching ignores scales entirely (it is scale-tolerant), so we
         report the single-scale default there to keep the params object tidy.
         """
+        if self._current_method() == "semantic":
+            return (0.75, 1.0, 1.5) if self._semantic_multiscale.isChecked() else (1.0,)
         if not self._is_conv_method():
             return _SCALES_CPU
         if self._is_cuda and self._multiscale.isChecked():
@@ -624,7 +663,13 @@ class ParamsPanel(QWidget):
 
     def _sync_method_page(self) -> None:
         """Show the control page (conv vs features) matching the current method."""
-        self._method_stack.setCurrentIndex(0 if self._is_conv_method() else 1)
+        method = self._current_method()
+        self._method_stack.setCurrentIndex({"fuzzy": 2, "semantic": 3}.get(
+            method, 0 if self._is_conv_method() else 1))
+        semantic = method == "semantic"
+        self._channel_mode.setEnabled(not semantic)
+        self._rgb_weight_box.setEnabled(not semantic)
+        self._ycbcr_weight_box.setEnabled(not semantic)
 
     def _form_label(self, text: str) -> QLabel:
         """A right-aligned form label pinned to the parent label-column width.
@@ -794,7 +839,8 @@ class ParamsPanel(QWidget):
             enable_flipping=self._enable_flipping.isChecked(),
             feature_detector=str(self._feature_detector.currentData()),
             feature_ratio=MatchParams.feature_ratio,
-            feature_min_inliers=self._feature_min_inliers.value(),
+            feature_min_inliers=(self._fuzzy_min_inliers.value() if self._current_method() == "fuzzy"
+                                 else self._feature_min_inliers.value()),
             feature_max_instances=MatchParams.feature_max_instances,
         )
 

@@ -134,13 +134,15 @@ def orientation_from_matrix(linear: np.ndarray) -> str:
 
 # The selectable matching methods, in UI order, with one-line guidance on when each fits.
 # Single source of truth shared by the engine dispatch and the params-panel dropdown.
-METHODS: tuple[str, ...] = ("ncc", "ssd", "ccorr", "features")
+METHODS: tuple[str, ...] = ("ncc", "ssd", "ccorr", "fuzzy", "semantic", "features")
 
 METHOD_LABELS: dict[str, str] = {
     "ncc": "NCC — normalized cross-correlation (textured, illumination-robust)",
     "ssd": "SSD — squared difference (flat / low-texture / exact appearance)",
     "ccorr": "CCORR — cosine cross-correlation (bright / high-energy templates; no mean subtraction)",
-    "features": "Feature matching — ORB keypoints + appearance verify (rotated / scaled)",
+    "fuzzy": "Fuzzy instance search — RootSIFT + geometry (altered / occluded copies)",
+    "semantic": "Semantic similarity — DINOv2 (visually related objects)",
+    "features": "Strict feature matching — keypoints + pixel appearance (rotated / scaled)",
 }
 
 # Methods whose score map is computed by the shared tiled-convolution machinery.
@@ -207,8 +209,10 @@ class Match:
         y: Top edge (inclusive top-left), image px.
         w: Width in image px (half-open: covers columns ``x .. x+w``).
         h: Height in image px (half-open: covers rows ``y .. y+h``).
-        score: NCC peak remapped to ``[0, 1]`` (raw NCC in ``[-1, 1]`` is
-            clamped at 0 — negative correlation is "not a match").
+        score: Similarity in ``[0, 1]``. Correlation methods use pixel similarity,
+            fuzzy retrieval uses descriptor/geometric evidence, and semantic
+            retrieval uses embedding cosine. Scores are not probabilities and
+            are not directly comparable between methods.
         scale: Scale at which the instance was found (``1.0`` == template
             native size; ``> 1`` == larger instance, ``< 1`` == smaller).
         orientation: Dihedral orientation the instance was found under (one of
@@ -258,8 +262,9 @@ class MatchParams:
 
     # --- Matching method selection (see METHODS / METHOD_LABELS) ---------------
     # "ncc"/"ssd"/"ccorr" use the GPU tiled-convolution machinery (scales/NMS apply).
-    # "features" uses an ORB-keypoint + RANSAC-homography backend that tolerates
-    # rotation/scale/perspective warp; the scale/NMS/channel knobs do not apply to it.
+    # "features" is strict keypoint + pixel verification; "fuzzy" retrieves
+    # RootSIFT instances geometrically (both infer scale). "semantic" uses
+    # learned DINOv2 embeddings over the requested scale grid.
     method: str = "ncc"
 
     # --- Orientation search (dihedral D4; see active_orientations) --------------

@@ -38,6 +38,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Engine device preference (default: auto; canary-gated, CPU fallback).",
     )
     p.add_argument(
+        "--download-semantic-model",
+        metavar="PATH",
+        nargs="?",
+        const="",
+        default=None,
+        help="Download optional DINOv2 weights to PATH (default: models/dinov2-small) and exit.",
+    )
+    p.add_argument(
         "--generate-sample",
         metavar="PATH",
         default=None,
@@ -84,6 +92,16 @@ def main(argv: list[str] | None = None) -> int:
         argv: Optional argument vector (defaults to ``sys.argv[1:]``).
     """
     args = _build_parser().parse_args(argv)
+
+    if args.download_semantic_model is not None:
+        from .semantic_matcher import download_semantic_model
+        try:
+            target = download_semantic_model(args.download_semantic_model or None)
+        except Exception as exc:
+            print(f"Semantic model download failed: {exc}", file=sys.stderr)
+            return 1
+        print(f"DINOv2 model saved to {target}. Semantic searches now run offline.")
+        return 0
 
     # Import the loader lazily so --help / arg errors don't pay import costs.
     from .loader import generate_sample, load_image
