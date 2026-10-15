@@ -19,7 +19,27 @@ if sys.stdout is None or sys.stderr is None:
     if sys.stderr is None:
         sys.stderr = log
 
+from fastmatch.external_runtime import configure_runtime
+
+configure_runtime()
+
 from fastmatch.__main__ import main
 
+
+def missing_runtime(error):
+    message = (f"FastMatch could not load a required library: {error}\n\n"
+               "For CUDA/ROCm builds, install the system GPU runtime described in README.md "
+               "and expose its library directories. See _internal/runtime-requirements.json "
+               "for this build's library list. Use the CPU package if no GPU runtime is installed.")
+    print(message, file=sys.stderr)
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, message, "FastMatch: missing runtime", 0x10)
+    return 1
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        code = main()
+    except (ImportError, OSError) as error:
+        code = missing_runtime(error)
+    raise SystemExit(code)

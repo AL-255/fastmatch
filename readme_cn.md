@@ -24,18 +24,20 @@ SSD 适用于平坦或纹理较少的区域，CCORR 提供另一种相关性度�
 ### 下载可执行程序
 
 带版本标签的提交会在 [GitHub Releases](https://github.com/AL-255/fastmatch/releases)
-生成独立应用。解压后运行应用无需安装 Python。
+生成独立应用。解压后运行应用无需安装 Python。CPU 和 macOS 包包含计算运行时；
+CUDA/ROCm 的 `-system` 包使用系统已安装的 GPU 运行库，安装方法见下文。
 
 | 平台 | 构建版本 |
 |---|---|
-| Windows x64 | CPU、NVIDIA CUDA 12.8 |
-| Linux x64（Ubuntu 22.04 或更新版本 / 兼容的桌面系统） | CPU、NVIDIA CUDA 12.8、AMD ROCm 7.2 |
+| Windows x64 | CPU、NVIDIA CUDA 12.8（`-system`） |
+| Linux x64（Ubuntu 22.04 或更新版本 / 兼容的桌面系统） | CPU、NVIDIA CUDA 12.8（`-system`）、AMD ROCm 7.2（`-system`） |
 | macOS Apple Silicon | Apple MPS GPU，不可用时回退到 CPU |
 
 选择适合硬件的版本，解压并保留完整文件夹。Windows 启动 `FastMatch.exe`，
 macOS 启动 `FastMatch.app`，Linux 启动 `FastMatch/FastMatch`。
 **Auto** 自动选择可用的加速器；**Engine** 菜单也提供 CPU、CUDA/ROCm 和 Apple MPS。
-CUDA/ROCm 版本需要兼容的 GPU 驱动。macOS 版本采用临时签名，尚未公证；Windows 版本未签名。
+CUDA/ROCm 版本需要兼容的 GPU 驱动**及对应的运行库**，仅安装驱动不够。
+macOS 版本采用临时签名，尚未公证；Windows 版本未签名。
 语义模型已包含在应用中，可离线使用。
 
 较大的 GPU 压缩包会分为 `.part001`、`.part002` 等文件。
@@ -43,17 +45,41 @@ CUDA/ROCm 版本需要兼容的 GPU 驱动。macOS 版本采用临时签名，�
 发布页面提供合并分片并验证 SHA256 的脚本：
 
 ```bash
-python assemble_release.py FastMatch-vX.Y.Z-linux-x64-rocm7.2.tar.gz.parts.json
+python assemble_release.py FastMatch-vX.Y.Z-linux-x64-rocm7.2-system.tar.gz.parts.json
 ```
 
 Windows 可使用 PowerShell 脚本，无需 Python：
 
 ```powershell
-./assemble_release.ps1 -Manifest FastMatch-vX.Y.Z-windows-x64-cuda-cu128.zip.parts.json
+./assemble_release.ps1 -Manifest FastMatch-vX.Y.Z-windows-x64-cuda-cu128-system.zip.parts.json
 ```
 
 合并后再解压。每个构建还附带 `.sha256` 校验文件和打包应用的冒烟测试报告。
 本地构建及版本标签触发的工作流程参见[发布构建](docs/RELEASING.md)。
+
+### GPU 运行库安装
+
+`-system` 包不再包含 CUDA/ROCm SDK 运行库及 GPU 内核数据库，也会移除 PyTorch
+测试文件、开发工具和无关的 Transformers 模型源码。应用仍保留 Python、Qt、OpenCV、
+PyTorch 自身的原生库和支持离线语义搜索的 DINOv2 权重。
+发布文件中的 `.packaging.json` 提供体积分析，`.runtime.json` 列出被排除的 GPU 运行库；
+后者也位于应用的 `_internal/runtime-requirements.json`。
+
+- **NVIDIA / Linux：**安装 CUDA 12.8、适配 CUDA 12 的 cuDNN 9、NCCL 2，
+  并根据运行库清单安装 cuSPARSELt、NVSHMEM、cuFile 等组件。
+  将库目录加入 `LD_LIBRARY_PATH`，如 `/usr/local/cuda-12.8/lib64` 和 cuDNN/NCCL 所在目录。
+- **NVIDIA / Windows：**安装 CUDA Toolkit 12.8、适配 CUDA 12 的 cuDNN 9 和
+  Visual C++ x64 Redistributable。应用会检查 `CUDA_PATH_V12_8`、`CUDA_PATH`、
+  `CUDNN_PATH` 及 `PATH`；自定义目录通过 `FASTMATCH_GPU_LIBRARY_PATH` 指定，多个 DLL
+  目录以分号分隔。
+- **AMD / Linux：**安装完整的 ROCm 7.2 用户态运行时，包括 HIP、rocBLAS、hipBLASLt、
+  rocFFT、MIOpen、RCCL 及配套 GPU 内核数据。将 `/opt/rocm/lib` 和 `/opt/rocm/lib64`
+  加入 `LD_LIBRARY_PATH`；按实际安装位置替换路径，并确认当前用户有 GPU 设备访问权限。
+- **Apple Silicon：**使用 macOS 自带的 MPS，无需安装 CUDA/ROCm。
+
+官方安装指南及完整命令见英文 README 的 [GPU runtime installation](README.md#gpu-runtime-installation)。
+可通过 `--smoke-test smoke.json --device cuda` 或 `--device rocm` 验证真实 GPU 执行。
+缺少运行库时，请按清单补齐，或改用 CPU 包；GPU 包须先成功加载原生库，才能在设备不可用时回退到 CPU。
 
 ### 从源码运行
 

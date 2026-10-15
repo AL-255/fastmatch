@@ -1,12 +1,13 @@
-# Native onedir bundles: avoid extracting multi-gigabyte GPU runtimes at launch.
+# Native onedir bundles; CUDA/ROCm runtime libraries are installed on the host.
 from pathlib import Path
-import importlib.metadata
 import json
 import sys
 
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, copy_metadata, collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, copy_metadata
 
 root = Path(SPECPATH).parent
+sys.path.insert(0, str(root))
+from scripts.bundle_policy import trim_collection
 build_info = json.loads((root / "build" / "metadata" / "_build_info.json").read_text(encoding="utf-8"))
 datas = [(str(root / "LICENSE"), "."), (str(root / "README.md"), "."),
          (str(root / "readme_cn.md"), "."),
@@ -23,23 +24,14 @@ hiddenimports = ["transformers.models.dinov2.modeling_dinov2",
 for distribution in ("transformers", "torch", "huggingface-hub", "safetensors", "numpy"):
     datas += copy_metadata(distribution)
 
-# ROCm 7.x can ship its runtime in SDK wheels, rather than torch/lib. Preserve
-# their package layout (and metadata) so the SDK's loader can find its libraries.
-for distribution in importlib.metadata.distributions():
-    name = distribution.metadata.get("Name", "")
-    if name.lower().startswith(("rocm", "amd-rocm", "nvidia-")):
-        datas += copy_metadata(name)
-        for package in (distribution.read_text("top_level.txt") or "").splitlines():
-            if package and not package.startswith("#"):
-                datas += collect_data_files(package)
-                binaries += collect_dynamic_libs(package, search_patterns=["*.so", "*.so.*", "*.dll", "*.dylib"])
-                hiddenimports += collect_submodules(package)
-
 a = Analysis([str(root / "packaging" / "entrypoint.py")], pathex=[str(root)],
              datas=datas, binaries=binaries, hiddenimports=hiddenimports,
              hookspath=[str(root / "packaging" / "hooks")],
              excludes=["torchvision", "torchaudio", "matplotlib", "IPython", "pytest",
-                       "PyQt5", "PyQt6", "PySide2", "tensorflow", "jax", "scipy", "sklearn"])
+                       "PyQt5", "PyQt6", "PySide2", "tensorflow", "jax", "scipy", "sklearn",
+                       "triton"])
+a.binaries, a.datas = trim_collection(a.binaries, a.datas, build_info["backend"], root / "build" / "metadata")
+a.datas += [("runtime-requirements.json", str(root / "build" / "metadata" / "runtime-requirements.json"), "DATA")]
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="FastMatch",
           console=sys.platform not in ("win32", "darwin"), debug=False, upx=False)
