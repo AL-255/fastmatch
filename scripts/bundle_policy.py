@@ -19,7 +19,9 @@ def exclusion_reason(destination, source, backend):
         return "development and test files"
     if "transformers/models/" in dest:
         model = dest.split("transformers/models/", 1)[1].split("/", 1)[0]
-        if model not in ("__init__.py", "auto", "dinov2"):
+        # AutoTokenizer imports EncoderDecoderConfig while DINOv2's decorators
+        # construct documentation at import time.
+        if model not in ("__init__.py", "auto", "dinov2", "encoder_decoder"):
             return "unused model implementations"
     if backend not in ("cuda-cu128", "rocm7.2"):
         return None

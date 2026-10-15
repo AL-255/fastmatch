@@ -37,6 +37,7 @@ def test_external_runtime_removes_aliases_and_reports_without_host_paths(tmp_pat
 def test_keeps_dinov2_and_removes_unrelated_models_and_torch_tests():
     assert exclusion_reason("transformers/models/dinov2/modeling_dinov2.py", "", "cpu") is None
     assert exclusion_reason("transformers/models/auto/modeling_auto.py", "", "cpu") is None
+    assert exclusion_reason("transformers/models/encoder_decoder/configuration_encoder_decoder.py", "", "cpu") is None
     assert exclusion_reason("transformers/models/llama/modeling_llama.py", "", "cpu")
     assert exclusion_reason("torch/test/test_api", "", "cpu")
     assert exclusion_reason("torch/bin/protoc", "", "cpu")
