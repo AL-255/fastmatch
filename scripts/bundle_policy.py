@@ -1,6 +1,7 @@
 """Keep application libraries; leave accelerator SDKs to the host system."""
 
 from pathlib import Path, PurePosixPath
+import importlib.metadata
 import json
 
 
@@ -72,6 +73,11 @@ def trim_collection(binaries, datas, backend, output):
     output.mkdir(parents=True, exist_ok=True)
     requirements = dict(backend=backend, external_libraries=sorted(external),
                         instructions="See README.md: GPU runtime installation")
+    if backend in ("cuda-cu128", "rocm7.2"):
+        requirements["build_runtime_packages"] = {
+            dist.metadata["Name"]: dist.version for dist in importlib.metadata.distributions()
+            if dist.metadata.get("Name", "").lower().startswith(("nvidia-", "cuda-", "rocm-", "amd-rocm"))
+        }
     (output / "runtime-requirements.json").write_text(json.dumps(requirements, indent=2), encoding="utf-8")
     # Build-machine paths are used only for the CI smoke test, never shipped.
     (output / "runtime-files.json").write_text(json.dumps(runtime_files), encoding="utf-8")

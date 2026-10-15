@@ -44,7 +44,8 @@ CUDA/ROCm archives have a `-system` suffix and deliberately exclude vendor
 runtime libraries and GPU kernel databases. Users install the corresponding
 CUDA 12.8/cuDNN/NCCL or ROCm 7.2 stack separately; see
 [GPU runtime installation](../README.md#gpu-runtime-installation).
-PyTorch's own ABI-specific libraries stay bundled. CPU/macOS remain self-contained
+PyTorch's own ABI-specific libraries and required framework dependencies
+(MAGMA/AOTriton for ROCm) stay bundled; these are not supplied by the system SDK. CPU/macOS remain self-contained
 apart from normal OS graphics libraries/frameworks.
 
 `scripts/bundle_policy.py` removes vendor libraries after dependency analysis,

@@ -64,8 +64,9 @@ for local builds and the tag-triggered workflow.
 
 ### GPU runtime installation
 
-The `-system` downloads omit CUDA/ROCm SDK libraries and GPU kernel databases.
-They retain Python, Qt, OpenCV, PyTorch's own native libraries, and the DINOv2
+The `-system` downloads omit vendor CUDA/ROCm SDK libraries and their kernel databases.
+They retain Python, Qt, OpenCV, PyTorch's own native libraries and required
+framework dependencies (including MAGMA/AOTriton on ROCm), and the DINOv2
 weights for offline semantic search. PyTorch's framework binaries are still
 substantial; installing a GPU driver cannot replace them. Development tools,
 PyTorch test binaries/data, and unrelated Transformers model source files are
@@ -78,8 +79,10 @@ inventory of the omitted libraries, also available inside the application as
 [cuDNN 9 for CUDA 12](https://docs.nvidia.com/deeplearning/cudnn/installation/latest/linux.html),
 and [NCCL 2](https://docs.nvidia.com/deeplearning/nccl/install-guide/index.html).
 Depending on the PyTorch runtime inventory, cuSPARSELt, NVSHMEM and cuFile may
-also be needed. Use versions compatible with the bundled PyTorch 2.11.0 CUDA
-12.8 build; a newer toolkit with incompatible library SONAMEs is not a substitute.
+also be needed. The tested PyTorch 2.11.0 runtime uses CUDA Toolkit **12.8.1**,
+cuDNN **9.19.0.56**, NCCL **2.28.9**, cuSPARSELt **0.7.1** and NVSHMEM **3.4.5**
+on Linux. The `.runtime.json` file records installed build-runtime package versions
+as well as library names. A newer toolkit with incompatible library SONAMEs is not a substitute.
 After registering NVIDIA's repository for your distribution, the CUDA library
 metapackage is `cuda-libraries-12-8`; install cuDNN/NCCL using their linked guides.
 If your libraries are outside the dynamic linker's standard search paths, launch
