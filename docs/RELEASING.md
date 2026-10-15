@@ -40,6 +40,22 @@ FastMatch --smoke-test smoke-rocm.json --device rocm
 FastMatch --smoke-test smoke-mps.json --device mps
 ```
 
+CUDA/ROCm archives have a `-system` suffix and deliberately exclude vendor
+runtime libraries and GPU kernel databases. Users install the corresponding
+CUDA 12.8/cuDNN/NCCL or ROCm 7.2 stack separately; see
+[GPU runtime installation](../README.md#gpu-runtime-installation).
+PyTorch's own ABI-specific libraries stay bundled. CPU/macOS remain self-contained
+apart from normal OS graphics libraries/frameworks.
+
+`scripts/bundle_policy.py` removes vendor libraries after dependency analysis,
+including aliases that would otherwise point at omitted files. It also removes
+PyTorch tests/tools and unrelated Transformers model sources. Each build exports
+`.runtime.json` (external library inventory) and `.packaging.json` (byte counts
+and largest retained files). CI smoke tests use the build environment's installed
+external GPU libraries through `LD_LIBRARY_PATH`/Windows DLL search directories;
+those machine-specific paths are never included in the distributable. A GPU
+package still needs its user-space libraries even to run in CPU fallback mode.
+
 The publisher requires all six build artifacts, creates a draft release, uploads
 one platform at a time, and publishes only after all uploads succeed. Only the
 publisher has `contents: write`. A failed build creates no release; a failed new
@@ -60,6 +76,8 @@ git push origin vX.Y.Z
 The build embeds the tag version, commit hash and runtime in the application.
 The About dialog reads those values without needing Git on the user's machine.
 Prerelease tags are published as GitHub prereleases.
+Write curated release notes in `docs/releases/vX.Y.Z.md` before tagging; the
+publisher uses that file instead of generated commit notes when present.
 
 ## Local builds
 
@@ -96,7 +114,8 @@ and verify the archive before extraction. A bad or missing part fails the
 operation; an existing verified archive is preserved on failure.
 
 Every build has a `.sha256` file covering the uploaded files and a `.smoke.json`
-report. GPU runtimes are substantially larger than CPU bundles.
+report. System-runtime GPU builds can still be large because PyTorch itself
+contains accelerator-specific operators; inspect `.packaging.json` for details.
 
 ## Signing and writable data
 

@@ -100,6 +100,15 @@ def build(label: str, backend: str):
     environment = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "HF_HUB_OFFLINE": "1",
                    "HF_HUB_DISABLE_PROGRESS_BARS": "1", "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2"}
     environment.pop("FASTMATCH_SEMANTIC_MODEL", None)
+    runtime_paths = json.loads((ROOT / "build" / "metadata" / "runtime-search-paths.json").read_text())
+    if backend in ("cuda-cu128", "rocm7.2"):
+        if not runtime_paths:
+            raise RuntimeError("GPU build did not identify any external runtime libraries")
+        # Test the trimmed bundle against external installed libraries. Keep
+        # these build-machine paths out of the distributable.
+        variable = "PATH" if sys.platform == "win32" else "LD_LIBRARY_PATH"
+        environment[variable] = os.pathsep.join([*runtime_paths, environment.get(variable, "")])
+        environment["FASTMATCH_GPU_LIBRARY_PATH"] = os.pathsep.join(runtime_paths)
     report = ROOT / "build" / f"smoke-{system}-{backend}.json"
     subprocess.run([str(executable), "--smoke-test", str(report), "--device", "cpu"],
                    cwd=ROOT / "dist", env=environment, check=True, timeout=240)
@@ -116,6 +125,8 @@ def build(label: str, backend: str):
     assets = ROOT / "release-assets"
     assets.mkdir(exist_ok=True)
     name = f"FastMatch-{label}-{system}-{architecture}-{backend}"
+    if backend in ("cuda-cu128", "rocm7.2"):
+        name += "-system"
     if sys.platform == "darwin":
         archive = assets / f"{name}.zip"
         subprocess.run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(bundle), str(archive)], check=True)
@@ -146,7 +157,11 @@ def build(label: str, backend: str):
     # Ship smoke evidence next to each native bundle.
     smoke_asset = assets / f"{name}.smoke.json"
     shutil.copy2(report, smoke_asset)
-    outputs = [*split_archive(archive), smoke_asset]
+    size_asset = assets / f"{name}.packaging.json"
+    shutil.copy2(ROOT / "build" / "metadata" / "packaging-report.json", size_asset)
+    runtime_asset = assets / f"{name}.runtime.json"
+    shutil.copy2(ROOT / "build" / "metadata" / "runtime-requirements.json", runtime_asset)
+    outputs = [*split_archive(archive), smoke_asset, size_asset, runtime_asset]
     checksums = assets / f"{name}.sha256"
     checksums.write_text("".join(f"{sha256(path)}  {path.name}\n" for path in outputs), encoding="utf-8")
     print(f"Packaged {name}; frozen smoke passed. Assets: {assets}")

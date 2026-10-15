@@ -35,7 +35,9 @@ def publish(repo, tag, run_id):
         raise RuntimeError("Missing validated build artifacts; refusing to publish a partial release")
     exists = subprocess.run(["gh", "release", "view", tag, "--repo", repo], capture_output=True).returncode == 0
     if not exists:
-        gh("release", "create", tag, "--repo", repo, "--verify-tag", "--draft", "--generate-notes",
+        notes = Path(__file__).resolve().parent.parent / "docs" / "releases" / f"{tag}.md"
+        notes_args = ["--notes-file", str(notes)] if notes.is_file() else ["--generate-notes"]
+        gh("release", "create", tag, "--repo", repo, "--verify-tag", "--draft", *notes_args,
            "--title", f"FastMatch {tag}", "--target", run["head_sha"])
     for artifact in sorted(artifacts, key=lambda a: a["name"]):
         with tempfile.TemporaryDirectory(prefix="fastmatch-assets-") as temporary:

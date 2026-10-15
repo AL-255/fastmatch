@@ -26,19 +26,22 @@ See [Fuzzy and semantic search](#fuzzy-and-semantic-search).
 ### Download an executable
 
 Tagged versions build standalone applications on [GitHub Releases](https://github.com/AL-255/fastmatch/releases).
-No Python installation is needed to run an extracted application.
+No Python installation is needed to run an extracted application. CPU and macOS
+packages include their compute runtime; CUDA/ROCm packages use your installed
+system GPU libraries (see [GPU runtime installation](#gpu-runtime-installation)).
 
 | Platform | Builds |
 |---|---|
-| Windows x64 | CPU, NVIDIA CUDA 12.8 |
-| Linux x64 (Ubuntu 22.04 or newer / compatible desktop) | CPU, NVIDIA CUDA 12.8, AMD ROCm 7.2 |
+| Windows x64 | CPU, NVIDIA CUDA 12.8 (`-system`) |
+| Linux x64 (Ubuntu 22.04 or newer / compatible desktop) | CPU, NVIDIA CUDA 12.8 (`-system`), AMD ROCm 7.2 (`-system`) |
 | macOS Apple Silicon | Apple MPS GPU, with CPU fallback |
 
 Choose the runtime for your hardware, extract the archive, and keep the complete
 folder together. Launch `FastMatch.exe` on Windows, `FastMatch.app` on macOS, or
 `FastMatch/FastMatch` on Linux. **Auto** selects a working accelerator; **Engine**
 also offers CPU, CUDA/ROCm, and Apple MPS. CUDA/ROCm builds require compatible GPU
-drivers. macOS builds are ad-hoc signed, not notarized; Windows builds are unsigned.
+drivers **and the runtime libraries below**. A driver alone is insufficient.
+macOS builds are ad-hoc signed, not notarized; Windows builds are unsigned.
 The semantic model is included and works offline.
 
 Large GPU archives are split into `.part001`, `.part002`, etc. Download **all**
@@ -46,18 +49,81 @@ parts for your chosen build and its `.parts.json` manifest into one folder.
 The release includes helpers that join the parts and verify SHA256:
 
 ```bash
-python assemble_release.py FastMatch-vX.Y.Z-linux-x64-rocm7.2.tar.gz.parts.json
+python assemble_release.py FastMatch-vX.Y.Z-linux-x64-rocm7.2-system.tar.gz.parts.json
 ```
 
 On Windows, use the PowerShell helper without Python:
 
 ```powershell
-./assemble_release.ps1 -Manifest FastMatch-vX.Y.Z-windows-x64-cuda-cu128.zip.parts.json
+./assemble_release.ps1 -Manifest FastMatch-vX.Y.Z-windows-x64-cuda-cu128-system.zip.parts.json
 ```
 
 Extract the reconstructed archive afterward. Each build also includes a `.sha256`
 checksum file and its packaged-app smoke-test report. See [Release builds](docs/RELEASING.md)
 for local builds and the tag-triggered workflow.
+
+### GPU runtime installation
+
+The `-system` downloads omit CUDA/ROCm SDK libraries and GPU kernel databases.
+They retain Python, Qt, OpenCV, PyTorch's own native libraries, and the DINOv2
+weights for offline semantic search. PyTorch's framework binaries are still
+substantial; installing a GPU driver cannot replace them. Development tools,
+PyTorch test binaries/data, and unrelated Transformers model source files are
+excluded. Each download has a `.packaging.json` size report and a `.runtime.json`
+inventory of the omitted libraries, also available inside the application as
+`_internal/runtime-requirements.json`.
+
+**NVIDIA on Linux:** install a compatible NVIDIA driver, the
+[CUDA 12.8 runtime libraries](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-installation-guide-linux/index.html),
+[cuDNN 9 for CUDA 12](https://docs.nvidia.com/deeplearning/cudnn/installation/latest/linux.html),
+and [NCCL 2](https://docs.nvidia.com/deeplearning/nccl/install-guide/index.html).
+Depending on the PyTorch runtime inventory, cuSPARSELt, NVSHMEM and cuFile may
+also be needed. Use versions compatible with the bundled PyTorch 2.11.0 CUDA
+12.8 build; a newer toolkit with incompatible library SONAMEs is not a substitute.
+After registering NVIDIA's repository for your distribution, the CUDA library
+metapackage is `cuda-libraries-12-8`; install cuDNN/NCCL using their linked guides.
+If your libraries are outside the dynamic linker's standard search paths, launch
+with their directories exposed, adjusting these example paths to your install:
+
+```bash
+export LD_LIBRARY_PATH="/usr/local/cuda-12.8/lib64:/usr/local/cuda-12.8/extras/CUPTI/lib64:/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+./FastMatch/FastMatch --smoke-test smoke-cuda.json --device cuda
+./FastMatch/FastMatch
+```
+
+**NVIDIA on Windows:** install the
+[CUDA Toolkit 12.8](https://developer.nvidia.com/cuda-12-8-0-download-archive),
+[cuDNN 9 for CUDA 12](https://docs.nvidia.com/deeplearning/cudnn/installation/latest/windows.html),
+and the [Visual C++ x64 Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe).
+FastMatch checks `CUDA_PATH_V12_8`, `CUDA_PATH`, `CUDNN_PATH`, and `PATH` for DLL
+directories. For a custom installation, set `FASTMATCH_GPU_LIBRARY_PATH` to a
+semicolon-separated list of directories that actually contain the DLLs:
+
+```powershell
+$env:FASTMATCH_GPU_LIBRARY_PATH = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin;C:\gpu-libraries\cudnn\bin'
+.\FastMatch\FastMatch.exe --smoke-test smoke-cuda.json --device cuda
+.\FastMatch\FastMatch.exe
+```
+
+**AMD on Linux:** install the supported AMD driver and the full ROCm 7.2 user-space
+runtime using [AMD's installation guide](https://rocm.docs.amd.com/projects/install-on-linux/en/docs-7.2.0/install/quick-start.html)
+for your distribution/GPU. Include HIP, rocBLAS, hipBLASLt, rocFFT, MIOpen and
+RCCL, along with their GPU kernel data. With AMD's 7.2 repository configured,
+`sudo apt install rocm` installs the ROCm stack on Ubuntu. Ensure your account
+has the device access described in AMD's post-installation instructions. Then:
+
+```bash
+export LD_LIBRARY_PATH="/opt/rocm/lib:/opt/rocm/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+./FastMatch/FastMatch --smoke-test smoke-rocm.json --device rocm
+./FastMatch/FastMatch
+```
+
+Use `/opt/rocm-7.2.0` instead if your install has a versioned prefix. Keep kernel
+data beside its installed ROCm libraries; copying only the `.so` files can break
+GPU searches. macOS uses the MPS framework provided by macOS; no CUDA/ROCm setup
+is needed. If a GPU package reports a missing library, check its runtime inventory
+and library search path, or use the CPU package. CPU fallback requires the GPU
+package's native runtime to load successfully first.
 
 ### Run from source
 

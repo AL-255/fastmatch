@@ -8,6 +8,7 @@ on:
       - '.github/workflows/release.yml'
       - 'packaging/**'
       - 'scripts/*release*'
+      - 'scripts/bundle_policy.py'
       - 'requirements-build.txt'
       - 'fastmatch/**'
       - 'tests/**'
@@ -114,6 +115,7 @@ jobs:
           name: diagnostics-${{ matrix.platform }}-${{ matrix.backend }}
           path: |
             build/*.json
+            build/metadata/*.json
             build/FastMatch/warn-FastMatch.txt
           if-no-files-found: ignore
 
