@@ -65,7 +65,7 @@ def trim_collection(binaries, datas, backend, output):
                 if reason == "system accelerator runtime" and kind != "SYMLINK":
                     if ".so" in path.name or path.suffix.lower() in (".dll", ".dylib"):
                         external.add(path.name)
-                        runtime_files[PurePosixPath(destination).name] = str(path.resolve())
+                        runtime_files[PurePosixPath(destination.replace("\\", "/")).name] = str(path.resolve())
             else:
                 filtered.append((destination, source, kind))
                 if kind != "SYMLINK":

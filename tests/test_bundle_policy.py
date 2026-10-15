@@ -53,3 +53,17 @@ def test_external_smoke_runtime_cannot_supply_unbundled_framework(tmp_path):
     runtime = stage_external_runtime({"librocblas.so.5": str(vendor)}, tmp_path / "external")
     assert (runtime / "librocblas.so.5").read_bytes() == b"vendor"
     assert not (runtime / "libtorch_hip.so").exists()
+
+
+def test_windows_toc_paths_stage_dlls_directly_in_search_directory(tmp_path):
+    vendor = tmp_path / "torch" / "lib" / "nvrtc64_120_0.dll"
+    vendor.parent.mkdir(parents=True)
+    vendor.write_bytes(b"runtime")
+    metadata = tmp_path / "metadata"
+    kept, _ = trim_collection([(r"torch\lib\nvrtc64_120_0.dll", str(vendor), "BINARY")],
+                              [], "cuda-cu128", metadata)
+    assert kept == []
+    files = json.loads((metadata / "runtime-files.json").read_text())
+    runtime = stage_external_runtime(files, tmp_path / "external")
+    assert (runtime / vendor.name).read_bytes() == b"runtime"
+    assert not (runtime / "torch").exists()
