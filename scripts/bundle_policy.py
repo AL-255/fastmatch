@@ -40,14 +40,14 @@ def exclusion_reason(destination, source, backend):
                     "rccl", "aqlprofile", "comgr", "drm_amdgpu")
         if vendor_name.startswith(prefixes) and (".so" in name or name.endswith((".dll", ".dylib"))):
             return "system accelerator runtime"
-        if any(p.lower() in ("rocblas", "hipblaslt", "miopen", "aotriton") for p in parts):
+        if any(p.lower() in ("rocblas", "hipblaslt", "hipsparselt", "miopen") for p in parts):
             return "system accelerator runtime"
     return None
 
 
 def trim_collection(binaries, datas, backend, output):
     """Filter PyInstaller TOCs and record the exact external dependencies."""
-    totals, external, source_dirs, kept = {}, set(), set(), []
+    totals, external, runtime_files, kept = {}, set(), {}, []
     result = []
     for collection in (binaries, datas):
         filtered = []
@@ -62,7 +62,7 @@ def trim_collection(binaries, datas, backend, output):
                 if reason == "system accelerator runtime" and kind != "SYMLINK":
                     if ".so" in path.name or path.suffix.lower() in (".dll", ".dylib"):
                         external.add(path.name)
-                        source_dirs.add(str(path.parent.resolve()))
+                        runtime_files[PurePosixPath(destination).name] = str(path.resolve())
             else:
                 filtered.append((destination, source, kind))
                 if kind != "SYMLINK":
@@ -74,7 +74,7 @@ def trim_collection(binaries, datas, backend, output):
                         instructions="See README.md: GPU runtime installation")
     (output / "runtime-requirements.json").write_text(json.dumps(requirements, indent=2), encoding="utf-8")
     # Build-machine paths are used only for the CI smoke test, never shipped.
-    (output / "runtime-search-paths.json").write_text(json.dumps(sorted(source_dirs)), encoding="utf-8")
+    (output / "runtime-files.json").write_text(json.dumps(runtime_files), encoding="utf-8")
     report = dict(excluded_bytes=totals, retained_bytes=sum(size for size, _ in kept),
                   largest_files=[dict(path=name, bytes=size) for size, name in sorted(kept, reverse=True)[:25]])
     (output / "packaging-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

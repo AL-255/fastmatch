@@ -5,6 +5,7 @@ import json
 import pytest
 
 from scripts.bundle_policy import exclusion_reason, trim_collection
+from scripts.build_release import stage_external_runtime
 
 
 @pytest.mark.parametrize("backend", ["cpu", "cuda-cu128", "rocm7.2", "mps"])
@@ -40,3 +41,14 @@ def test_keeps_dinov2_and_removes_unrelated_models_and_torch_tests():
     assert exclusion_reason("torch/test/test_api", "", "cpu")
     assert exclusion_reason("torch/bin/protoc", "", "cpu")
     assert exclusion_reason("torch/bin/torch_shm_manager", "", "cpu") is None
+
+
+def test_external_smoke_runtime_cannot_supply_unbundled_framework(tmp_path):
+    source = tmp_path / "installed" / "torch" / "lib"
+    source.mkdir(parents=True)
+    (source / "libtorch_hip.so").write_bytes(b"framework")
+    vendor = source / "librocblas.so.5.2"
+    vendor.write_bytes(b"vendor")
+    runtime = stage_external_runtime({"librocblas.so.5": str(vendor)}, tmp_path / "external")
+    assert (runtime / "librocblas.so.5").read_bytes() == b"vendor"
+    assert not (runtime / "libtorch_hip.so").exists()

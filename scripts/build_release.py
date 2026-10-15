@@ -69,6 +69,33 @@ def verify_backend(backend):
         assert sys.platform == "darwin" and torch.backends.mps.is_built(), "Expected Apple MPS wheel"
 
 
+def stage_external_runtime(files, directory):
+    """Expose only omitted libraries, never the build's original libtorch files."""
+    directory = Path(directory)
+    if directory.exists():
+        shutil.rmtree(directory)
+    directory.mkdir(parents=True)
+    for name, filename in files.items():
+        source = Path(filename)
+        aliases = {name, source.name}
+        if ".so" in source.name:
+            for candidate in source.parent.glob(source.name.split(".so", 1)[0] + ".so*"):
+                if candidate.resolve() == source.resolve():
+                    aliases.add(candidate.name)
+        for alias in aliases:
+            target = directory / alias
+            if target.exists():
+                continue
+            try:
+                if sys.platform == "win32":
+                    os.link(source, target)
+                else:
+                    target.symlink_to(source.resolve())
+            except OSError:
+                shutil.copy2(source, target)
+    return directory
+
+
 def build(label: str, backend: str):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_-]*", label):
         raise ValueError("Invalid release/build label")
@@ -100,15 +127,16 @@ def build(label: str, backend: str):
     environment = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "HF_HUB_OFFLINE": "1",
                    "HF_HUB_DISABLE_PROGRESS_BARS": "1", "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2"}
     environment.pop("FASTMATCH_SEMANTIC_MODEL", None)
-    runtime_paths = json.loads((ROOT / "build" / "metadata" / "runtime-search-paths.json").read_text())
+    runtime_files = json.loads((ROOT / "build" / "metadata" / "runtime-files.json").read_text())
     if backend in ("cuda-cu128", "rocm7.2"):
-        if not runtime_paths:
+        if not runtime_files:
             raise RuntimeError("GPU build did not identify any external runtime libraries")
         # Test the trimmed bundle against external installed libraries. Keep
         # these build-machine paths out of the distributable.
+        runtime = stage_external_runtime(runtime_files, ROOT / "build" / "external-runtime")
         variable = "PATH" if sys.platform == "win32" else "LD_LIBRARY_PATH"
-        environment[variable] = os.pathsep.join([*runtime_paths, environment.get(variable, "")])
-        environment["FASTMATCH_GPU_LIBRARY_PATH"] = os.pathsep.join(runtime_paths)
+        environment[variable] = os.pathsep.join([str(runtime), environment.get(variable, "")])
+        environment["FASTMATCH_GPU_LIBRARY_PATH"] = str(runtime)
     report = ROOT / "build" / f"smoke-{system}-{backend}.json"
     subprocess.run([str(executable), "--smoke-test", str(report), "--device", "cpu"],
                    cwd=ROOT / "dist", env=environment, check=True, timeout=240)

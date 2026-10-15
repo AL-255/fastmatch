@@ -29,7 +29,7 @@ a = Analysis([str(root / "packaging" / "entrypoint.py")], pathex=[str(root)],
              hookspath=[str(root / "packaging" / "hooks")],
              excludes=["torchvision", "torchaudio", "matplotlib", "IPython", "pytest",
                        "PyQt5", "PyQt6", "PySide2", "tensorflow", "jax", "scipy", "sklearn",
-                       "triton", "torch.testing._internal"])
+                       "triton"])
 a.binaries, a.datas = trim_collection(a.binaries, a.datas, build_info["backend"], root / "build" / "metadata")
 a.datas += [("runtime-requirements.json", str(root / "build" / "metadata" / "runtime-requirements.json"), "DATA")]
 pyz = PYZ(a.pure)
