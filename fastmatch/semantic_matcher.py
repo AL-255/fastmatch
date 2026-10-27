@@ -193,11 +193,13 @@ class SemanticMatcher:
                         progress(int(80 * seen / max(1, total)))
                     # Keep enough alternatives to refine and perform global NMS,
                     # bounding storage even when every window clears the floor.
-                    if len(proposals) > max(2000, params.max_results * 8):
+                    if params.max_results > 0 and len(proposals) > max(2000, params.max_results * 8):
                         proposals = self._nms(proposals, params.nms_iou)[:max(500, params.max_results * 4)]
                 if cancel is not None and cancel():
                     return []
-        coarse = self._nms(proposals, params.nms_iou)[:min(128, max(16, params.max_results))]
+        coarse = self._nms(proposals, params.nms_iou)
+        if params.max_results > 0:
+            coarse = coarse[:min(128, max(16, params.max_results))]
         refine = set()
         for r in coarse:
             for dy in (-(r.h // 4), 0, r.h // 4):
@@ -220,7 +222,9 @@ class SemanticMatcher:
                 progress(80 + int(19 * done / max(1, len(boxes_to_refine))))
         if cancel is not None and cancel():
             return []
-        results = self._nms(proposals, params.nms_iou)[:max(0, params.max_results)]
+        results = self._nms(proposals, params.nms_iou)
+        if params.max_results > 0:
+            results = results[:params.max_results]
         if progress is not None:
             progress(100)
         return results

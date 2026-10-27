@@ -1,6 +1,6 @@
 # Reproduce the runtime that was validated before release. Install the desired
 # torch wheel from its CPU/CUDA/ROCm index FIRST; this constraint preserves it.
-torch==2.11.0
+torch>=2.9.1,<=2.11.0
 PySide6==6.11.1
 numpy==2.4.6
 Pillow==12.1.0

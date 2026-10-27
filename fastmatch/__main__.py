@@ -146,6 +146,12 @@ def main(argv: list[str] | None = None) -> int:
 
     apply_theme(app, load_theme(), persist=False)
 
+    from .cpu import configure_threads, load_threads
+    configure_threads(load_threads())
+
+    from .i18n import load_language, set_language
+    set_language(load_language(), persist=False)
+
     # Resolve the image: the user's file, or None to start on an empty canvas
     # (no auto-generated demo). An image is opened later via File > Open Image…
     doc = (

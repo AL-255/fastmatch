@@ -1,0 +1,4 @@
+# PyTorch 2.2.x is the final upstream macOS x86_64 wheel line.
+torch==2.2.2
+numpy==1.26.4
+opencv-python-headless==4.11.0.86

@@ -8,6 +8,20 @@ from scripts.bundle_policy import exclusion_reason, trim_collection
 from scripts.build_release import stage_external_runtime
 
 
+def test_transformers_four_keeps_lazy_model_source_directories():
+    for model in ("albert", "llama", "dinov2"):
+        path = f"transformers/models/{model}/__init__.py"
+        assert exclusion_reason(path, "", "cpu", transformers_major=4) is None
+    assert exclusion_reason("transformers/models/albert/__init__.py", "", "cpu", transformers_major=5)
+
+
+def test_bundled_windows_rocm_keeps_runtime_and_kernel_data():
+    for path in ("_rocm_sdk_core/bin/amdhip64.dll", "_rocm_sdk_core/lib/llvm/bin/clang.exe",
+                 "_rocm_sdk_libraries_custom/bin/rocblas/library/kernels.dat"):
+        assert exclusion_reason(path, path, "rocm7.2.1-bundled") is None
+        assert exclusion_reason(path, path, "rocm7.2") == "system accelerator runtime"
+
+
 @pytest.mark.parametrize("backend", ["cpu", "cuda-cu128", "rocm7.2", "mps"])
 @pytest.mark.parametrize("library", ["libtorch_cpu.so", "libtorch_cuda.so", "libtorch_hip.so",
                                       "libc10_hip.so", "torch_cuda.dll", "c10_cuda.dll", "libgomp.so.1",

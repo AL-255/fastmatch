@@ -65,6 +65,9 @@ def verify_backend(backend):
         assert torch.version.cuda and torch.version.cuda.startswith("12.8"), "Expected CUDA 12.8 wheel"
     elif backend == "rocm7.2":
         assert torch.version.hip and torch.version.hip.startswith("7.2"), "Expected ROCm 7.2 wheel"
+    elif backend == "rocm7.2.1-bundled":
+        assert sys.platform == "win32", "Bundled ROCm build requires Windows"
+        assert torch.version.hip and torch.version.hip.startswith("7.2"), "Expected Windows ROCm 7.2.1 wheel"
     elif backend == "mps":
         assert sys.platform == "darwin" and torch.backends.mps.is_built(), "Expected Apple MPS wheel"
 
@@ -198,6 +201,6 @@ def build(label: str, backend: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--label", required=True)
-    parser.add_argument("--backend", choices=("cpu", "cuda-cu128", "rocm7.2", "mps"), required=True)
+    parser.add_argument("--backend", choices=("cpu", "cuda-cu128", "rocm7.2", "rocm7.2.1-bundled", "mps"), required=True)
     args = parser.parse_args()
     build(args.label, args.backend)

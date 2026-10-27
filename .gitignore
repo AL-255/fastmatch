@@ -16,6 +16,13 @@ htmlcov/
 
 # Virtual environments
 .venv/
+.cpu-runtime/
+logs/
+downloads/
+upstream-work/
+/release/
+/releases/
+/FastMatch.exe
 venv/
 env/
 

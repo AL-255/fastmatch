@@ -25,6 +25,23 @@ def run_smoke_test(report_path: str, device: str = "cpu") -> int:
                       cuda=torch.version.cuda, hip=torch.version.hip,
                       mps_built=torch.backends.mps.is_built())
         app = QApplication.instance() or QApplication([])
+        # Exercise the frozen loader too: alpha-only white artwork must retain
+        # geometry in both the RAM and disk-backed paths.
+        import tempfile
+        from PIL import Image
+        from .loader import load_image
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "transparent-pads.png"
+            rgba = np.full((8, 12, 4), 255, dtype=np.uint8)
+            rgba[:, :, 3] = 0
+            rgba[2:6, 3:9, 3] = 255
+            Image.fromarray(rgba).save(path)
+            for budget in (1, 1_000_000):
+                doc = load_image(path, max_ram_bytes=budget)
+                np.testing.assert_array_equal(doc.full[:, :, 0], rgba[:, :, 3])
+                assert (doc.width, doc.height) == (12, 8)
+                del doc
+        report["transparent_images"] = "RAM and memmap alpha geometry passed"
         window = MainWindow(None, device="cpu")
         window._viewport.setViewport(QWidget())  # headless runners lack an OpenGL display
         window.show()

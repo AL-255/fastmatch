@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from fastmatch.document import ImageDocument
 from fastmatch.types import Match
@@ -122,3 +123,72 @@ def test_load_via_memmap_returns_memmap(tmp_path) -> None:
     assert isinstance(mm, np.memmap)
     assert mm.shape == (SAMPLE_KW["h"], SAMPLE_KW["w"], 3)
     assert mm.dtype == np.uint8
+
+
+@pytest.mark.parametrize("max_ram_bytes", [1, 6_000_000_000])
+@pytest.mark.parametrize("mode", ["RGBA", "LA", "P"])
+def test_white_artwork_keeps_alpha_geometry(tmp_path, max_ram_bytes, mode) -> None:
+    """White ink encoded only in alpha must not turn into a blank white image."""
+    alpha = np.array([[0, 128, 255], [255, 0, 128]], dtype=np.uint8)
+    rgba = np.full((2, 3, 4), 255, dtype=np.uint8)
+    rgba[:, :, 3] = alpha
+    im = Image.fromarray(rgba)
+    if mode == "LA":
+        im = im.convert("LA")
+    elif mode == "P":
+        # A palette PNG can encode both partial and full transparency in tRNS.
+        im = Image.fromarray(np.array([[0, 1, 2], [2, 0, 1]], np.uint8)).convert("P")
+        im.putpalette([255, 255, 255] * 256)
+        im.info["transparency"] = bytes([0, 128, 255])
+    path = tmp_path / "white-pads.png"
+    im.save(path)
+    doc = loader.load_image(path, max_ram_bytes=max_ram_bytes)
+    assert (doc.width, doc.height) == (3, 2)
+    np.testing.assert_array_equal(doc.full, np.repeat(alpha[:, :, None], 3, axis=2))
+
+
+@pytest.mark.parametrize("max_ram_bytes", [1, 6_000_000_000])
+def test_dark_artwork_ignores_invisible_rgb(tmp_path, max_ram_bytes) -> None:
+    """Dark lines need a white matte, regardless of hidden transparent colors."""
+    rgba = np.full((3, 4, 4), 255, dtype=np.uint8)
+    rgba[:, :, 3] = 0  # invisible white must not bias the matte toward black
+    rgba[1, 1] = (0, 0, 0, 255)
+    rgba[1, 2] = (0, 0, 0, 128)
+    path = tmp_path / "dark-lines.png"
+    Image.fromarray(rgba).save(path)
+    doc = loader.load_image(path, max_ram_bytes=max_ram_bytes)
+    expected = np.full((3, 4, 3), 255, dtype=np.uint8)
+    expected[1, 1] = 0
+    expected[1, 2] = 127
+    np.testing.assert_array_equal(doc.full, expected)
+
+
+def test_transparent_image_uses_one_matte_across_strip_boundary(tmp_path) -> None:
+    rgba = np.zeros((loader._STRIP_ROWS + 1, 4, 4), dtype=np.uint8)
+    rgba[:, :3, 3] = 255
+    rgba[-1, :3, :3] = 255  # this strip alone would choose the opposite matte
+    path = tmp_path / "seam.png"
+    Image.fromarray(rgba).save(path)
+    ram = loader.load_image(path)
+    mapped = loader.load_image(path, max_ram_bytes=1)
+    np.testing.assert_array_equal(mapped.full, ram.full)
+    np.testing.assert_array_equal(mapped.full[:, 3], 255)
+    np.testing.assert_array_equal(mapped.full[:, :3], rgba[:, :3, :3])
+
+
+@pytest.mark.parametrize("mode", ["RGB", "RGBA"])
+def test_opaque_pixels_are_preserved(tmp_path, mode) -> None:
+    rgb = np.random.default_rng(5).integers(0, 256, (12, 13, 3), dtype=np.uint8)
+    path = tmp_path / "opaque.png"
+    Image.fromarray(rgb).convert(mode).save(path)
+    for budget in (1, 6_000_000_000):
+        np.testing.assert_array_equal(loader.load_image(path, max_ram_bytes=budget).full, rgb)
+
+
+@pytest.mark.parametrize("max_ram_bytes", [1, 6_000_000_000])
+def test_rgb_transparent_color_key(tmp_path, max_ram_bytes) -> None:
+    path = tmp_path / "color-key.png"
+    rgb = np.array([[[255, 255, 255], [255, 0, 255]]], dtype=np.uint8)
+    Image.fromarray(rgb).save(path, transparency=(255, 0, 255))
+    doc = loader.load_image(path, max_ram_bytes=max_ram_bytes)
+    np.testing.assert_array_equal(doc.full, [[[255, 255, 255], [0, 0, 0]]])

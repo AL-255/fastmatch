@@ -9,6 +9,8 @@ scrollable, read-only view.
 
 from __future__ import annotations
 
+from .i18n import tr
+
 import subprocess
 from pathlib import Path
 
@@ -80,12 +82,12 @@ class AboutDialog(QDialog):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("About FastMatch")
+        self.setWindowTitle(tr("About FastMatch"))
         self.resize(600, 640)
 
         layout = QVBoxLayout(self)
 
-        heading = QLabel("<h2>FastMatch</h2>", self)
+        heading = QLabel(tr("<h2>FastMatch</h2>"), self)
         heading.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(heading)
 
@@ -97,14 +99,14 @@ class AboutDialog(QDialog):
             Qt.TextInteractionFlag.TextBrowserInteraction
         )
         self._info.setText(
-            f"Version {__version__}<br>"
+            tr(f"Version {__version__}<br>"
             f"Build {build_id()}<br><br>"
             f"{AUTHOR}<br>"
-            f'<a href="mailto:{EMAIL}">{EMAIL}</a>'
+            f'<a href="mailto:{EMAIL}">{EMAIL}</a>')
         )
         layout.addWidget(self._info)
 
-        layout.addWidget(QLabel("License", self))
+        layout.addWidget(QLabel(tr("License"), self))
         self._license = QPlainTextEdit(self)
         self._license.setReadOnly(True)
         self._license.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)

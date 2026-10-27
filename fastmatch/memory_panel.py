@@ -22,6 +22,8 @@ handed up, so there is no cross-thread payload here.
 
 from __future__ import annotations
 
+from .i18n import tr
+
 import os
 
 from PySide6.QtCore import Qt, Signal
@@ -119,7 +121,7 @@ class MemoryPanel(QWidget):
         root.addWidget(self._header_label)
         # Surface the otherwise-invisible recall gesture (double-click). Muted via
         # the shared "matchCount" secondary-text style hook (themed in theme.py).
-        self._hint_label = QLabel("Double-click an entry to restore its boxes and selection.", self)
+        self._hint_label = QLabel(tr("Double-click an entry to restore its boxes and selection."), self)
         self._hint_label.setObjectName("matchCount")
         self._hint_label.setTextFormat(Qt.TextFormat.PlainText)
         root.addWidget(self._hint_label)
@@ -140,24 +142,24 @@ class MemoryPanel(QWidget):
         for col in range(1, len(_COLUMNS)):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         # Double-click a row -> revisit that entry.
-        self._table.setToolTip("Double-click an entry to restore its boxes and selection.")
+        self._table.setToolTip(tr("Double-click an entry to restore its boxes and selection."))
         self._table.itemDoubleClicked.connect(self._on_item_double_clicked)
         root.addWidget(self._table, 1)
 
         # --- Button row ----------------------------------------------------
         buttons = QHBoxLayout()
-        self._add_button = QPushButton("Add to Memory", self)
-        self._add_button.setToolTip("Save the current selection and its matches as a memory entry.")
+        self._add_button = QPushButton(tr("Add to Memory"), self)
+        self._add_button.setToolTip(tr("Save the current selection and its matches as a memory entry."))
         self._add_button.clicked.connect(self.add_requested)
         buttons.addWidget(self._add_button)
 
-        self._rename_button = QPushButton("Rename…", self)
-        self._rename_button.setToolTip("Give the selected memory entry a custom name.")
+        self._rename_button = QPushButton(tr("Rename…"), self)
+        self._rename_button.setToolTip(tr("Give the selected memory entry a custom name."))
         self._rename_button.clicked.connect(self._on_rename_clicked)
         buttons.addWidget(self._rename_button)
 
-        self._remove_button = QPushButton("Remove", self)
-        self._remove_button.setToolTip("Delete the selected memory entries.")
+        self._remove_button = QPushButton(tr("Remove"), self)
+        self._remove_button.setToolTip(tr("Delete the selected memory entries."))
         self._remove_button.clicked.connect(self._on_remove_clicked)
         buttons.addWidget(self._remove_button)
 
@@ -189,9 +191,9 @@ class MemoryPanel(QWidget):
         plural = "entry" if n == 1 else "entries"
         if self._source_image:
             name = os.path.basename(self._source_image)
-            self._header_label.setText(f"Memory — {name} ({n} {plural})")
+            self._header_label.setText(tr(f"Memory — {name} ({n} {plural})"))
         else:
-            self._header_label.setText(f"Memory ({n} {plural})")
+            self._header_label.setText(tr(f"Memory ({n} {plural})"))
 
     def _row_cells(self, entry: MemoryEntry) -> list[str]:
         """Build the per-column display strings for one entry's stats row."""
@@ -244,7 +246,7 @@ class MemoryPanel(QWidget):
             # Defensive: keep cells non-editable even if the table policy changes.
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             # Every cell on the row reveals the full settings on hover.
-            item.setToolTip(tooltip)
+            item.setToolTip(tr(tooltip))
             self._table.setItem(row, col, item)
         return row
 
@@ -285,8 +287,8 @@ class MemoryPanel(QWidget):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self._table.setItem(row, col, item)
             else:
-                item.setText(text)
-            item.setToolTip(tooltip)
+                item.setText(tr(text))
+            item.setToolTip(tr(tooltip))
 
     def _on_rename_clicked(self) -> None:
         """Prompt for a custom name for the selected entry (empty -> auto label).
@@ -296,14 +298,14 @@ class MemoryPanel(QWidget):
         """
         rows = sorted({idx.row() for idx in self._table.selectionModel().selectedRows()})
         if not rows:
-            QMessageBox.information(self, "Rename", "Select a memory entry to rename.")
+            QMessageBox.information(self, tr("Rename"), tr("Select a memory entry to rename."))
             return
         row = rows[0]
         if not (0 <= row < len(self._entries)):
             return
         entry = self._entries[row]
         current = entry.label or entry.summary()
-        name, ok = QInputDialog.getText(self, "Rename entry", "Name:", text=current)
+        name, ok = QInputDialog.getText(self, tr("Rename entry"), tr("Name:"), text=current)
         if not ok:
             return
         entry.label = name.strip()
@@ -342,13 +344,13 @@ class MemoryPanel(QWidget):
         store, remembers the path, and re-emits it via ``store_loaded``.
         Returns whether a store was loaded.
         """
-        path, _ = QFileDialog.getOpenFileName(self, "Open Memory", "", _JSON_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, tr("Open Memory"), "", _JSON_FILTER)
         if not path:
             return False  # user cancelled
         try:
             store = memory.load_store(path)
         except ValueError as exc:
-            QMessageBox.warning(self, "Open failed", f"Could not open memory:\n{exc}")
+            QMessageBox.warning(self, tr("Open failed"), tr(f"Could not open memory:\n{exc}"))
             return False
         self.load_store(store)
         self._current_path = path
@@ -364,7 +366,7 @@ class MemoryPanel(QWidget):
     def save_memory_as(self) -> bool:
         """Prompt for a path and write the current store as JSON; remember it."""
         start = self._current_path or ""
-        path, _ = QFileDialog.getSaveFileName(self, "Save Memory As", start, _JSON_FILTER)
+        path, _ = QFileDialog.getSaveFileName(self, tr("Save Memory As"), start, _JSON_FILTER)
         if not path:
             return False  # user cancelled
         path = _ensure_json_suffix(path)  # write "name" as "name.json"
@@ -378,7 +380,7 @@ class MemoryPanel(QWidget):
         try:
             memory.save_store(self.store(), path)
         except Exception as exc:  # I/O, permissions, etc.
-            QMessageBox.warning(self, "Save failed", f"Could not save memory:\n{exc}")
+            QMessageBox.warning(self, tr("Save failed"), tr(f"Could not save memory:\n{exc}"))
             return False
         return True
 

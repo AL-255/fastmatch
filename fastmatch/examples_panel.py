@@ -12,6 +12,8 @@ them (:meth:`set_examples`) and reports what the user asked for via signals.
 
 from __future__ import annotations
 
+from .i18n import tr
+
 from PySide6.QtCore import QRect, Qt, Signal
 from PySide6.QtGui import QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
@@ -29,7 +31,6 @@ from PySide6.QtWidgets import (
 Item = tuple[str, int]  # ("pos" | "neg", number as labelled on the image)
 
 _COLUMNS = ("#", "Type", "Position", "Size")
-_EMPTY = "No examples. Shift+drag adds one, Ctrl+drag a negative."
 _POS_COLOR = QColor(0, 150, 200)
 _NEG_COLOR = QColor(230, 80, 0)
 
@@ -58,12 +59,12 @@ class ExamplesPanel(QWidget):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
-        self._summary = QLabel(_EMPTY, self)
+        self._summary = QLabel(tr("No examples. Shift+drag adds one, Ctrl+drag a negative."), self)
         self._summary.setWordWrap(True)
         root.addWidget(self._summary)
 
         self._table = QTableWidget(0, len(_COLUMNS), self)
-        self._table.setHorizontalHeaderLabels(list(_COLUMNS))
+        self._table.setHorizontalHeaderLabels([tr(c) for c in _COLUMNS])
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -82,11 +83,11 @@ class ExamplesPanel(QWidget):
             sc.activated.connect(self._delete_selected)
 
         buttons = QHBoxLayout()
-        self._delete_btn = QPushButton("Delete selected", self)
-        self._delete_btn.setToolTip("Delete the selected examples (Delete key). Ctrl/Shift+click selects several.")
+        self._delete_btn = QPushButton(tr("Delete selected"), self)
+        self._delete_btn.setToolTip(tr("Delete the selected examples (Delete key). Ctrl/Shift+click selects several."))
         self._delete_btn.clicked.connect(self._delete_selected)
         self._delete_btn.setEnabled(False)
-        self._clear_btn = QPushButton("Clear examples", self)
+        self._clear_btn = QPushButton(tr("Clear examples"), self)
         self._clear_btn.clicked.connect(self.clear_requested.emit)
         self._clear_btn.setEnabled(False)
         buttons.addWidget(self._delete_btn)
@@ -115,7 +116,7 @@ class ExamplesPanel(QWidget):
             color = _POS_COLOR if kind == "pos" else _NEG_COLOR
             cells = (
                 str(number) if kind == "pos" else f"×{number}",
-                "Positive" if kind == "pos" else "Negative",
+                tr("Positive") if kind == "pos" else tr("Negative"),
                 f"({x}, {y})",
                 f"{w} × {h}",
             )
@@ -129,8 +130,8 @@ class ExamplesPanel(QWidget):
         n_pos = sum(1 for k, _ in self._items if k == "pos")
         n_neg = len(self._items) - n_pos
         self._summary.setText(
-            f"Examples: {n_pos} positive, {n_neg} negative" if self._items
-            else _EMPTY)
+            tr(f"Examples: {n_pos} positive, {n_neg} negative") if self._items
+            else tr("No examples. Shift+drag adds one, Ctrl+drag a negative."))
         self._clear_btn.setEnabled(bool(positives or negatives))
         self._delete_btn.setEnabled(False)
         self.highlight_changed.emit([])

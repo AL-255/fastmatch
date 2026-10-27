@@ -144,7 +144,10 @@ class FuzzyMatcher(FeatureMatcher):
                     progress(55 + int(44 * (number + 1) / max(1, min(3000, len(candidates)))))
         results.sort(key=lambda r: -r.score)
         results = self._nms(results, params.nms_iou)
-        results = results[:max(0, min(params.max_results, params.feature_max_instances))]
+        limit = params.feature_max_instances
+        if params.max_results > 0:
+            limit = min(limit, params.max_results)
+        results = results[:max(0, limit)]
         if scale_back != 1:
             results = [replace(r, x=r.x * scale_back, y=r.y * scale_back,
                                w=r.w * scale_back, h=r.h * scale_back) for r in results]

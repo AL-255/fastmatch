@@ -2,7 +2,7 @@ name: Build executables
 
 on:
   push:
-    tags: ['v[0-9]*']
+    tags: ['v[0-9]*', '!v*-desktop*']
   pull_request:
     paths:
       - '.github/workflows/release.yml'

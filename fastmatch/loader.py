@@ -42,6 +42,38 @@ Image.MAX_IMAGE_PIXELS = None
 _STRIP_ROWS = 1024
 
 
+def _alpha_background(im: Image.Image) -> int | None:
+    """Choose one contrasting matte for the entire transparent image.
+
+    The display and matcher share RGB pixels. Dropping alpha loses drawings
+    whose geometry is stored only in transparency (e.g. white PCB pads).
+    Composite light artwork onto black and dark artwork onto white, using
+    alpha-weighted luminance so invisible RGB values cannot affect the choice.
+    Scan in strips to avoid a second full-size RGBA buffer for large images.
+    """
+    if "A" not in im.getbands() and "transparency" not in im.info:
+        return None
+    alpha_sum = luma_sum = 0
+    for y0 in range(0, im.height, _STRIP_ROWS):
+        strip = im.crop((0, y0, im.width, min(y0 + _STRIP_ROWS, im.height)))
+        pixels = np.asarray(strip.convert("RGBA"), dtype=np.uint32)
+        alpha = pixels[:, :, 3]
+        luma = (299 * pixels[:, :, 0] + 587 * pixels[:, :, 1]
+                + 114 * pixels[:, :, 2])
+        alpha_sum += int(alpha.sum(dtype=np.uint64))
+        luma_sum += int((luma * alpha).sum(dtype=np.uint64))
+    return 0 if luma_sum > 127_500 * alpha_sum else 255
+
+
+def _to_rgb(im: Image.Image, background: int | None) -> Image.Image:
+    """Flatten alpha without resizing; use the same matte for every strip."""
+    if background is None:
+        return im.convert("RGB")
+    rgba = im.convert("RGBA")
+    matte = Image.new("RGBA", im.size, (background, background, background, 255))
+    return Image.alpha_composite(matte, rgba).convert("RGB")
+
+
 def load_image(
     path: str | Path,
     *,
@@ -54,6 +86,10 @@ def load_image(
     pixels. If the full RGB buffer (``w * h * 3`` bytes) fits within
     ``max_ram_bytes`` it is decoded in one shot; otherwise the decode is streamed
     into a ``np.memmap`` so peak RAM stays bounded by one strip.
+
+    Transparent inputs are composited onto a contrasting black or white matte
+    shared by the display and matcher. Dimensions and opaque pixels are retained;
+    the source file is never modified.
 
     Args:
         path: Image file on disk.
@@ -87,9 +123,9 @@ def load_image(
                 f"max_image_bytes ceiling of {max_image_bytes}"
             )
         if need <= max_ram_bytes:
-            # Small enough: decode fully. ``convert("RGB")`` collapses palette /
-            # grayscale / RGBA inputs to the (H, W, 3) uint8 the document needs.
-            arr = np.ascontiguousarray(np.asarray(im.convert("RGB")))
+            # Keep transparency-defined geometry in the shared display/matcher
+            # pixels instead of discarding alpha during RGB conversion.
+            arr = np.ascontiguousarray(np.asarray(_to_rgb(im, _alpha_background(im))))
             return ImageDocument(full=arr, path=str(path), height=h, width=w)
 
     # Too large for one buffer: stream-decode into a memmap. We re-open inside
@@ -153,12 +189,12 @@ def _load_via_memmap(path: str | Path, w: int, h: int) -> np.memmap:
 
     mm = np.memmap(tmp_name, dtype=np.uint8, mode="w+", shape=(h, w, 3))
     with Image.open(path) as im:
-        rgb = im.convert("RGB") if im.mode != "RGB" else im
+        background = _alpha_background(im)
         for y0 in range(0, h, _STRIP_ROWS):
             y1 = min(y0 + _STRIP_ROWS, h)
             # crop box is (left, upper, right, lower), half-open on the lower/right
             # edges — exactly our row range [y0, y1).
-            strip = rgb.crop((0, y0, w, y1))
+            strip = _to_rgb(im.crop((0, y0, w, y1)), background)
             mm[y0:y1] = np.asarray(strip, dtype=np.uint8).reshape(y1 - y0, w, 3)
 
     # Flush dirty pages to disk and drop the writable mapping, then reopen

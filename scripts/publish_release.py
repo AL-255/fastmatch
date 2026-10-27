@@ -16,7 +16,7 @@ def gh(*args):
     return subprocess.check_output(["gh", *args], text=True)
 
 
-def publish(repo, tag, run_id):
+def publish(repo, tag, run_id, desktop=False):
     if not re.fullmatch(r"v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", tag):
         raise ValueError("Not a release version tag")
     run = json.loads(gh("api", f"repos/{repo}/actions/runs/{run_id}"))
@@ -31,6 +31,9 @@ def publish(repo, tag, run_id):
     expected = {"FastMatch-windows-x64-cpu", "FastMatch-windows-x64-cuda-cu128",
                 "FastMatch-linux-x64-cpu", "FastMatch-linux-x64-cuda-cu128",
                 "FastMatch-linux-x64-rocm7.2", "FastMatch-macos-arm64-mps"}
+    if desktop:
+        expected = {"FastMatch-windows-x64-cpu", "FastMatch-windows-x64-rocm7.2.1-bundled",
+                    "FastMatch-macos-arm64-mps", "FastMatch-macos-x64-cpu"}
     if {a["name"] for a in artifacts} != expected:
         raise RuntimeError("Missing validated build artifacts; refusing to publish a partial release")
     exists = subprocess.run(["gh", "release", "view", tag, "--repo", repo], capture_output=True).returncode == 0
@@ -58,5 +61,6 @@ if __name__ == "__main__":
     parser.add_argument("--repo", required=True)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--desktop", action="store_true", help="Publish the Windows/macOS desktop matrix")
     args = parser.parse_args()
-    publish(args.repo, args.tag, args.run_id)
+    publish(args.repo, args.tag, args.run_id, desktop=args.desktop)

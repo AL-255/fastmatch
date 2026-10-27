@@ -1,0 +1,5 @@
+# Install separately so an existing ROCm torch build is not replaced.
+PySide6>=6.8,<7
+numpy>=1.26,<3
+Pillow>=11,<13
+opencv-python-headless>=4.10,<5

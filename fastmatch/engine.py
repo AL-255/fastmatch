@@ -999,7 +999,9 @@ class Matcher:
         b = np.array([(m.x, m.y, m.x + m.w, m.y + m.h) for m in ordered], dtype=np.float64)
         keep = _greedy_order(b[:, 0], b[:, 1], b[:, 2], b[:, 3],
                              np.arange(len(ordered)), float(params.nms_iou))
-        return [ordered[i] for i in keep[: params.max_results]]
+        if params.max_results > 0:
+            keep = keep[: params.max_results]
+        return [ordered[i] for i in keep]
 
     # -- template preparation / validation -----------------------------------
 
@@ -2639,7 +2641,7 @@ class Matcher:
         scale = scale[keep]
 
         # Top-K by score desc (§D.5 step 5).
-        if scores.numel() > params.max_results:
+        if params.max_results > 0 and scores.numel() > params.max_results:
             top = torch.argsort(scores, descending=True)[: params.max_results]
         else:
             top = torch.argsort(scores, descending=True)

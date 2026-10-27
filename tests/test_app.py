@@ -31,7 +31,7 @@ from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
 from fastmatch import theme  # noqa: E402
 from fastmatch.app import MainWindow  # noqa: E402
-from fastmatch.device import resolve_device  # noqa: E402
+from fastmatch.device import resolve_device, gpu_backend  # noqa: E402
 from fastmatch.document import ImageDocument  # noqa: E402
 from fastmatch.memory_panel import _ensure_json_suffix  # noqa: E402
 
@@ -65,8 +65,10 @@ def window(qapp):
     w.close()
 
 
-CUDA_AVAILABLE = resolve_device("cuda").type == "cuda"
 MPS_AVAILABLE = resolve_device("mps").type == "mps"
+GPU_AVAILABLE = resolve_device("auto").type == "cuda"
+CUDA_AVAILABLE = GPU_AVAILABLE and gpu_backend() == "cuda"
+ROCM_AVAILABLE = GPU_AVAILABLE and gpu_backend() == "rocm"
 
 
 def _checked_keys(w: MainWindow) -> list[str]:
@@ -76,10 +78,11 @@ def _checked_keys(w: MainWindow) -> list[str]:
 def test_engine_menu_structure(window) -> None:
     """Three exclusive radios; CPU checked at start; CUDA gated on availability."""
     assert window._engine_menu.title() == "&Engine"
-    assert set(window._engine_actions) == {"auto", "cuda", "mps", "cpu"}
+    assert set(window._engine_actions) == {"auto", "cuda", "rocm", "mps", "cpu"}
     assert window._engine_group.isExclusive()
     assert _checked_keys(window) == ["cpu"]  # constructed with device="cpu"
     assert window._engine_actions["cuda"].isEnabled() == CUDA_AVAILABLE
+    assert window._engine_actions["rocm"].isEnabled() == ROCM_AVAILABLE
     assert window._engine_actions["mps"].isEnabled() == MPS_AVAILABLE
     assert window._engine_actions["cpu"].isEnabled()
     assert window._engine_actions["auto"].isEnabled()
@@ -91,6 +94,25 @@ def test_select_same_engine_is_noop(window) -> None:
     window._on_select_engine("cpu")
     assert window._controller is ctrl
     assert window._device_pref == "cpu"
+
+
+def test_rocm_menu_and_cpu_switch(qapp, monkeypatch):
+    import torch
+    import fastmatch.app as app_module
+    monkeypatch.setattr(app_module, "gpu_backend", lambda: "rocm")
+    monkeypatch.setattr(app_module, "resolve_device",
+                        lambda pref: torch.device("cpu" if pref == "cpu" else "cuda"))
+    w = MainWindow(None, device="rocm")
+    try:
+        assert w._engine_actions["rocm"].isEnabled()
+        assert not w._engine_actions["cuda"].isEnabled()
+        assert _checked_keys(w) == ["rocm"]
+        assert w._params_panel._multiscale.isEnabled()
+        w._on_select_engine("cpu")
+        assert _checked_keys(w) == ["cpu"]
+        assert not w._params_panel._multiscale.isEnabled()
+    finally:
+        w.close()
 
 
 def test_switch_engine_rebuilds_controller_and_updates_ui(window) -> None:
@@ -106,7 +128,7 @@ def test_switch_engine_rebuilds_controller_and_updates_ui(window) -> None:
     assert not window._orphaned_controllers  # old controller joined, none parked
 
     resolved = window._resolved_device.type
-    assert resolved == ("cuda" if CUDA_AVAILABLE else "mps" if MPS_AVAILABLE else "cpu")
+    assert resolved == ("cuda" if GPU_AVAILABLE else "mps" if MPS_AVAILABLE else "cpu")
     # Multi-scale is GPU-only: enabled exactly when the resolved device is CUDA.
     assert window._params_panel._multiscale.isEnabled() == (resolved in ("cuda", "mps"))
 

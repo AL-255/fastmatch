@@ -5,7 +5,7 @@ import importlib.metadata
 import json
 
 
-def exclusion_reason(destination, source, backend):
+def exclusion_reason(destination, source, backend, *, transformers_major=5):
     dest = destination.replace("\\", "/")
     src = source.replace("\\", "/")
     parts = PurePosixPath(dest).parts
@@ -17,7 +17,10 @@ def exclusion_reason(destination, source, backend):
     if name.startswith(("libtorchbind_test", "libjitbackend_test", "libbackend_with_compiler",
                         "libaoti_custom_ops", "torchbind_test", "jitbackend_test")):
         return "development and test files"
-    if "transformers/models/" in dest:
+    # Transformers 4.x imports every model package's lazy initializer from
+    # models/__init__.py. Those initializers inspect adjacent source files;
+    # trimming their directories breaks even DINOv2-only frozen applications.
+    if "transformers/models/" in dest and transformers_major >= 5:
         model = dest.split("transformers/models/", 1)[1].split("/", 1)[0]
         # AutoTokenizer imports EncoderDecoderConfig while DINOv2's decorators
         # construct documentation at import time.
@@ -50,14 +53,18 @@ def exclusion_reason(destination, source, backend):
 
 def trim_collection(binaries, datas, backend, output):
     """Filter PyInstaller TOCs and record the exact external dependencies."""
+    try:
+        transformers_major = int(importlib.metadata.version("transformers").split(".")[0])
+    except importlib.metadata.PackageNotFoundError:
+        transformers_major = 5
     totals, external, runtime_files, kept = {}, set(), {}, []
     result = []
     for collection in (binaries, datas):
         filtered = []
         for destination, source, kind in collection:
-            reason = exclusion_reason(destination, source, backend)
+            reason = exclusion_reason(destination, source, backend, transformers_major=transformers_major)
             if kind == "SYMLINK":
-                reason = reason or exclusion_reason(source, source, backend)
+                reason = reason or exclusion_reason(source, source, backend, transformers_major=transformers_major)
             path = Path(source)
             size = path.stat().st_size if path.is_file() else 0
             if reason:

@@ -25,6 +25,12 @@ See [Fuzzy and semantic search](#fuzzy-and-semantic-search).
 
 ### Download an executable
 
+The [desktop preview](RELEASE.md) adds English/Chinese UI switching, CPU thread
+controls, unlimited results and transparent-image fixes. Its Windows
+`rocm7.2.1-bundled` package includes AMD runtime libraries (a compatible driver is
+still required), and its Intel Mac package uses a CPU backend. The system-runtime
+installation instructions below apply to packages with `-system` in their name.
+
 Tagged versions build standalone applications on [GitHub Releases](https://github.com/AL-255/fastmatch/releases).
 No Python installation is needed to run an extracted application. CPU and macOS
 packages include their compute runtime; CUDA/ROCm packages use your installed

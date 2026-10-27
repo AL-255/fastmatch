@@ -222,20 +222,25 @@ def apply_theme(app: QApplication, key: str, *, persist: bool = True) -> str:
             app.setStyle(_default_style)
         if _default_palette is not None:
             app.setPalette(_default_palette)
-        scheme = Qt.ColorScheme.Unknown
+        scheme = getattr(Qt, "ColorScheme", None)
+        if scheme is not None:
+            scheme = scheme.Unknown
     else:
         app.setStyle("Fusion")  # palette-faithful on every platform
         pal = build_palette(key)
         if pal is not None:
             app.setPalette(pal)
-        scheme = Qt.ColorScheme.Dark if key == "dark" else Qt.ColorScheme.Light
+        scheme = getattr(Qt, "ColorScheme", None)
+        if scheme is not None:
+            scheme = scheme.Dark if key == "dark" else scheme.Light
 
     # Nudge platforms that honour colour-scheme hints (native menus, dialogs,
     # tooltips). Harmless where unsupported; the palette above is the guarantee.
-    try:
-        app.styleHints().setColorScheme(scheme)
-    except (AttributeError, RuntimeError):
-        pass
+    if scheme is not None:
+        try:
+            app.styleHints().setColorScheme(scheme)
+        except (AttributeError, RuntimeError):
+            pass
 
     if persist:
         save_theme(key)

@@ -244,10 +244,10 @@ class MatchParams:
     threshold_floor: float = 0.50    # engine returns everything >= this; UI filters up
     scales: tuple[float, ...] = (1.0,)
     rotations: tuple[float, ...] | None = None  # degrees; None = off (documented unsupported)
-    max_results: int = 500           # cap after NMS
+    max_results: int = 0             # 0 means unlimited; positive values cap after NMS
     nms_iou: float = 0.30            # IoU above which overlapping detections are merged
     exclude_iou: float = 0.30        # drop hits overlapping the source box by more than this
-    device: str = "auto"            # "auto" | "cuda" | "cpu"
+    device: str = "auto"            # "auto" | "cuda" | "rocm" | "cpu"
     compute_dtype: str = "float32"  # "float32" | "float16" (accumulators always fp32)
     channel_mode: str = "luminance"  # "luminance" | "rgb" | "ycbcr" (see CHANNEL_MODES)
 
